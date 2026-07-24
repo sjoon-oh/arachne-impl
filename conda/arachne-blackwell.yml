@@ -1,0 +1,38 @@
+# Build environment for Arachne's C++/CUDA control plane, targeting NVIDIA
+# Blackwell GPUs (SM100 data-center: B100/B200/GB200; SM120 consumer:
+# RTX 50-series / GeForce Blackwell). CUDA 12.8+ is required for Blackwell
+# device code generation.
+#
+# Usage:
+#   conda env create -f conda/arachne-blackwell.yml
+#   conda activate arachne-blackwell
+#   cmake -S cpp -B cpp/build -GNinja
+#   cmake --build cpp/build
+name: arachne
+channels:
+  - rapidsai
+  - conda-forge
+  - nvidia
+dependencies:
+  - python=3.14
+  - cuda-version=12.8
+  - cuda-toolkit=12.8
+  - cuda-nvcc=12.8
+  - gcc=12
+  - gxx=12
+  - cmake>=3.26
+  - ninja
+  # RAFT: header-only + compiled GPU primitives (distance, matrix, etc.)
+  # that Arachne's control plane links against. Index adapters that want a
+  # ready-made GPU ANN index (e.g. CAGRA) should additionally depend on
+  # libcuvs, which is intentionally left out here since Arachne itself is
+  # index-agnostic.
+  - libraft-headers
+  - libraft
+  - librmm
+  - gtest
+  # Logging. RAFT's own logger (raft::default_logger(), included with
+  # libraft above) is itself a spdlog wrapper (rapids-logger), so this is
+  # only needed standalone when building with ARACHNE_USE_RAFT=OFF -- see
+  # cpp/include/arachne/logging.hpp.
+  - spdlog
