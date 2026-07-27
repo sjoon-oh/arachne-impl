@@ -4,17 +4,26 @@
 #include <unordered_map>
 #include <vector>
 
-#include "arachne/adapter/region.hpp"
-#include "arachne/types.hpp"
+#include "adapter/region.hpp"
+#include "gpu/stitch_handle.hpp"
+#include "types.hpp"
 
 namespace arachne {
 
 /// A Stitch is the association between an Anchor (identified only by its
 /// VectorId -- RoutingCache doesn't know or care what a Stitch is) and a
-/// Region that Anchor currently holds GPU write authority (a Lease) over.
+/// Region that Anchor currently holds GPU write authority (a Lease) over,
+/// plus the GPU-resident memory backing that authority. `memory` is
+/// obtained from a gpu::StitchPool (see gpu/stitch_pool.hpp) -- Arachne,
+/// not the adapter, owns this allocation, per the Anchor-centric residency
+/// policy (variable-sized, keyed by handle rather than by fixed address).
+/// Left invalid ({} / StitchHandle{}) for callers that don't yet wire a
+/// StitchPool through -- AnchorManager itself never allocates or frees it,
+/// only carries it.
 struct Stitch {
 	RegionId region = 0;
 	LeaseHandle lease;
+	gpu::StitchHandle memory;
 };
 
 /// Owns Stitch (GPU write-lease) bookkeeping for whatever Anchor ids Core
@@ -30,13 +39,17 @@ class AnchorManager {
 	std::vector<Stitch> stitchesOf(VectorId anchor_id) const;
 
 	/// Records a new Stitch. No-op if `anchor_id` already has one for
-	/// `region`.
-	void addStitch(VectorId anchor_id, RegionId region, LeaseHandle lease);
+	/// `region`. `memory` defaults to an invalid handle for callers that
+	/// don't yet allocate GPU memory for a Stitch through a gpu::StitchPool.
+	void addStitch(VectorId anchor_id, RegionId region, LeaseHandle lease,
+								gpu::StitchHandle memory = {});
 
-	/// Removes the Stitch for `region`, if any, returning its LeaseHandle so
-	/// the caller can release the underlying IRegion lease. Returns an
-	/// invalid handle (and does nothing) if there was nothing to remove.
-	LeaseHandle removeStitch(VectorId anchor_id, RegionId region);
+	/// Removes the Stitch for `region`, if any, returning it so the caller
+	/// can release both the underlying IRegion lease and (via
+	/// gpu::StitchPool::free()) the GPU allocation backing `memory`. Returns
+	/// a default-constructed Stitch (invalid lease) and does nothing if there
+	/// was nothing to remove.
+	Stitch removeStitch(VectorId anchor_id, RegionId region);
 
 	/// Removes every Stitch recorded for `anchor_id` and returns them, so
 	/// the caller can release each underlying lease. The hook a future

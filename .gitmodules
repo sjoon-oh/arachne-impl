@@ -1,3 +1,52 @@
+# cpp/thirdparty/hnswlib is locally patched, not upstream-clean.
+#
+# Base commit (what our patches are relative to):
+#   d9b3608c83d83b46c96e25088cb1d729b29dcfe9
+#   upstream: https://github.com/nmslib/hnswlib
+#   git describe at that commit: v0.2-385-gd9b3608
+#
+# Local patches on top of that base -- captured as cpp/thirdparty/
+# hnswlib.patch, reapplied via cpp/thirdparty/apply_hnswlib_patch.sh
+# (resets the submodule to the base commit above, discarding local
+# changes, then applies the patch). Working tree also carries these
+# changes directly for now; the patch/script pair exists so they survive
+# a `git submodule update` or a re-vendor from scratch:
+#   - hnswlib/half_utils.h (new): portable scalar float16<->float32
+#     conversion, used as the non-SIMD fallback/residual path.
+#   - hnswlib/space_l2.h: added SIMD (SSE/AVX2/AVX512) tiers to the
+#     existing uint8 L2SpaceI, plus new L2SpaceInt8 (signed int8) and
+#     L2SpaceHalf (float16) spaces.
+#   - hnswlib/space_ip.h: added new InnerProductSpaceU8, InnerProductSpaceInt8,
+#     InnerProductSpaceHalf spaces (uint8/int8/float16), all SIMD (SSE/AVX2/
+#     AVX512), mirroring the existing float InnerProductSpace's structure.
+#   - hnswlib.h: added USE_F16C/USE_SSE41/USE_AVX2 ISA detection macros
+#     (alongside the existing USE_SSE/USE_AVX/USE_AVX512) and matching
+#     runtime capability checks AVX2Capable()/F16CCapable() (alongside the
+#     existing AVXCapable()/AVX512Capable()) -- USE_AVX/AVXCapable() alone
+#     don't guarantee AVX2 or F16C are actually safe to use.
+#   - tests/cpp/dtype_space_test.cpp (new): correctness test comparing
+#     every SIMD tier added above against its scalar reference (many dims,
+#     including non-multiples of the SIMD chunk width, randomized data),
+#     plus an end-to-end HierarchicalNSW build+search self-recall check per
+#     new Space.
+#   - CMakeLists.txt: wired dtype_space_test into the existing tests/
+#     executable list.
+#
+# Verified (2026-07-27): built via this submodule's own CMakeLists.txt
+# (HNSWLIB_EXAMPLES path) plus ad-hoc g++ across -march=x86-64 (pure
+# scalar), -msse4.1-only, and the default -march=native on the machine used
+# (resolved to SSE4.1+AVX2+F16C, no AVX512) -- all passed, including the
+# pre-existing hnswlib tests (no regressions). The AVX512(+F16C) tiers only
+# compile+link cleanly there; that machine's CPU has no AVX512, so those
+# specific code paths are compile-verified only, not execution-verified.
+# Re-run tests/cpp/dtype_space_test.cpp on real AVX512 hardware before
+# trusting that tier.
+#
+# If these files are edited further: regenerate cpp/thirdparty/
+# hnswlib.patch from the submodule's working tree (`git add -A && git diff
+# --cached`, run from inside cpp/thirdparty/hnswlib) rather than assuming
+# `git submodule update` is safe on its own -- it would overwrite these
+# changes with plain upstream.
 [submodule "cpp/thirdparty/hnswlib"]
 	path = cpp/thirdparty/hnswlib
 	url = https://github.com/nmslib/hnswlib.git

@@ -1,0 +1,1441 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index be0d40f..f2602d9 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -102,4 +102,14 @@ if(HNSWLIB_EXAMPLES)
+ 
+     add_executable(main tests/cpp/main.cpp tests/cpp/sift_1b.cpp)
+     target_link_libraries(main hnswlib)
++
++    # Correctness test for the uint8/int8/float16 spaces (L2SpaceI's SIMD
++    # tiers, L2SpaceInt8, L2SpaceHalf, InnerProductSpaceU8,
++    # InnerProductSpaceInt8, InnerProductSpaceHalf) added locally on top of
++    # upstream -- see space_l2.h/space_ip.h and half_utils.h. Compiled with
++    # whatever -march this block already set above (native on GCC/Clang),
++    # so which SIMD tier it actually exercises depends on the machine
++    # building it.
++    add_executable(dtype_space_test tests/cpp/dtype_space_test.cpp)
++    target_link_libraries(dtype_space_test hnswlib)
+ endif()
+diff --git a/hnswlib/half_utils.h b/hnswlib/half_utils.h
+new file mode 100644
+index 0000000..aacf1c7
+--- /dev/null
++++ b/hnswlib/half_utils.h
+@@ -0,0 +1,80 @@
++#pragma once
++#include <cstdint>
++#include <cstring>
++
++// Portable (no SIMD, no compiler _Float16 extension) IEEE-754 binary16 <->
++// binary32 conversion. Used two ways by space_l2.h/space_ip.h's *Half
++// spaces:
++//   - as the unconditional scalar fstdistfunc_ fallback when no SIMD ISA
++//     is compiled in at all;
++//   - as the residual/tail handler after a SIMD chunk loop, exactly like
++//     L2Sqr/InnerProduct already serve that role for the float spaces.
++//
++// Storage type for a half value is a raw uint16_t (the IEEE-754 binary16
++// bit pattern), not a compiler-specific `_Float16`/`__fp16` type -- kept
++// portable across toolchains, and it's what the F16C conversion intrinsics
++// (_mm*_cvtph_ps) operate on too (a packed-uint16 __m128i/__m256i input).
++
++namespace hnswlib {
++
++inline float HalfToFloat(uint16_t h) {
++    uint32_t sign = static_cast<uint32_t>(h & 0x8000u) << 16;
++    uint32_t exp = (h >> 10) & 0x1Fu;
++    uint32_t mant = h & 0x3FFu;
++    uint32_t bits;
++
++    if (exp == 0) {
++        if (mant == 0) {
++            bits = sign;  // +/-0
++        } else {
++            // Subnormal half -> normalize into a normal float.
++            exp = 1;
++            while ((mant & 0x400u) == 0) {
++                mant <<= 1;
++                exp--;
++            }
++            mant &= 0x3FFu;
++            bits = sign | ((exp + (127 - 15)) << 23) | (mant << 13);
++        }
++    } else if (exp == 0x1Fu) {
++        bits = sign | 0x7F800000u | (mant << 13);  // inf / NaN
++    } else {
++        bits = sign | ((exp + (127 - 15)) << 23) | (mant << 13);
++    }
++
++    float f;
++    std::memcpy(&f, &bits, sizeof(f));
++    return f;
++}
++
++// Encoder is only needed by tests/tooling that construct half data from
++// float -- no space in space_l2.h/space_ip.h calls this, since Arachne's
++// own quantization step (future work, outside this submodule) is
++// responsible for producing the binary16 bytes hnswlib stores and reads
++// via HalfToFloat above. Subnormal results are flushed to zero rather than
++// encoded exactly: acceptable for that use (test-data generation), not
++// intended as a general-purpose codec.
++inline uint16_t FloatToHalf(float f) {
++    uint32_t bits;
++    std::memcpy(&bits, &f, sizeof(bits));
++
++    uint32_t sign = (bits >> 16) & 0x8000u;
++    uint32_t f_exp = (bits >> 23) & 0xFFu;
++    uint32_t mant = bits & 0x7FFFFFu;
++
++    if (f_exp == 0xFFu) {
++        // inf / NaN
++        return static_cast<uint16_t>(sign | 0x7C00u | (mant ? 0x200u : 0u));
++    }
++
++    int32_t exp = static_cast<int32_t>(f_exp) - 127 + 15;
++    if (exp <= 0) {
++        return static_cast<uint16_t>(sign);  // underflow -> +/-0
++    }
++    if (exp >= 0x1F) {
++        return static_cast<uint16_t>(sign | 0x7C00u);  // overflow -> +/-inf
++    }
++    return static_cast<uint16_t>(sign | (exp << 10) | (mant >> 13));
++}
++
++}  // namespace hnswlib
+diff --git a/hnswlib/hnswlib.h b/hnswlib/hnswlib.h
+index 7ccfbba..83cf2c7 100644
+--- a/hnswlib/hnswlib.h
++++ b/hnswlib/hnswlib.h
+@@ -20,6 +20,35 @@
+ #endif
+ #endif
+ 
++// F16C: float16<->float32 hardware conversion (VCVTPH2PS/VCVTPS2PH). A
++// separate CPUID feature from AVX/AVX512 -- checked independently rather
++// than assumed, even though in practice it has shipped alongside AVX since
++// Ivy Bridge. Backs the SIMD tiers of L2SpaceHalf/InnerProductSpaceHalf
++// (space_l2.h/space_ip.h); their scalar fallback (half_utils.h) doesn't
++// need this and works regardless.
++#ifndef NO_MANUAL_VECTORIZATION
++#if defined(USE_AVX) && defined(__F16C__)
++#define USE_F16C
++#endif
++#endif
++
++// The uint8/int8 SIMD tiers (L2SpaceI/L2SpaceInt8/InnerProductSpaceU8/
++// InnerProductSpaceInt8 in space_l2.h/space_ip.h) widen bytes to 32-bit
++// lanes via PMOVZXBD/PMOVSXBD-family instructions before doing arithmetic,
++// to sidestep 8/16-bit overflow entirely rather than reason about
++// saturation. Those instructions need SSE4.1, not just baseline SSE/SSE2 --
++// and their 256-bit form needs true AVX2, not just AVX1 (AVX1 has no
++// integer ymm ops at all). USE_SSE/USE_AVX above don't guarantee either,
++// so they're checked as their own capability, same reasoning as USE_F16C.
++#ifndef NO_MANUAL_VECTORIZATION
++#if defined(USE_SSE) && defined(__SSE4_1__)
++#define USE_SSE41
++#endif
++#if defined(USE_AVX) && defined(__AVX2__)
++#define USE_AVX2
++#endif
++#endif
++
+ #if defined(USE_AVX) || defined(USE_SSE)
+ #ifdef _MSC_VER
+ #include <intrin.h>
+@@ -114,6 +143,40 @@ static bool AVX512Capable() {
+     }
+     return HW_AVX512F && avx512Supported;
+ }
++
++// AVXCapable() only checks CPUID.1:ECX.AVX[bit 28] -- true on any
++// Sandy/Ivy Bridge-class CPU, which may not have AVX2 (CPUID.(7,0):EBX.
++// AVX2[bit 5], a separate/later feature). USE_AVX alone is therefore not
++// sufficient to safely dispatch to the 256-bit *integer* SIMD tiers added
++// for L2SpaceI/L2SpaceInt8/InnerProductSpaceU8/InnerProductSpaceInt8 in
++// space_l2.h/space_ip.h (AVX1 has no integer ymm ops at all) -- this is
++// their runtime guard, same role AVXCapable()/AVX512Capable() play above.
++static bool AVX2Capable() {
++    if (!AVXCapable()) return false;
++
++    int cpuInfo[4];
++    cpuid(cpuInfo, 0, 0);
++    int nIds = cpuInfo[0];
++
++    bool HW_AVX2 = false;
++    if (nIds >= 0x00000007) {
++        cpuid(cpuInfo, 0x00000007, 0);
++        HW_AVX2 = (cpuInfo[1] & ((int)1 << 5)) != 0;  // CPUID.(7,0):EBX.AVX2
++    }
++    return HW_AVX2;
++}
++
++// F16C (VCVTPH2PS/VCVTPS2PH, CPUID.1:ECX.F16C[bit 29]) is its own CPUID
++// feature, independent of AVX2/AVX512F -- checked at runtime the same way,
++// backing L2SpaceHalf/InnerProductSpaceHalf's SIMD tiers in space_l2.h/
++// space_ip.h.
++static bool F16CCapable() {
++    if (!AVXCapable()) return false;
++
++    int cpuInfo[4];
++    cpuid(cpuInfo, 1, 0);
++    return (cpuInfo[2] & ((int)1 << 29)) != 0;  // CPUID.1:ECX.F16C
++}
+ #endif
+ 
+ #include <queue>
+diff --git a/hnswlib/space_ip.h b/hnswlib/space_ip.h
+index 0e6834c..14030df 100644
+--- a/hnswlib/space_ip.h
++++ b/hnswlib/space_ip.h
+@@ -1,5 +1,9 @@
+ #pragma once
+ #include "hnswlib.h"
++#include "half_utils.h"
++
++#include <cstdint>
++#include <cstring>
+ 
+ namespace hnswlib {
+ 
+@@ -397,4 +401,476 @@ class InnerProductSpace : public SpaceInterface<float> {
+ ~InnerProductSpace() {}
+ };
+ 
++// InnerProductSpaceU8/InnerProductSpaceInt8: uint8/int8 dot product,
++// widened to int32 lanes first (same reasoning as L2SpaceI/L2SpaceInt8 in
++// space_l2.h -- sidesteps 8/16-bit overflow entirely rather than reason
++// about saturation). SpaceInterface<int>, matching L2SpaceI's convention
++// for integer-typed spaces.
++//
++// "Distance" here is -dot, not 1-dot: unlike float cosine, a raw integer
++// dot product has no natural upper bound to subtract from, so the usual
++// max-inner-product-search-as-min-search transformation (negate, since
++// hnswlib's graph search always minimizes) is used instead.
++static int
++InnerProductU8(const void *__restrict pVect1v, const void *__restrict pVect2v, const void *__restrict qty_ptr) {
++    const unsigned char *pVect1 = (const unsigned char *) pVect1v;
++    const unsigned char *pVect2 = (const unsigned char *) pVect2v;
++    size_t qty = *((size_t *) qty_ptr);
++
++    int res = 0;
++    for (size_t i = 0; i < qty; i++) {
++        res += (int) pVect1[i] * (int) pVect2[i];
++    }
++    return res;
++}
++
++static int
++InnerProductDistanceU8(const void *pVect1v, const void *pVect2v, const void *qty_ptr) {
++    return -InnerProductU8(pVect1v, pVect2v, qty_ptr);
++}
++
++#if defined(USE_SSE41)
++static int
++InnerProductU8SIMD16ExtSSE41(const void *__restrict pVect1v, const void *__restrict pVect2v,
++        const void *__restrict qty_ptr) {
++    const unsigned char *pVect1 = (const unsigned char *) pVect1v;
++    const unsigned char *pVect2 = (const unsigned char *) pVect2v;
++    size_t qty = *((size_t *) qty_ptr);
++    size_t qty16 = qty >> 4;
++
++    __m128i sum = _mm_setzero_si128();
++    for (size_t i = 0; i < qty16; i++) {
++        for (int j = 0; j < 4; j++) {
++            int32_t a4, b4;
++            std::memcpy(&a4, pVect1, 4);
++            std::memcpy(&b4, pVect2, 4);
++            pVect1 += 4;
++            pVect2 += 4;
++            __m128i a32 = _mm_cvtepu8_epi32(_mm_cvtsi32_si128(a4));
++            __m128i b32 = _mm_cvtepu8_epi32(_mm_cvtsi32_si128(b4));
++            sum = _mm_add_epi32(sum, _mm_mullo_epi32(a32, b32));
++        }
++    }
++
++    int32_t PORTABLE_ALIGN32 tmp[4];
++    _mm_store_si128((__m128i *) tmp, sum);
++    return tmp[0] + tmp[1] + tmp[2] + tmp[3];
++}
++#endif
++
++#if defined(USE_AVX2)
++static int
++InnerProductU8SIMD16ExtAVX2(const void *__restrict pVect1v, const void *__restrict pVect2v,
++        const void *__restrict qty_ptr) {
++    const unsigned char *pVect1 = (const unsigned char *) pVect1v;
++    const unsigned char *pVect2 = (const unsigned char *) pVect2v;
++    size_t qty = *((size_t *) qty_ptr);
++    size_t qty16 = qty >> 4;
++
++    __m256i sum = _mm256_setzero_si256();
++    for (size_t i = 0; i < qty16; i++) {
++        for (int j = 0; j < 2; j++) {
++            __m128i a8 = _mm_loadl_epi64((const __m128i *) pVect1);
++            __m128i b8 = _mm_loadl_epi64((const __m128i *) pVect2);
++            pVect1 += 8;
++            pVect2 += 8;
++            __m256i a32 = _mm256_cvtepu8_epi32(a8);
++            __m256i b32 = _mm256_cvtepu8_epi32(b8);
++            sum = _mm256_add_epi32(sum, _mm256_mullo_epi32(a32, b32));
++        }
++    }
++
++    int32_t PORTABLE_ALIGN32 tmp[8];
++    _mm256_storeu_si256((__m256i *) tmp, sum);
++    return tmp[0] + tmp[1] + tmp[2] + tmp[3] + tmp[4] + tmp[5] + tmp[6] + tmp[7];
++}
++#endif
++
++#if defined(USE_AVX512)
++static int
++InnerProductU8SIMD16ExtAVX512(const void *__restrict pVect1v, const void *__restrict pVect2v,
++        const void *__restrict qty_ptr) {
++    const unsigned char *pVect1 = (const unsigned char *) pVect1v;
++    const unsigned char *pVect2 = (const unsigned char *) pVect2v;
++    size_t qty = *((size_t *) qty_ptr);
++    size_t qty16 = qty >> 4;
++
++    __m512i sum = _mm512_setzero_si512();
++    for (size_t i = 0; i < qty16; i++) {
++        __m128i a8 = _mm_loadu_si128((const __m128i *) pVect1);
++        __m128i b8 = _mm_loadu_si128((const __m128i *) pVect2);
++        pVect1 += 16;
++        pVect2 += 16;
++        __m512i a32 = _mm512_cvtepu8_epi32(a8);
++        __m512i b32 = _mm512_cvtepu8_epi32(b8);
++        sum = _mm512_add_epi32(sum, _mm512_mullo_epi32(a32, b32));
++    }
++    return _mm512_reduce_add_epi32(sum);
++}
++#endif
++
++#if defined(USE_SSE41)
++static DISTFUNC<int> InnerProductU8SIMD16Ext = InnerProductU8SIMD16ExtSSE41;
++
++static int
++InnerProductDistanceU8SIMD16Ext(const void *pVect1v, const void *pVect2v, const void *qty_ptr) {
++    return -InnerProductU8SIMD16Ext(pVect1v, pVect2v, qty_ptr);
++}
++
++static int
++InnerProductDistanceU8SIMD16ExtResiduals(const void *pVect1v, const void *pVect2v, const void *qty_ptr) {
++    size_t qty = *((size_t *) qty_ptr);
++    size_t qty16 = qty >> 4 << 4;
++    int res = InnerProductU8SIMD16Ext(pVect1v, pVect2v, &qty16);
++
++    const unsigned char *pVect1 = (const unsigned char *) pVect1v + qty16;
++    const unsigned char *pVect2 = (const unsigned char *) pVect2v + qty16;
++    size_t qty_left = qty - qty16;
++    int res_tail = InnerProductU8(pVect1, pVect2, &qty_left);
++    return -(res + res_tail);
++}
++#endif
++
++class InnerProductSpaceU8 : public SpaceInterface<int> {
++    DISTFUNC<int> fstdistfunc_;
++    size_t data_size_;
++    size_t dim_;
++
++ public:
++    InnerProductSpaceU8(size_t dim) {
++        fstdistfunc_ = InnerProductDistanceU8;
++#if defined(USE_SSE41)
++#if defined(USE_AVX512)
++        if (AVX512Capable())
++            InnerProductU8SIMD16Ext = InnerProductU8SIMD16ExtAVX512;
++        else if (AVX2Capable())
++            InnerProductU8SIMD16Ext = InnerProductU8SIMD16ExtAVX2;
++#elif defined(USE_AVX2)
++        if (AVX2Capable())
++            InnerProductU8SIMD16Ext = InnerProductU8SIMD16ExtAVX2;
++#endif
++        if (dim % 16 == 0)
++            fstdistfunc_ = InnerProductDistanceU8SIMD16Ext;
++        else if (dim > 16)
++            fstdistfunc_ = InnerProductDistanceU8SIMD16ExtResiduals;
++#endif
++        dim_ = dim;
++        data_size_ = dim * sizeof(unsigned char);
++    }
++
++    size_t get_data_size() {
++        return data_size_;
++    }
++
++    DISTFUNC<int> get_dist_func() {
++        return fstdistfunc_;
++    }
++
++    void *get_dist_func_param() {
++        return &dim_;
++    }
++
++    ~InnerProductSpaceU8() {}
++};
++
++// Signed int8_t mirror of InnerProductSpaceU8 above -- identical structure,
++// sign-extending widen instructions (PMOVSXBD) instead of zero-extending.
++static int
++InnerProductInt8(const void *__restrict pVect1v, const void *__restrict pVect2v, const void *__restrict qty_ptr) {
++    const int8_t *pVect1 = (const int8_t *) pVect1v;
++    const int8_t *pVect2 = (const int8_t *) pVect2v;
++    size_t qty = *((size_t *) qty_ptr);
++
++    int res = 0;
++    for (size_t i = 0; i < qty; i++) {
++        res += (int) pVect1[i] * (int) pVect2[i];
++    }
++    return res;
++}
++
++static int
++InnerProductDistanceInt8(const void *pVect1v, const void *pVect2v, const void *qty_ptr) {
++    return -InnerProductInt8(pVect1v, pVect2v, qty_ptr);
++}
++
++#if defined(USE_SSE41)
++static int
++InnerProductInt8SIMD16ExtSSE41(const void *__restrict pVect1v, const void *__restrict pVect2v,
++        const void *__restrict qty_ptr) {
++    const int8_t *pVect1 = (const int8_t *) pVect1v;
++    const int8_t *pVect2 = (const int8_t *) pVect2v;
++    size_t qty = *((size_t *) qty_ptr);
++    size_t qty16 = qty >> 4;
++
++    __m128i sum = _mm_setzero_si128();
++    for (size_t i = 0; i < qty16; i++) {
++        for (int j = 0; j < 4; j++) {
++            int32_t a4, b4;
++            std::memcpy(&a4, pVect1, 4);
++            std::memcpy(&b4, pVect2, 4);
++            pVect1 += 4;
++            pVect2 += 4;
++            __m128i a32 = _mm_cvtepi8_epi32(_mm_cvtsi32_si128(a4));
++            __m128i b32 = _mm_cvtepi8_epi32(_mm_cvtsi32_si128(b4));
++            sum = _mm_add_epi32(sum, _mm_mullo_epi32(a32, b32));
++        }
++    }
++
++    int32_t PORTABLE_ALIGN32 tmp[4];
++    _mm_store_si128((__m128i *) tmp, sum);
++    return tmp[0] + tmp[1] + tmp[2] + tmp[3];
++}
++#endif
++
++#if defined(USE_AVX2)
++static int
++InnerProductInt8SIMD16ExtAVX2(const void *__restrict pVect1v, const void *__restrict pVect2v,
++        const void *__restrict qty_ptr) {
++    const int8_t *pVect1 = (const int8_t *) pVect1v;
++    const int8_t *pVect2 = (const int8_t *) pVect2v;
++    size_t qty = *((size_t *) qty_ptr);
++    size_t qty16 = qty >> 4;
++
++    __m256i sum = _mm256_setzero_si256();
++    for (size_t i = 0; i < qty16; i++) {
++        for (int j = 0; j < 2; j++) {
++            __m128i a8 = _mm_loadl_epi64((const __m128i *) pVect1);
++            __m128i b8 = _mm_loadl_epi64((const __m128i *) pVect2);
++            pVect1 += 8;
++            pVect2 += 8;
++            __m256i a32 = _mm256_cvtepi8_epi32(a8);
++            __m256i b32 = _mm256_cvtepi8_epi32(b8);
++            sum = _mm256_add_epi32(sum, _mm256_mullo_epi32(a32, b32));
++        }
++    }
++
++    int32_t PORTABLE_ALIGN32 tmp[8];
++    _mm256_storeu_si256((__m256i *) tmp, sum);
++    return tmp[0] + tmp[1] + tmp[2] + tmp[3] + tmp[4] + tmp[5] + tmp[6] + tmp[7];
++}
++#endif
++
++#if defined(USE_AVX512)
++static int
++InnerProductInt8SIMD16ExtAVX512(const void *__restrict pVect1v, const void *__restrict pVect2v,
++        const void *__restrict qty_ptr) {
++    const int8_t *pVect1 = (const int8_t *) pVect1v;
++    const int8_t *pVect2 = (const int8_t *) pVect2v;
++    size_t qty = *((size_t *) qty_ptr);
++    size_t qty16 = qty >> 4;
++
++    __m512i sum = _mm512_setzero_si512();
++    for (size_t i = 0; i < qty16; i++) {
++        __m128i a8 = _mm_loadu_si128((const __m128i *) pVect1);
++        __m128i b8 = _mm_loadu_si128((const __m128i *) pVect2);
++        pVect1 += 16;
++        pVect2 += 16;
++        __m512i a32 = _mm512_cvtepi8_epi32(a8);
++        __m512i b32 = _mm512_cvtepi8_epi32(b8);
++        sum = _mm512_add_epi32(sum, _mm512_mullo_epi32(a32, b32));
++    }
++    return _mm512_reduce_add_epi32(sum);
++}
++#endif
++
++#if defined(USE_SSE41)
++static DISTFUNC<int> InnerProductInt8SIMD16Ext = InnerProductInt8SIMD16ExtSSE41;
++
++static int
++InnerProductDistanceInt8SIMD16Ext(const void *pVect1v, const void *pVect2v, const void *qty_ptr) {
++    return -InnerProductInt8SIMD16Ext(pVect1v, pVect2v, qty_ptr);
++}
++
++static int
++InnerProductDistanceInt8SIMD16ExtResiduals(const void *pVect1v, const void *pVect2v, const void *qty_ptr) {
++    size_t qty = *((size_t *) qty_ptr);
++    size_t qty16 = qty >> 4 << 4;
++    int res = InnerProductInt8SIMD16Ext(pVect1v, pVect2v, &qty16);
++
++    const int8_t *pVect1 = (const int8_t *) pVect1v + qty16;
++    const int8_t *pVect2 = (const int8_t *) pVect2v + qty16;
++    size_t qty_left = qty - qty16;
++    int res_tail = InnerProductInt8(pVect1, pVect2, &qty_left);
++    return -(res + res_tail);
++}
++#endif
++
++class InnerProductSpaceInt8 : public SpaceInterface<int> {
++    DISTFUNC<int> fstdistfunc_;
++    size_t data_size_;
++    size_t dim_;
++
++ public:
++    InnerProductSpaceInt8(size_t dim) {
++        fstdistfunc_ = InnerProductDistanceInt8;
++#if defined(USE_SSE41)
++#if defined(USE_AVX512)
++        if (AVX512Capable())
++            InnerProductInt8SIMD16Ext = InnerProductInt8SIMD16ExtAVX512;
++        else if (AVX2Capable())
++            InnerProductInt8SIMD16Ext = InnerProductInt8SIMD16ExtAVX2;
++#elif defined(USE_AVX2)
++        if (AVX2Capable())
++            InnerProductInt8SIMD16Ext = InnerProductInt8SIMD16ExtAVX2;
++#endif
++        if (dim % 16 == 0)
++            fstdistfunc_ = InnerProductDistanceInt8SIMD16Ext;
++        else if (dim > 16)
++            fstdistfunc_ = InnerProductDistanceInt8SIMD16ExtResiduals;
++#endif
++        dim_ = dim;
++        data_size_ = dim * sizeof(int8_t);
++    }
++
++    size_t get_data_size() {
++        return data_size_;
++    }
++
++    DISTFUNC<int> get_dist_func() {
++        return fstdistfunc_;
++    }
++
++    void *get_dist_func_param() {
++        return &dim_;
++    }
++
++    ~InnerProductSpaceInt8() {}
++};
++
++// InnerProductSpaceHalf: mirrors InnerProductSpace (float) above exactly,
++// including its "distance" = 1 - dot convention -- half data is widened to
++// float via F16C (VCVTPH2PS) first, then it's the same math. Same 16-wide
++// outer chunk contract and F16C-tier/AVX512-tier reasoning as
++// L2SpaceHalf in space_l2.h.
++static float
++InnerProductHalf(const void *pVect1v, const void *pVect2v, const void *qty_ptr) {
++    const uint16_t *pVect1 = (const uint16_t *) pVect1v;
++    const uint16_t *pVect2 = (const uint16_t *) pVect2v;
++    size_t qty = *((size_t *) qty_ptr);
++
++    float res = 0;
++    for (size_t i = 0; i < qty; i++) {
++        res += HalfToFloat(pVect1[i]) * HalfToFloat(pVect2[i]);
++    }
++    return res;
++}
++
++static float
++InnerProductDistanceHalf(const void *pVect1v, const void *pVect2v, const void *qty_ptr) {
++    return 1.0f - InnerProductHalf(pVect1v, pVect2v, qty_ptr);
++}
++
++#if defined(USE_F16C)
++static float
++InnerProductHalfSIMD16ExtF16C(const void *pVect1v, const void *pVect2v, const void *qty_ptr) {
++    const uint16_t *pVect1 = (const uint16_t *) pVect1v;
++    const uint16_t *pVect2 = (const uint16_t *) pVect2v;
++    size_t qty = *((size_t *) qty_ptr);
++    size_t qty16 = qty >> 4;
++    float PORTABLE_ALIGN32 TmpRes[8];
++
++    __m256 sum = _mm256_set1_ps(0);
++    for (size_t i = 0; i < qty16; i++) {
++        for (int j = 0; j < 2; j++) {
++            __m128i h1 = _mm_loadu_si128((const __m128i *) pVect1);
++            __m128i h2 = _mm_loadu_si128((const __m128i *) pVect2);
++            pVect1 += 8;
++            pVect2 += 8;
++            __m256 v1 = _mm256_cvtph_ps(h1);
++            __m256 v2 = _mm256_cvtph_ps(h2);
++            sum = _mm256_add_ps(sum, _mm256_mul_ps(v1, v2));
++        }
++    }
++
++    _mm256_store_ps(TmpRes, sum);
++    return TmpRes[0] + TmpRes[1] + TmpRes[2] + TmpRes[3] + TmpRes[4] + TmpRes[5] + TmpRes[6] + TmpRes[7];
++}
++#endif
++
++#if defined(USE_AVX512) && defined(__F16C__)
++static float
++InnerProductHalfSIMD16ExtAVX512(const void *pVect1v, const void *pVect2v, const void *qty_ptr) {
++    const uint16_t *pVect1 = (const uint16_t *) pVect1v;
++    const uint16_t *pVect2 = (const uint16_t *) pVect2v;
++    size_t qty = *((size_t *) qty_ptr);
++    size_t qty16 = qty >> 4;
++
++    __m512 sum = _mm512_set1_ps(0);
++    for (size_t i = 0; i < qty16; i++) {
++        __m256i h1 = _mm256_loadu_si256((const __m256i *) pVect1);
++        __m256i h2 = _mm256_loadu_si256((const __m256i *) pVect2);
++        pVect1 += 16;
++        pVect2 += 16;
++        __m512 v1 = _mm512_cvtph_ps(h1);
++        __m512 v2 = _mm512_cvtph_ps(h2);
++        sum = _mm512_add_ps(sum, _mm512_mul_ps(v1, v2));
++    }
++    return _mm512_reduce_add_ps(sum);
++}
++#endif
++
++#if defined(USE_F16C)
++static DISTFUNC<float> InnerProductHalfSIMD16Ext = InnerProductHalfSIMD16ExtF16C;
++
++static float
++InnerProductDistanceHalfSIMD16Ext(const void *pVect1v, const void *pVect2v, const void *qty_ptr) {
++    return 1.0f - InnerProductHalfSIMD16Ext(pVect1v, pVect2v, qty_ptr);
++}
++
++static float
++InnerProductDistanceHalfSIMD16ExtResiduals(const void *pVect1v, const void *pVect2v, const void *qty_ptr) {
++    size_t qty = *((size_t *) qty_ptr);
++    size_t qty16 = qty >> 4 << 4;
++    float res = InnerProductHalfSIMD16Ext(pVect1v, pVect2v, &qty16);
++
++    const uint16_t *pVect1 = (const uint16_t *) pVect1v + qty16;
++    const uint16_t *pVect2 = (const uint16_t *) pVect2v + qty16;
++    size_t qty_left = qty - qty16;
++    float res_tail = InnerProductHalf(pVect1, pVect2, &qty_left);
++    return 1.0f - (res + res_tail);
++}
++#endif
++
++class InnerProductSpaceHalf : public SpaceInterface<float> {
++    DISTFUNC<float> fstdistfunc_;
++    size_t data_size_;
++    size_t dim_;
++
++ public:
++    InnerProductSpaceHalf(size_t dim) {
++        fstdistfunc_ = InnerProductDistanceHalf;
++#if defined(USE_F16C)
++#if defined(USE_AVX512) && defined(__F16C__)
++        if (AVX512Capable() && F16CCapable())
++            InnerProductHalfSIMD16Ext = InnerProductHalfSIMD16ExtAVX512;
++        else if (F16CCapable())
++            InnerProductHalfSIMD16Ext = InnerProductHalfSIMD16ExtF16C;
++#else
++        if (F16CCapable())
++            InnerProductHalfSIMD16Ext = InnerProductHalfSIMD16ExtF16C;
++#endif
++        if (dim % 16 == 0)
++            fstdistfunc_ = InnerProductDistanceHalfSIMD16Ext;
++        else if (dim > 16)
++            fstdistfunc_ = InnerProductDistanceHalfSIMD16ExtResiduals;
++#endif
++        dim_ = dim;
++        data_size_ = dim * sizeof(uint16_t);
++    }
++
++    size_t get_data_size() {
++        return data_size_;
++    }
++
++    DISTFUNC<float> get_dist_func() {
++        return fstdistfunc_;
++    }
++
++    void *get_dist_func_param() {
++        return &dim_;
++    }
++
++    ~InnerProductSpaceHalf() {}
++};
++
+ }  // namespace hnswlib
+diff --git a/hnswlib/space_l2.h b/hnswlib/space_l2.h
+index 834d19f..978f6cc 100644
+--- a/hnswlib/space_l2.h
++++ b/hnswlib/space_l2.h
+@@ -1,5 +1,9 @@
+ #pragma once
+ #include "hnswlib.h"
++#include "half_utils.h"
++
++#include <cstdint>
++#include <cstring>
+ 
+ namespace hnswlib {
+ 
+@@ -291,6 +295,130 @@ static int L2SqrI(const void* __restrict pVect1, const void* __restrict pVect2,
+     return (res);
+ }
+ 
++// SIMD tiers for L2SpaceI (unsigned char / uint8 data). All widen bytes to
++// 32-bit lanes (via PMOVZXBD-family instructions) before subtracting and
++// squaring, rather than doing arithmetic in 8/16-bit lanes -- a uint8 diff
++// is at most 255, so its square (up to 65025) already doesn't fit in
++// int16, let alone the diff-of-diffs tricks some SIMD dot-product code
++// uses. Widening to int32 first sidesteps that entirely: everything below
++// is exact, not an approximation.
++//
++// Every tier (SSE41/AVX2/AVX512) processes a 16-byte outer chunk per call,
++// like the float kernels above process a 16-float chunk regardless of
++// which ISA backs L2SqrSIMD16Ext -- SSE41 covers it via 4 widen-4 substeps,
++// AVX2 via 2 widen-8 substeps, AVX512 via 1 widen-16 step. Keeping the
++// outer contract uniform lets all three share one residual wrapper
++// (L2SqrU8SIMD16ExtResiduals), exactly mirroring L2SqrSIMD16ExtResiduals.
++//
++// PMOVZXBD (the widening instruction) needs SSE4.1, not baseline SSE/SSE2;
++// its 256-bit form needs true AVX2, not just AVX1 -- see USE_SSE41/
++// USE_AVX2 in hnswlib.h for why USE_SSE/USE_AVX alone aren't checked here.
++#if defined(USE_SSE41)
++static int
++L2SqrU8SIMD16ExtSSE41(const void *__restrict pVect1v, const void *__restrict pVect2v,
++        const void *__restrict qty_ptr) {
++    const unsigned char *pVect1 = (const unsigned char *) pVect1v;
++    const unsigned char *pVect2 = (const unsigned char *) pVect2v;
++    size_t qty = *((size_t *) qty_ptr);
++    size_t qty16 = qty >> 4;
++
++    __m128i sum = _mm_setzero_si128();
++    for (size_t i = 0; i < qty16; i++) {
++        for (int j = 0; j < 4; j++) {  // 4 substeps x 4 bytes = 16 bytes/iter
++            int32_t a4, b4;
++            std::memcpy(&a4, pVect1, 4);
++            std::memcpy(&b4, pVect2, 4);
++            pVect1 += 4;
++            pVect2 += 4;
++            __m128i a32 = _mm_cvtepu8_epi32(_mm_cvtsi32_si128(a4));
++            __m128i b32 = _mm_cvtepu8_epi32(_mm_cvtsi32_si128(b4));
++            __m128i diff = _mm_sub_epi32(a32, b32);
++            sum = _mm_add_epi32(sum, _mm_mullo_epi32(diff, diff));
++        }
++    }
++
++    int32_t PORTABLE_ALIGN32 tmp[4];
++    _mm_store_si128((__m128i *) tmp, sum);
++    return tmp[0] + tmp[1] + tmp[2] + tmp[3];
++}
++#endif
++
++#if defined(USE_AVX2)
++static int
++L2SqrU8SIMD16ExtAVX2(const void *__restrict pVect1v, const void *__restrict pVect2v,
++        const void *__restrict qty_ptr) {
++    const unsigned char *pVect1 = (const unsigned char *) pVect1v;
++    const unsigned char *pVect2 = (const unsigned char *) pVect2v;
++    size_t qty = *((size_t *) qty_ptr);
++    size_t qty16 = qty >> 4;
++
++    __m256i sum = _mm256_setzero_si256();
++    for (size_t i = 0; i < qty16; i++) {
++        for (int j = 0; j < 2; j++) {  // 2 substeps x 8 bytes = 16 bytes/iter
++            __m128i a8 = _mm_loadl_epi64((const __m128i *) pVect1);
++            __m128i b8 = _mm_loadl_epi64((const __m128i *) pVect2);
++            pVect1 += 8;
++            pVect2 += 8;
++            __m256i a32 = _mm256_cvtepu8_epi32(a8);
++            __m256i b32 = _mm256_cvtepu8_epi32(b8);
++            __m256i diff = _mm256_sub_epi32(a32, b32);
++            sum = _mm256_add_epi32(sum, _mm256_mullo_epi32(diff, diff));
++        }
++    }
++
++    int32_t PORTABLE_ALIGN32 tmp[8];
++    _mm256_storeu_si256((__m256i *) tmp, sum);
++    return tmp[0] + tmp[1] + tmp[2] + tmp[3] + tmp[4] + tmp[5] + tmp[6] + tmp[7];
++}
++#endif
++
++#if defined(USE_AVX512)
++static int
++L2SqrU8SIMD16ExtAVX512(const void *__restrict pVect1v, const void *__restrict pVect2v,
++        const void *__restrict qty_ptr) {
++    const unsigned char *pVect1 = (const unsigned char *) pVect1v;
++    const unsigned char *pVect2 = (const unsigned char *) pVect2v;
++    size_t qty = *((size_t *) qty_ptr);
++    size_t qty16 = qty >> 4;
++
++    __m512i sum = _mm512_setzero_si512();
++    for (size_t i = 0; i < qty16; i++) {
++        __m128i a8 = _mm_loadu_si128((const __m128i *) pVect1);
++        __m128i b8 = _mm_loadu_si128((const __m128i *) pVect2);
++        pVect1 += 16;
++        pVect2 += 16;
++        __m512i a32 = _mm512_cvtepu8_epi32(a8);
++        __m512i b32 = _mm512_cvtepu8_epi32(b8);
++        __m512i diff = _mm512_sub_epi32(a32, b32);
++        sum = _mm512_add_epi32(sum, _mm512_mullo_epi32(diff, diff));
++    }
++    return _mm512_reduce_add_epi32(sum);
++}
++#endif
++
++#if defined(USE_SSE41)
++// Compile-time default is always the narrowest tier that exists in this
++// translation unit: whenever USE_AVX2/USE_AVX512 are defined, USE_SSE41 is
++// guaranteed defined too (their compiler ISA flags imply SSE4.1's), same
++// reasoning L2SqrSIMD16Ext's SSE default relies on for USE_AVX/USE_AVX512.
++// The constructor below upgrades this at runtime if a wider tier both
++// compiled in and is actually supported by the CPU running it.
++static DISTFUNC<int> L2SqrU8SIMD16Ext = L2SqrU8SIMD16ExtSSE41;
++
++static int
++L2SqrU8SIMD16ExtResiduals(const void *pVect1v, const void *pVect2v, const void *qty_ptr) {
++    size_t qty = *((size_t *) qty_ptr);
++    size_t qty16 = qty >> 4 << 4;
++    int res = L2SqrU8SIMD16Ext(pVect1v, pVect2v, &qty16);
++
++    const unsigned char *pVect1 = (const unsigned char *) pVect1v + qty16;
++    const unsigned char *pVect2 = (const unsigned char *) pVect2v + qty16;
++    size_t qty_left = qty - qty16;
++    int res_tail = L2SqrI(pVect1, pVect2, &qty_left);
++    return res + res_tail;
++}
++#endif
++
+ class L2SpaceI : public SpaceInterface<int> {
+     DISTFUNC<int> fstdistfunc_;
+     size_t data_size_;
+@@ -303,6 +431,25 @@ class L2SpaceI : public SpaceInterface<int> {
+         } else {
+             fstdistfunc_ = L2SqrI;
+         }
++#if defined(USE_SSE41)
++#if defined(USE_AVX512)
++        if (AVX512Capable())
++            L2SqrU8SIMD16Ext = L2SqrU8SIMD16ExtAVX512;
++        else if (AVX2Capable())
++            L2SqrU8SIMD16Ext = L2SqrU8SIMD16ExtAVX2;
++#elif defined(USE_AVX2)
++        if (AVX2Capable())
++            L2SqrU8SIMD16Ext = L2SqrU8SIMD16ExtAVX2;
++#endif
++        // No runtime SSE4.1 check: same assumption L2SqrSIMD16ExtSSE's use
++        // as an unconditional default already makes for baseline SSE2 --
++        // SSE4.1 (2008, Penryn/Nehalem) is old enough at this point that
++        // any x86-64 target this project runs on has it.
++        if (dim % 16 == 0)
++            fstdistfunc_ = L2SqrU8SIMD16Ext;
++        else if (dim > 16)
++            fstdistfunc_ = L2SqrU8SIMD16ExtResiduals;
++#endif
+         dim_ = dim;
+         data_size_ = dim * sizeof(unsigned char);
+     }
+@@ -321,4 +468,306 @@ class L2SpaceI : public SpaceInterface<int> {
+ 
+     ~L2SpaceI() {}
+ };
++
++// L2SpaceInt8: signed int8_t data (as opposed to L2SpaceI's unsigned
++// char). Structurally identical to the uint8 kernels above -- same
++// widen-to-int32-first reasoning, same 16-byte outer chunk contract, same
++// three ISA tiers -- the only difference is sign-extending widen
++// instructions (PMOVSXBD, not PMOVZXBD) and the int8_t pointer type.
++static int
++L2SqrInt8(const void *__restrict pVect1v, const void *__restrict pVect2v, const void *__restrict qty_ptr) {
++    const int8_t *pVect1 = (const int8_t *) pVect1v;
++    const int8_t *pVect2 = (const int8_t *) pVect2v;
++    size_t qty = *((size_t *) qty_ptr);
++
++    int res = 0;
++    for (size_t i = 0; i < qty; i++) {
++        int diff = (int) pVect1[i] - (int) pVect2[i];
++        res += diff * diff;
++    }
++    return res;
++}
++
++#if defined(USE_SSE41)
++static int
++L2SqrInt8SIMD16ExtSSE41(const void *__restrict pVect1v, const void *__restrict pVect2v,
++        const void *__restrict qty_ptr) {
++    const int8_t *pVect1 = (const int8_t *) pVect1v;
++    const int8_t *pVect2 = (const int8_t *) pVect2v;
++    size_t qty = *((size_t *) qty_ptr);
++    size_t qty16 = qty >> 4;
++
++    __m128i sum = _mm_setzero_si128();
++    for (size_t i = 0; i < qty16; i++) {
++        for (int j = 0; j < 4; j++) {
++            int32_t a4, b4;
++            std::memcpy(&a4, pVect1, 4);
++            std::memcpy(&b4, pVect2, 4);
++            pVect1 += 4;
++            pVect2 += 4;
++            __m128i a32 = _mm_cvtepi8_epi32(_mm_cvtsi32_si128(a4));
++            __m128i b32 = _mm_cvtepi8_epi32(_mm_cvtsi32_si128(b4));
++            __m128i diff = _mm_sub_epi32(a32, b32);
++            sum = _mm_add_epi32(sum, _mm_mullo_epi32(diff, diff));
++        }
++    }
++
++    int32_t PORTABLE_ALIGN32 tmp[4];
++    _mm_store_si128((__m128i *) tmp, sum);
++    return tmp[0] + tmp[1] + tmp[2] + tmp[3];
++}
++#endif
++
++#if defined(USE_AVX2)
++static int
++L2SqrInt8SIMD16ExtAVX2(const void *__restrict pVect1v, const void *__restrict pVect2v,
++        const void *__restrict qty_ptr) {
++    const int8_t *pVect1 = (const int8_t *) pVect1v;
++    const int8_t *pVect2 = (const int8_t *) pVect2v;
++    size_t qty = *((size_t *) qty_ptr);
++    size_t qty16 = qty >> 4;
++
++    __m256i sum = _mm256_setzero_si256();
++    for (size_t i = 0; i < qty16; i++) {
++        for (int j = 0; j < 2; j++) {
++            __m128i a8 = _mm_loadl_epi64((const __m128i *) pVect1);
++            __m128i b8 = _mm_loadl_epi64((const __m128i *) pVect2);
++            pVect1 += 8;
++            pVect2 += 8;
++            __m256i a32 = _mm256_cvtepi8_epi32(a8);
++            __m256i b32 = _mm256_cvtepi8_epi32(b8);
++            __m256i diff = _mm256_sub_epi32(a32, b32);
++            sum = _mm256_add_epi32(sum, _mm256_mullo_epi32(diff, diff));
++        }
++    }
++
++    int32_t PORTABLE_ALIGN32 tmp[8];
++    _mm256_storeu_si256((__m256i *) tmp, sum);
++    return tmp[0] + tmp[1] + tmp[2] + tmp[3] + tmp[4] + tmp[5] + tmp[6] + tmp[7];
++}
++#endif
++
++#if defined(USE_AVX512)
++static int
++L2SqrInt8SIMD16ExtAVX512(const void *__restrict pVect1v, const void *__restrict pVect2v,
++        const void *__restrict qty_ptr) {
++    const int8_t *pVect1 = (const int8_t *) pVect1v;
++    const int8_t *pVect2 = (const int8_t *) pVect2v;
++    size_t qty = *((size_t *) qty_ptr);
++    size_t qty16 = qty >> 4;
++
++    __m512i sum = _mm512_setzero_si512();
++    for (size_t i = 0; i < qty16; i++) {
++        __m128i a8 = _mm_loadu_si128((const __m128i *) pVect1);
++        __m128i b8 = _mm_loadu_si128((const __m128i *) pVect2);
++        pVect1 += 16;
++        pVect2 += 16;
++        __m512i a32 = _mm512_cvtepi8_epi32(a8);
++        __m512i b32 = _mm512_cvtepi8_epi32(b8);
++        __m512i diff = _mm512_sub_epi32(a32, b32);
++        sum = _mm512_add_epi32(sum, _mm512_mullo_epi32(diff, diff));
++    }
++    return _mm512_reduce_add_epi32(sum);
++}
++#endif
++
++#if defined(USE_SSE41)
++static DISTFUNC<int> L2SqrInt8SIMD16Ext = L2SqrInt8SIMD16ExtSSE41;
++
++static int
++L2SqrInt8SIMD16ExtResiduals(const void *pVect1v, const void *pVect2v, const void *qty_ptr) {
++    size_t qty = *((size_t *) qty_ptr);
++    size_t qty16 = qty >> 4 << 4;
++    int res = L2SqrInt8SIMD16Ext(pVect1v, pVect2v, &qty16);
++
++    const int8_t *pVect1 = (const int8_t *) pVect1v + qty16;
++    const int8_t *pVect2 = (const int8_t *) pVect2v + qty16;
++    size_t qty_left = qty - qty16;
++    int res_tail = L2SqrInt8(pVect1, pVect2, &qty_left);
++    return res + res_tail;
++}
++#endif
++
++class L2SpaceInt8 : public SpaceInterface<int> {
++    DISTFUNC<int> fstdistfunc_;
++    size_t data_size_;
++    size_t dim_;
++
++ public:
++    L2SpaceInt8(size_t dim) {
++        fstdistfunc_ = L2SqrInt8;
++#if defined(USE_SSE41)
++#if defined(USE_AVX512)
++        if (AVX512Capable())
++            L2SqrInt8SIMD16Ext = L2SqrInt8SIMD16ExtAVX512;
++        else if (AVX2Capable())
++            L2SqrInt8SIMD16Ext = L2SqrInt8SIMD16ExtAVX2;
++#elif defined(USE_AVX2)
++        if (AVX2Capable())
++            L2SqrInt8SIMD16Ext = L2SqrInt8SIMD16ExtAVX2;
++#endif
++        if (dim % 16 == 0)
++            fstdistfunc_ = L2SqrInt8SIMD16Ext;
++        else if (dim > 16)
++            fstdistfunc_ = L2SqrInt8SIMD16ExtResiduals;
++#endif
++        dim_ = dim;
++        data_size_ = dim * sizeof(int8_t);
++    }
++
++    size_t get_data_size() {
++        return data_size_;
++    }
++
++    DISTFUNC<int> get_dist_func() {
++        return fstdistfunc_;
++    }
++
++    void *get_dist_func_param() {
++        return &dim_;
++    }
++
++    ~L2SpaceInt8() {}
++};
++
++// L2SpaceHalf: IEEE-754 binary16 data, stored as raw uint16_t (see
++// half_utils.h). SIMD tiers convert half->float via F16C (VCVTPH2PS) then
++// reuse plain float subtract/multiply/add -- the same math the float
++// L2Sqr* kernels above already use, just fed converted lanes instead of
++// loading float lanes directly. Both tiers keep the same 16-element outer
++// chunk contract as the uint8/int8 kernels above, for the same reason
++// (one shared residual wrapper): the F16C-only tier covers it via 2
++// widen-8 substeps (_mm256_cvtph_ps, needs F16C+AVX but not AVX512), the
++// AVX512 tier via 1 widen-16 step (_mm512_cvtph_ps, AVX512F baseline --
++// unlike the 128/256-bit forms, the 512-bit half<->float conversion
++// doesn't need the separate F16C CPUID bit).
++static float
++L2SqrHalf(const void *pVect1v, const void *pVect2v, const void *qty_ptr) {
++    const uint16_t *pVect1 = (const uint16_t *) pVect1v;
++    const uint16_t *pVect2 = (const uint16_t *) pVect2v;
++    size_t qty = *((size_t *) qty_ptr);
++
++    float res = 0;
++    for (size_t i = 0; i < qty; i++) {
++        float t = HalfToFloat(pVect1[i]) - HalfToFloat(pVect2[i]);
++        res += t * t;
++    }
++    return res;
++}
++
++#if defined(USE_F16C)
++static float
++L2SqrHalfSIMD16ExtF16C(const void *pVect1v, const void *pVect2v, const void *qty_ptr) {
++    const uint16_t *pVect1 = (const uint16_t *) pVect1v;
++    const uint16_t *pVect2 = (const uint16_t *) pVect2v;
++    size_t qty = *((size_t *) qty_ptr);
++    size_t qty16 = qty >> 4;
++    float PORTABLE_ALIGN32 TmpRes[8];
++
++    __m256 sum = _mm256_set1_ps(0);
++    for (size_t i = 0; i < qty16; i++) {
++        for (int j = 0; j < 2; j++) {  // 2 substeps x 8 halfs = 16 halfs/iter
++            __m128i h1 = _mm_loadu_si128((const __m128i *) pVect1);
++            __m128i h2 = _mm_loadu_si128((const __m128i *) pVect2);
++            pVect1 += 8;
++            pVect2 += 8;
++            __m256 v1 = _mm256_cvtph_ps(h1);
++            __m256 v2 = _mm256_cvtph_ps(h2);
++            __m256 diff = _mm256_sub_ps(v1, v2);
++            sum = _mm256_add_ps(sum, _mm256_mul_ps(diff, diff));
++        }
++    }
++
++    _mm256_store_ps(TmpRes, sum);
++    return TmpRes[0] + TmpRes[1] + TmpRes[2] + TmpRes[3] + TmpRes[4] + TmpRes[5] + TmpRes[6] + TmpRes[7];
++}
++#endif
++
++#if defined(USE_AVX512) && defined(__F16C__)
++static float
++L2SqrHalfSIMD16ExtAVX512(const void *pVect1v, const void *pVect2v, const void *qty_ptr) {
++    const uint16_t *pVect1 = (const uint16_t *) pVect1v;
++    const uint16_t *pVect2 = (const uint16_t *) pVect2v;
++    size_t qty = *((size_t *) qty_ptr);
++    size_t qty16 = qty >> 4;
++
++    __m512 sum = _mm512_set1_ps(0);
++    for (size_t i = 0; i < qty16; i++) {
++        __m256i h1 = _mm256_loadu_si256((const __m256i *) pVect1);
++        __m256i h2 = _mm256_loadu_si256((const __m256i *) pVect2);
++        pVect1 += 16;
++        pVect2 += 16;
++        __m512 v1 = _mm512_cvtph_ps(h1);
++        __m512 v2 = _mm512_cvtph_ps(h2);
++        __m512 diff = _mm512_sub_ps(v1, v2);
++        sum = _mm512_add_ps(sum, _mm512_mul_ps(diff, diff));
++    }
++    return _mm512_reduce_add_ps(sum);
++}
++#endif
++
++#if defined(USE_F16C)
++// Whenever the AVX512 tier above is compiled in (USE_AVX512 && __F16C__),
++// USE_F16C is necessarily defined too (USE_AVX512 implies USE_AVX, and
++// combined with __F16C__ that's USE_F16C's exact condition) -- so this is
++// always a valid, safe compile-time default, same reasoning as
++// L2SqrU8SIMD16Ext's SSE41 default above.
++static DISTFUNC<float> L2SqrHalfSIMD16Ext = L2SqrHalfSIMD16ExtF16C;
++
++static float
++L2SqrHalfSIMD16ExtResiduals(const void *pVect1v, const void *pVect2v, const void *qty_ptr) {
++    size_t qty = *((size_t *) qty_ptr);
++    size_t qty16 = qty >> 4 << 4;
++    float res = L2SqrHalfSIMD16Ext(pVect1v, pVect2v, &qty16);
++
++    const uint16_t *pVect1 = (const uint16_t *) pVect1v + qty16;
++    const uint16_t *pVect2 = (const uint16_t *) pVect2v + qty16;
++    size_t qty_left = qty - qty16;
++    float res_tail = L2SqrHalf(pVect1, pVect2, &qty_left);
++    return res + res_tail;
++}
++#endif
++
++class L2SpaceHalf : public SpaceInterface<float> {
++    DISTFUNC<float> fstdistfunc_;
++    size_t data_size_;
++    size_t dim_;
++
++ public:
++    L2SpaceHalf(size_t dim) {
++        fstdistfunc_ = L2SqrHalf;
++#if defined(USE_F16C)
++#if defined(USE_AVX512) && defined(__F16C__)
++        if (AVX512Capable() && F16CCapable())
++            L2SqrHalfSIMD16Ext = L2SqrHalfSIMD16ExtAVX512;
++        else if (F16CCapable())
++            L2SqrHalfSIMD16Ext = L2SqrHalfSIMD16ExtF16C;
++#else
++        if (F16CCapable())
++            L2SqrHalfSIMD16Ext = L2SqrHalfSIMD16ExtF16C;
++#endif
++        if (dim % 16 == 0)
++            fstdistfunc_ = L2SqrHalfSIMD16Ext;
++        else if (dim > 16)
++            fstdistfunc_ = L2SqrHalfSIMD16ExtResiduals;
++#endif
++        dim_ = dim;
++        data_size_ = dim * sizeof(uint16_t);
++    }
++
++    size_t get_data_size() {
++        return data_size_;
++    }
++
++    DISTFUNC<float> get_dist_func() {
++        return fstdistfunc_;
++    }
++
++    void *get_dist_func_param() {
++        return &dim_;
++    }
++
++    ~L2SpaceHalf() {}
++};
++
+ }  // namespace hnswlib
+diff --git a/tests/cpp/dtype_space_test.cpp b/tests/cpp/dtype_space_test.cpp
+new file mode 100644
+index 0000000..5d348dd
+--- /dev/null
++++ b/tests/cpp/dtype_space_test.cpp
+@@ -0,0 +1,280 @@
++// Correctness test for the uint8/int8/float16 spaces added on top of
++// upstream hnswlib (L2SpaceI's new SIMD tiers, L2SpaceInt8, L2SpaceHalf,
++// InnerProductSpaceU8, InnerProductSpaceInt8, InnerProductSpaceHalf -- see
++// space_l2.h/space_ip.h). Two levels:
++//   1. Every compiled-in SIMD tier's raw distance function, called
++//      directly, must agree with the plain scalar reference across many
++//      dims (including ones not a multiple of the SIMD chunk width, to
++//      exercise the residual path) and randomized data spanning each
++//      type's full value range.
++//   2. Each new Space class, used exactly as HierarchicalNSW would (build
++//      a real graph, insert, search), must actually work end to end and
++//      recall a point queried with its own vector.
++//
++// Which SIMD tiers get exercised depends on how this file itself is
++// compiled (USE_SSE41/USE_AVX2/USE_F16C/USE_AVX512, set from hnswlib.h
++// based on the -m<isa> flags passed) -- run this binary built under a few
++// different flag combinations to cover every tier.
++
++#include "../../hnswlib/hnswlib.h"
++
++#include <algorithm>
++#include <cassert>
++#include <cmath>
++#include <cstdint>
++#include <iostream>
++#include <random>
++#include <vector>
++
++namespace {
++
++std::mt19937 rng(12345);
++
++std::vector<unsigned char> RandomU8(size_t n) {
++    std::uniform_int_distribution<int> dist(0, 255);
++    std::vector<unsigned char> v(n);
++    for (auto &x : v) x = static_cast<unsigned char>(dist(rng));
++    return v;
++}
++
++std::vector<int8_t> RandomInt8(size_t n) {
++    std::uniform_int_distribution<int> dist(-128, 127);
++    std::vector<int8_t> v(n);
++    for (auto &x : v) x = static_cast<int8_t>(dist(rng));
++    return v;
++}
++
++std::vector<uint16_t> RandomHalf(size_t n) {
++    std::uniform_real_distribution<float> dist(-10.0f, 10.0f);
++    std::vector<uint16_t> v(n);
++    for (auto &x : v) x = hnswlib::FloatToHalf(dist(rng));
++    return v;
++}
++
++std::vector<float> RandomFloat(size_t n) {
++    std::uniform_real_distribution<float> dist(-10.0f, 10.0f);
++    std::vector<float> v(n);
++    for (auto &x : v) x = dist(rng);
++    return v;
++}
++
++const size_t kDims[] = {1, 2, 3, 4, 7, 8, 15, 16, 17, 31, 32, 33, 100, 129, 257};
++
++// ---- Level 1: SIMD tier vs scalar reference, per compiled-in tier ----
++
++void TestU8L2() {
++    for (size_t dim : kDims) {
++        auto a = RandomU8(dim);
++        auto b = RandomU8(dim);
++        int expected = hnswlib::L2SqrI(a.data(), b.data(), &dim);
++
++#if defined(USE_SSE41)
++        int got_sse41 = hnswlib::L2SqrU8SIMD16ExtSSE41(a.data(), b.data(), &dim);
++        if (dim % 16 == 0) assert(got_sse41 == expected);
++#endif
++#if defined(USE_AVX2)
++        if (dim >= 16) {
++            int got_avx2 = hnswlib::L2SqrU8SIMD16ExtAVX2(a.data(), b.data(), &dim);
++            if (dim % 16 == 0) assert(got_avx2 == expected);
++        }
++#endif
++#if defined(USE_SSE41)
++        // Residual path (the one L2SpaceI's constructor actually picks
++        // for non-multiple-of-16 dims) must match regardless of dim.
++        int got_residual = hnswlib::L2SqrU8SIMD16ExtResiduals(a.data(), b.data(), &dim);
++        assert(got_residual == expected);
++#endif
++    }
++    std::cout << "TestU8L2 ok\n";
++}
++
++void TestInt8L2() {
++    for (size_t dim : kDims) {
++        auto a = RandomInt8(dim);
++        auto b = RandomInt8(dim);
++        int expected = hnswlib::L2SqrInt8(a.data(), b.data(), &dim);
++
++#if defined(USE_SSE41)
++        int got_residual = hnswlib::L2SqrInt8SIMD16ExtResiduals(a.data(), b.data(), &dim);
++        assert(got_residual == expected);
++        if (dim % 16 == 0) {
++            int got_sse41 = hnswlib::L2SqrInt8SIMD16ExtSSE41(a.data(), b.data(), &dim);
++            assert(got_sse41 == expected);
++        }
++#endif
++#if defined(USE_AVX2)
++        if (dim % 16 == 0) {
++            int got_avx2 = hnswlib::L2SqrInt8SIMD16ExtAVX2(a.data(), b.data(), &dim);
++            assert(got_avx2 == expected);
++        }
++#endif
++    }
++    std::cout << "TestInt8L2 ok\n";
++}
++
++void TestHalfL2() {
++    for (size_t dim : kDims) {
++        auto a = RandomHalf(dim);
++        auto b = RandomHalf(dim);
++        float expected = hnswlib::L2SqrHalf(a.data(), b.data(), &dim);
++
++#if defined(USE_F16C)
++        float got_residual = hnswlib::L2SqrHalfSIMD16ExtResiduals(a.data(), b.data(), &dim);
++        // Relative tolerance: half itself only carries ~3 decimal digits,
++        // and the SIMD/scalar paths may sum in a different order.
++        float tol = std::max(1e-3f, std::fabs(expected) * 1e-2f);
++        assert(std::fabs(got_residual - expected) <= tol);
++        if (dim % 16 == 0) {
++            float got_f16c = hnswlib::L2SqrHalfSIMD16ExtF16C(a.data(), b.data(), &dim);
++            assert(std::fabs(got_f16c - expected) <= tol);
++        }
++#endif
++    }
++    std::cout << "TestHalfL2 ok\n";
++}
++
++void TestU8InnerProduct() {
++    for (size_t dim : kDims) {
++        auto a = RandomU8(dim);
++        auto b = RandomU8(dim);
++        int expected = -hnswlib::InnerProductU8(a.data(), b.data(), &dim);
++
++#if defined(USE_SSE41)
++        int got_residual = hnswlib::InnerProductDistanceU8SIMD16ExtResiduals(a.data(), b.data(), &dim);
++        assert(got_residual == expected);
++#endif
++    }
++    std::cout << "TestU8InnerProduct ok\n";
++}
++
++void TestInt8InnerProduct() {
++    for (size_t dim : kDims) {
++        auto a = RandomInt8(dim);
++        auto b = RandomInt8(dim);
++        int expected = -hnswlib::InnerProductInt8(a.data(), b.data(), &dim);
++
++#if defined(USE_SSE41)
++        int got_residual = hnswlib::InnerProductDistanceInt8SIMD16ExtResiduals(a.data(), b.data(), &dim);
++        assert(got_residual == expected);
++#endif
++    }
++    std::cout << "TestInt8InnerProduct ok\n";
++}
++
++void TestHalfInnerProduct() {
++    for (size_t dim : kDims) {
++        auto a = RandomHalf(dim);
++        auto b = RandomHalf(dim);
++        float expected = 1.0f - hnswlib::InnerProductHalf(a.data(), b.data(), &dim);
++
++#if defined(USE_F16C)
++        float got_residual = hnswlib::InnerProductDistanceHalfSIMD16ExtResiduals(a.data(), b.data(), &dim);
++        float tol = std::max(1e-3f, std::fabs(expected) * 1e-2f);
++        assert(std::fabs(got_residual - expected) <= tol);
++#endif
++    }
++    std::cout << "TestHalfInnerProduct ok\n";
++}
++
++// ---- Level 2: full HierarchicalNSW build + search, per new Space ----
++// (inline per-space below in main(), rather than templated -- the new
++// Space classes don't share a common dist_t, and this is a small enough
++// amount of repetition to just write out, matching hnswlib's own test
++// style elsewhere in this directory.)
++
++}  // namespace
++
++int main() {
++    std::cout << "Compiled-in SIMD tiers for this run:"
++#if defined(USE_SSE41)
++              << " SSE41"
++#endif
++#if defined(USE_AVX2)
++              << " AVX2"
++#endif
++#if defined(USE_F16C)
++              << " F16C"
++#endif
++#if defined(USE_AVX512)
++              << " AVX512"
++#endif
++              << "\n";
++
++    TestU8L2();
++    TestInt8L2();
++    TestHalfL2();
++    TestU8InnerProduct();
++    TestInt8InnerProduct();
++    TestHalfInnerProduct();
++
++    // SpaceInterface<...>::type_dist_t doesn't exist on the base class in
++    // this hnswlib version, so pass the dist_t explicitly per space
++    // instead of relying on a member typedef.
++    {
++        hnswlib::L2SpaceI space(100);
++        hnswlib::HierarchicalNSW<int> index(&space, 200, 16, 100);
++        std::vector<std::vector<unsigned char>> data;
++        for (size_t i = 0; i < 200; i++) {
++            data.push_back(RandomU8(100));
++            index.addPoint(data.back().data(), i);
++        }
++        index.setEf(50);
++        size_t misses = 0;
++        for (size_t i = 0; i < 200; i++) {
++            if (index.searchKnn(data[i].data(), 1).top().second != i) misses++;
++        }
++        std::cout << "L2SpaceI graph self-recall misses: " << misses << "/200\n";
++        assert(misses <= 10);
++    }
++    {
++        hnswlib::L2SpaceInt8 space(100);
++        hnswlib::HierarchicalNSW<int> index(&space, 200, 16, 100);
++        std::vector<std::vector<int8_t>> data;
++        for (size_t i = 0; i < 200; i++) {
++            data.push_back(RandomInt8(100));
++            index.addPoint(data.back().data(), i);
++        }
++        index.setEf(50);
++        size_t misses = 0;
++        for (size_t i = 0; i < 200; i++) {
++            if (index.searchKnn(data[i].data(), 1).top().second != i) misses++;
++        }
++        std::cout << "L2SpaceInt8 graph self-recall misses: " << misses << "/200\n";
++        assert(misses <= 10);
++    }
++    {
++        hnswlib::L2SpaceHalf space(100);
++        hnswlib::HierarchicalNSW<float> index(&space, 200, 16, 100);
++        std::vector<std::vector<uint16_t>> data;
++        for (size_t i = 0; i < 200; i++) {
++            data.push_back(RandomHalf(100));
++            index.addPoint(data.back().data(), i);
++        }
++        index.setEf(50);
++        size_t misses = 0;
++        for (size_t i = 0; i < 200; i++) {
++            if (index.searchKnn(data[i].data(), 1).top().second != i) misses++;
++        }
++        std::cout << "L2SpaceHalf graph self-recall misses: " << misses << "/200\n";
++        assert(misses <= 10);
++    }
++    {
++        hnswlib::InnerProductSpaceHalf space(100);
++        hnswlib::HierarchicalNSW<float> index(&space, 200, 16, 100);
++        std::vector<std::vector<uint16_t>> data;
++        for (size_t i = 0; i < 200; i++) {
++            data.push_back(RandomHalf(100));
++            index.addPoint(data.back().data(), i);
++        }
++        index.setEf(50);
++        size_t misses = 0;
++        for (size_t i = 0; i < 200; i++) {
++            if (index.searchKnn(data[i].data(), 1).top().second != i) misses++;
++        }
++        std::cout << "InnerProductSpaceHalf graph self-recall misses: " << misses << "/200\n";
++        assert(misses <= 10);
++    }
++
++    std::cout << "ALL DTYPE SPACE TESTS PASSED\n";
++    return 0;
++}

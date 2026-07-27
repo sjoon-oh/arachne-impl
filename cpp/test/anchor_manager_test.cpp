@@ -1,4 +1,4 @@
-#include "arachne/core/anchor_manager.hpp"
+#include "core/anchor_manager.hpp"
 
 #include <gtest/gtest.h>
 
@@ -41,24 +41,25 @@ TEST(AnchorManagerTest, DistinctRegionsAccumulateSeparateStitches) {
 	EXPECT_EQ(manager.stitchesOf(1).size(), 2u);
 }
 
-TEST(AnchorManagerTest, RemoveStitchReturnsItsLeaseAndDropsIt) {
+TEST(AnchorManagerTest, RemoveStitchReturnsItAndDropsIt) {
 	AnchorManager manager;
 	manager.addStitch(1, /*region=*/42, LeaseHandle{42, 7});
 
-	LeaseHandle removed = manager.removeStitch(1, 42);
+	Stitch removed = manager.removeStitch(1, 42);
 
-	EXPECT_TRUE(removed.valid());
-	EXPECT_EQ(removed.epoch, 7u);
+	EXPECT_TRUE(removed.lease.valid());
+	EXPECT_EQ(removed.region, 42u);
+	EXPECT_EQ(removed.lease.epoch, 7u);
 	EXPECT_TRUE(manager.stitchesOf(1).empty());
 }
 
-TEST(AnchorManagerTest, RemoveStitchOfUnknownRegionReturnsInvalidHandle) {
+TEST(AnchorManagerTest, RemoveStitchOfUnknownRegionReturnsInvalidStitch) {
 	AnchorManager manager;
 	manager.addStitch(1, /*region=*/42, LeaseHandle{42, 7});
 
-	LeaseHandle removed = manager.removeStitch(1, /*region=*/99);
+	Stitch removed = manager.removeStitch(1, /*region=*/99);
 
-	EXPECT_FALSE(removed.valid());
+	EXPECT_FALSE(removed.lease.valid());
 	EXPECT_EQ(manager.stitchesOf(1).size(), 1u);  // untouched
 }
 

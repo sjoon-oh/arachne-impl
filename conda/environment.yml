@@ -18,21 +18,15 @@ dependencies:
   - cuda-version=12.8
   - cuda-toolkit=12.8
   - cuda-nvcc=12.8
+  - cuda-cudart=12.8
+  - cuda-cudart-dev=12.8
   - gcc=12
   - gxx=12
   - cmake>=3.26
   - ninja
-  # RAFT: header-only + compiled GPU primitives (distance, matrix, etc.)
-  # that Arachne's control plane links against. Index adapters that want a
-  # ready-made GPU ANN index (e.g. CAGRA) should additionally depend on
-  # libcuvs, which is intentionally left out here since Arachne itself is
-  # index-agnostic.
-  - libraft-headers
+  - libraft-headers       # RAFT: header-only + compiled GPU primitives (distance, matrix, etc.)
   - libraft
   - librmm
   - gtest
-  # Logging. RAFT's own logger (raft::default_logger(), included with
-  # libraft above) is itself a spdlog wrapper (rapids-logger), so this is
-  # only needed standalone when building with ARACHNE_USE_RAFT=OFF -- see
-  # cpp/include/arachne/logging.hpp.
-  - spdlog
+  - spdlog                # Logging.
+  - highway               # CPU SIMD (AVX2/AVX512/NEON) dynamic dispatch for arachne/util vector math.

@@ -9,19 +9,27 @@
 //    RAFT's GPU-primitive logs share one sink, pattern, and level.
 //  - RAFT not linked: falls back to a standalone spdlog logger.
 //
-// spdlog is the engine underneath either way; RAFT just wraps it behind
-// rapids-logger's PImpl, which is why the two branches below look
-// different. Both accept fmt-style "{}" placeholders.
+// spdlog is the engine underneath either way, but the two aren't
+// format-compatible: the spdlog fallback below takes fmt-style "{}"
+// placeholders directly, while rapids_logger::logger::log() (what
+// RAFT_LOG_* forwards to) formats with plain printf-style specifiers
+// (std::snprintf internally) and silently drops "{}" as inert literal text
+// instead of substituting it -- every ARACHNE_LOG_* call site in this
+// codebase is written fmt-style, so the RAFT branch formats the message
+// eagerly with fmt itself and hands raft's logger the already-formatted
+// string via "%s", instead of requiring two different call styles at every
+// call site depending on which branch is active.
 
 #if defined(ARACHNE_WITH_RAFT)
 
+#include <fmt/format.h>
 #include <raft/core/logger.hpp>
 
-#define ARACHNE_LOG_TRACE(...) RAFT_LOG_TRACE(__VA_ARGS__)
-#define ARACHNE_LOG_DEBUG(...) RAFT_LOG_DEBUG(__VA_ARGS__)
-#define ARACHNE_LOG_INFO(...) RAFT_LOG_INFO(__VA_ARGS__)
-#define ARACHNE_LOG_WARN(...) RAFT_LOG_WARN(__VA_ARGS__)
-#define ARACHNE_LOG_ERROR(...) RAFT_LOG_ERROR(__VA_ARGS__)
+#define ARACHNE_LOG_TRACE(...) RAFT_LOG_TRACE("%s", ::fmt::format(__VA_ARGS__).c_str())
+#define ARACHNE_LOG_DEBUG(...) RAFT_LOG_DEBUG("%s", ::fmt::format(__VA_ARGS__).c_str())
+#define ARACHNE_LOG_INFO(...) RAFT_LOG_INFO("%s", ::fmt::format(__VA_ARGS__).c_str())
+#define ARACHNE_LOG_WARN(...) RAFT_LOG_WARN("%s", ::fmt::format(__VA_ARGS__).c_str())
+#define ARACHNE_LOG_ERROR(...) RAFT_LOG_ERROR("%s", ::fmt::format(__VA_ARGS__).c_str())
 
 #else
 

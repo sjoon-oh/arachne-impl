@@ -2,8 +2,8 @@
 
 #include <vector>
 
-#include "arachne/adapter/region.hpp"
-#include "arachne/types.hpp"
+#include "adapter/region.hpp"
+#include "types.hpp"
 
 namespace arachne {
 
@@ -12,22 +12,22 @@ enum class ExecutionMode {
 	Hybrid,   // the underlying index may fall back to Host traversal
 };
 
-struct TraversalRequest {
+struct TraverseRequest {
 	Query query;
 	ExecutionMode mode = ExecutionMode::Hybrid;
 	RegionFootprint scope;  // regions the traversal is confined to when GpuOnly
 };
 
-struct TraversalResult {
+struct TraverseResult {
 	SearchResult result;
 	RegionFootprint touched;               // footprint actually accessed
 	bool completed_within_scope = false;   // false => a GpuOnly attempt fell short
 };
 
-enum class ModificationOp { Insert, Delete };
+enum class ModifyOp { Insert, Delete };
 
-struct ModificationRequest {
-	ModificationOp op = ModificationOp::Insert;
+struct ModifyRequest {
+	ModifyOp op = ModifyOp::Insert;
 	Record record;           // valid for Insert
 	VectorId target = 0;     // valid for Delete
 	ExecutionMode mode = ExecutionMode::Hybrid;
@@ -35,7 +35,7 @@ struct ModificationRequest {
 	LeaseHandle lease;  // set when a GPU write lease already covers `scope`
 };
 
-struct ModificationResult {
+struct ModifyResult {
 	bool ok = false;
 	RegionFootprint touched;   // regions the candidate search/traversal read
 	RegionFootprint modified;  // regions actually mutated
@@ -51,8 +51,8 @@ class IndexAdapter {
  public:
 	virtual ~IndexAdapter() = default;
 
-	virtual TraversalResult traverse(const TraversalRequest& request) = 0;
-	virtual ModificationResult modify(const ModificationRequest& request) = 0;
+	virtual TraverseResult traverse(const TraverseRequest& request) = 0;
+	virtual ModifyResult modify(const ModifyRequest& request) = 0;
 
 	/// Structural accessors, not primitives: let Core resolve footprints
 	/// returned above into IRegion callbacks for residency/lease management.

@@ -23,7 +23,7 @@ if(DEFINED ENV{CONDA_PREFIX})
 endif()
 
 # Header-only; vendored as a submodule rather than pulled from conda since
-# it isn't packaged there. Backs RoutingCacheHnsw, but only inside
+# it isn't packaged there. Backs ASRoutingCacheHnsw, but only inside
 # routing_cache_hnsw.cpp -- the public header (arachne/core/
 # routing_cache_hnsw.hpp) forward-declares its hnswlib-wrapping Instance
 # type, so hnswlib stays a PRIVATE (impl-only) dependency of arachne_core.
@@ -32,21 +32,58 @@ target_include_directories(hnswlib SYSTEM INTERFACE
 	$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/hnswlib>
 )
 
-add_library(arachne_core
-	src/interface/engine.cpp
-	src/core/core.cpp
-	src/core/anchor_manager.cpp
-	src/core/routing_cache_hnsw.cpp
+set(ARACHNE_CORE_SOURCES
+		src/interface/index_impl.cpp
+		src/core/controller.cpp
+		src/core/op_scheduler.cpp
+		src/core/scheduling_policy.cpp
+		src/core/anchor_manager.cpp
+		src/core/as_routing_cache.cpp
+	src/core/as_routing_cache_hnsw.cpp
+	src/util/distance.cpp
 )
+if(ARACHNE_USE_RAFT)
+	# GPU device/memory management (arachne/gpu) -- built on raft::device_resources
+	# and RMM, so it only compiles/links when RAFT is actually available. See
+	# gpu/device_context.hpp and gpu/stitch_pool.hpp; Controller only declares
+	# its gpu:: members under the matching ARACHNE_WITH_RAFT compile definition
+	# set below.
+	list(APPEND ARACHNE_CORE_SOURCES
+		src/gpu/device_context.cpp
+		src/gpu/stitch_pool.cpp
+	)
+endif()
+
+add_library(arachne_core ${ARACHNE_CORE_SOURCES})
 add_library(arachne::core ALIAS arachne_core)
 
 target_include_directories(arachne_core PUBLIC
 	$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
 )
+# PRIVATE, cpp/ itself (not cpp/include): src/util/distance.cpp's Highway
+# foreach_target.h self-include re-includes this file by its src/-relative
+# path (see HWY_TARGET_INCLUDE there), which needs cpp/ -- not cpp/include,
+# which distance.cpp isn't under -- on the include path to resolve.
+target_include_directories(arachne_core PRIVATE
+	$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
+)
 target_compile_features(arachne_core PUBLIC cxx_std_20)
 target_link_libraries(arachne_core PRIVATE hnswlib)
 
-# RoutingCacheHnsw's background compaction (std::thread/std::shared_mutex).
+# logging.hpp needs fmt::format directly (see its own comment) regardless of
+# which ARACHNE_USE_RAFT branch is active -- the spdlog fallback pulls fmt
+# in transitively, but raft::raft does not, so this can't be left implicit.
+find_package(fmt CONFIG REQUIRED)
+target_link_libraries(arachne_core PUBLIC fmt::fmt)
+
+# Highway: CPU SIMD (AVX2/AVX512/NEON) with runtime target dispatch, backing
+# arachne/util/distance.hpp. Impl-only (src/util/distance.cpp), same as hnswlib --
+# the public header exposes plain float* signatures, so nothing that only
+# includes it needs Highway on its include path.
+find_package(hwy CONFIG REQUIRED)
+target_link_libraries(arachne_core PRIVATE hwy::hwy)
+
+# ASRoutingCacheHnsw's background compaction (std::thread/std::shared_mutex).
 find_package(Threads REQUIRED)
 target_link_libraries(arachne_core PUBLIC Threads::Threads)
 
