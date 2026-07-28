@@ -37,6 +37,7 @@ set(ARACHNE_CORE_SOURCES
 		src/core/controller.cpp
 		src/core/op_scheduler.cpp
 		src/core/scheduling_policy.cpp
+		src/core/replacement_policy.cpp
 		src/core/anchor_manager.cpp
 		src/core/as_routing_cache.cpp
 	src/core/as_routing_cache_hnsw.cpp

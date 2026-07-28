@@ -2,10 +2,12 @@
 
 #include <optional>
 #include <cstdint>
+#include <memory>
 
 #include "adapter/index_adapter.hpp"
 #include "core/anchor_manager.hpp"
 #include "core/op_scheduler.hpp"
+#include "core/replacement_policy.hpp"
 #include "core/routing_cache.hpp"
 
 #if defined(ARACHNE_WITH_RAFT)
@@ -29,8 +31,12 @@ namespace arachne {
 /// both.
 class Controller {
  public:
+	// `replacement_policy` defaults to FifoReplacementPolicy when left null,
+	// mirroring OpScheduler's own SchedulingPolicy default (see
+	// core/op_scheduler.hpp) -- see ReplacementPolicy's doc comment.
 	Controller(IndexAdapter& adapter, RoutingCache& routing_cache,
-			 SchedulingConfig scheduling_config = {});
+			 SchedulingConfig scheduling_config = {},
+			 std::unique_ptr<ReplacementPolicy> replacement_policy = nullptr);
 
 	SearchResult search(const Query& query);
 	InsertResult insert(const Record& record);
@@ -74,10 +80,31 @@ class Controller {
 
 	// Promotion / eviction (design point 2). Not yet wired to a drift
 	// trigger -- the policy for "when" is still open; these are the "how".
-	// Distinct from the Stitch-based Lease replacement policy below: this is
+	// Distinct from the Anchor/Stitch-based replacement policy below: this is
 	// general read-side residency, not write-lease bookkeeping.
 	void promote(const RegionFootprint& hot_host_footprint);
 	void evict(const RegionFootprint& candidates);
+
+	// Anchor-centric Promotion (design point 4): grants `anchor_id` write-lease
+	// Stitches over every region in `footprint`. 1) registers `anchor_id` in
+	// routing_cache_ under `anchor_vector` so future queries route to it, 2)
+	// calls make() per region, which materializes the region on device (see
+	// IRegion::materializeOnDevice()) and acquires a write lease for it, and
+	// 3) if make() fails for a region, asks replacement_policy_ for an Anchor
+	// to reclaim (excluding `anchor_id` itself), evicts it via evictAnchor(),
+	// and retries that one region once. Gives up on a region (leaving it
+	// un-stitched for this call) if there's no eviction candidate or the
+	// retry still fails -- a future call can try again.
+	void promoteAnchor(VectorId anchor_id, const VectorView& anchor_vector,
+									const RegionFootprint& footprint);
+
+	// Reclaims every Stitch currently held by `anchor_id`: releases each
+	// write lease, frees the GPU memory backing it (once StitchPool sizing is
+	// wired -- see make()'s doc comment), and notifies replacement_policy_ so
+	// it stops tracking `anchor_id`. The mechanism promoteAnchor() calls
+	// through replacement_policy_->selectEvictionCandidate() when it needs
+	// room, and the one verify() below uses on a mismatch.
+	void evictAnchor(VectorId anchor_id);
 
 	// Selective verification (design point 3). Not yet wired into search().
 	// On mismatch, reclaims every Stitch on `anchor_id` (via anchor_manager_)
@@ -85,25 +112,30 @@ class Controller {
 	// locality.
 	void verify(const Query& query, VectorId anchor_id, const TraverseResult& gpu_only_result);
 
-	// Stitch lifecycle (design point 4): acquires a write lease on `region`
-	// and records it against `anchor_id` via anchor_manager_. The eventual
-	// Anchor-recency replacement policy (reclaim every Stitch on a cold
-	// Anchor) would go through anchor_manager_.forget() directly rather than
-	// a Core-level counterpart to this.
+	// Stitch lifecycle (design point 4): materializes `region` on device if
+	// it isn't already (IRegion::materializeOnDevice()), acquires a write
+	// lease on it, and records both against `anchor_id` via anchor_manager_
+	// and replacement_policy_ (see promoteAnchor(), the caller this exists
+	// for). Returns false, leaving no new state behind, if `region` doesn't
+	// resolve, doesn't become resident, or isn't lease-eligible right now --
+	// callers wanting eviction-and-retry on failure go through
+	// promoteAnchor(), not this directly.
 	//
 	// Does not yet allocate GPU memory for the Stitch via stitch_pool_ above
 	// -- that needs a way to learn how many bytes `region` needs, which
 	// IRegion doesn't expose yet. Once it does, this is where
 	// stitch_pool_.allocate() gets called and the resulting handle threaded
 	// into anchor_manager_.addStitch()'s `memory` parameter; the mirror image
-	// (stitch_pool_.free()) belongs wherever a Stitch is removed --
-	// currently just the `stale` loop in verify() below.
+	// (stitch_pool_.free()) already happens in evictAnchor() below, guarded
+	// on Stitch::memory.valid() so it's a no-op until that wiring exists.
 	bool make(VectorId anchor_id, RegionId region);
 
 	IndexAdapter& adapter_;
 	RoutingCache& routing_cache_;
 	OpScheduler scheduler_;
 	AnchorManager anchor_manager_;
+	// Strategy (design point 4): see ReplacementPolicy's doc comment.
+	std::unique_ptr<ReplacementPolicy> replacement_policy_;
 #if defined(ARACHNE_WITH_RAFT)
 	// GPU residency accounting (design point 4): Arachne-owned, not the
 	// adapter's -- see gpu/device_context.hpp and gpu/stitch_pool.hpp. Not

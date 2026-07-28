@@ -19,16 +19,24 @@ constexpr float kDefaultAnchorMaxDistance = 1e-3f;
 }  // namespace
 
 #if defined(ARACHNE_WITH_RAFT)
-Controller::Controller(IndexAdapter& adapter, RoutingCache& routing_cache, SchedulingConfig scheduling_config)
+Controller::Controller(IndexAdapter& adapter, RoutingCache& routing_cache, SchedulingConfig scheduling_config,
+												std::unique_ptr<ReplacementPolicy> replacement_policy)
 	: adapter_(adapter),
 		routing_cache_(routing_cache),
 		scheduler_(scheduling_config),
+		replacement_policy_(std::move(replacement_policy)),
 		stitch_pool_(device_) {
+	if (replacement_policy_ == nullptr) replacement_policy_ = std::make_unique<FifoReplacementPolicy>();
 	scheduler_.start(adapter_);
 }
 #else
-Controller::Controller(IndexAdapter& adapter, RoutingCache& routing_cache, SchedulingConfig scheduling_config)
-	: adapter_(adapter), routing_cache_(routing_cache), scheduler_(scheduling_config) {
+Controller::Controller(IndexAdapter& adapter, RoutingCache& routing_cache, SchedulingConfig scheduling_config,
+												std::unique_ptr<ReplacementPolicy> replacement_policy)
+	: adapter_(adapter),
+		routing_cache_(routing_cache),
+		scheduler_(scheduling_config),
+		replacement_policy_(std::move(replacement_policy)) {
+	if (replacement_policy_ == nullptr) replacement_policy_ = std::make_unique<FifoReplacementPolicy>();
 	scheduler_.start(adapter_);
 }
 #endif
@@ -122,12 +130,8 @@ SearchResult Controller::commitSearch(const SearchPlan& plan, const TraverseResu
 }
 
 InsertResult Controller::commitInsert(const InsertPlan& plan, const ModifyResult& result) {
-	if (result.ok) {
-		for (RegionId region : result.modified.regions) {
-			if (plan.anchor_id != 0) {
-				make(plan.anchor_id, region);
-			}
-		}
+	if (result.ok && plan.anchor_id != 0) {
+		promoteAnchor(plan.anchor_id, plan.request.record.vector, result.modified);
 	}
 
 	recordTraversalForDrift(plan.request.mode == ExecutionMode::Hybrid);
@@ -201,15 +205,8 @@ void Controller::verify(const Query& query, VectorId anchor_id, const TraverseRe
 	// GPU-only diverged from ground truth: the regions currently stitched to
 	// this Anchor no longer represent its locality, so reclaim them all
 	// (Quick Summary design point 3 feeding the point 4 replacement policy).
-	std::vector<Stitch> stale = anchor_manager_.forget(anchor_id);
-
-	ARACHNE_LOG_WARN("verification mismatch for anchor {}: reclaiming {} stitch(es)", anchor_id,
-										stale.size());
-	for (const Stitch& stitch : stale) {
-		if (IRegion* target = adapter_.resolveRegion(stitch.region)) {
-			target->releaseWriteLease(stitch.lease);
-		}
-	}
+	ARACHNE_LOG_WARN("verification mismatch for anchor {}: reclaiming its stitches", anchor_id);
+	evictAnchor(anchor_id);
 }
 
 bool Controller::make(VectorId anchor_id, RegionId region) {
@@ -218,7 +215,15 @@ bool Controller::make(VectorId anchor_id, RegionId region) {
 	}
 
 	IRegion* target = adapter_.resolveRegion(region);
-	if (target == nullptr || target->residency() != ResidencyState::Resident) return false;
+	if (target == nullptr) return false;
+
+	if (target->residency() != ResidencyState::Resident) {
+		target->materializeOnDevice();  // Promotion step 2: copy the region's data onto GPU.
+		if (target->residency() != ResidencyState::Resident) {
+			ARACHNE_LOG_DEBUG("make: region {} did not become resident for anchor {}", region, anchor_id);
+			return false;
+		}
+	}
 
 	LeaseHandle lease = target->acquireWriteLease();
 	if (!lease.valid()) {
@@ -227,9 +232,60 @@ bool Controller::make(VectorId anchor_id, RegionId region) {
 	}
 
 	anchor_manager_.addStitch(anchor_id, region, lease);
+	replacement_policy_->onStitchAdded(anchor_id);
 
 	ARACHNE_LOG_DEBUG("make: stitched anchor {} to region {}", anchor_id, region);
 	return true;
+}
+
+void Controller::promoteAnchor(VectorId anchor_id, const VectorView& anchor_vector,
+																const RegionFootprint& footprint) {
+	// Step 1: register this Anchor in the RoutingCache so future queries
+	// close to it route to GPU (Quick Summary design point 1).
+	routing_cache_.ensure(anchor_id, anchor_vector, kDefaultAnchorMaxDistance);
+
+	// Steps 2 + 3: grant a Stitch for every region in scope, evicting via
+	// replacement_policy_ (excluding anchor_id itself) if a region can't be
+	// made available on the first attempt.
+	for (RegionId region : footprint.regions) {
+		if (make(anchor_id, region)) continue;
+
+		std::optional<VectorId> victim = replacement_policy_->selectEvictionCandidate(anchor_id);
+		if (!victim.has_value()) {
+			ARACHNE_LOG_DEBUG(
+					"promoteAnchor: no eviction candidate available, anchor {} region {} not promoted",
+					anchor_id, region);
+			continue;
+		}
+
+		evictAnchor(*victim);
+		if (!make(anchor_id, region)) {
+			ARACHNE_LOG_DEBUG(
+					"promoteAnchor: region {} still unavailable for anchor {} after evicting anchor {}",
+					region, anchor_id, *victim);
+		}
+	}
+}
+
+void Controller::evictAnchor(VectorId anchor_id) {
+	std::vector<Stitch> stitches = anchor_manager_.forget(anchor_id);
+	if (stitches.empty()) return;
+
+	for (const Stitch& stitch : stitches) {
+		if (IRegion* target = adapter_.resolveRegion(stitch.region)) {
+			target->releaseWriteLease(stitch.lease);
+		}
+#if defined(ARACHNE_WITH_RAFT)
+		// No-op until make() actually allocates through stitch_pool_ -- see its
+		// doc comment. Guarded on validity so this is safe either way.
+		if (stitch.memory.valid()) {
+			stitch_pool_.free(stitch.memory);
+		}
+#endif
+	}
+	replacement_policy_->onAnchorEvicted(anchor_id);
+
+	ARACHNE_LOG_DEBUG("evictAnchor: reclaimed {} stitch(es) from anchor {}", stitches.size(), anchor_id);
 }
 
 }  // namespace arachne

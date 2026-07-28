@@ -5,6 +5,7 @@ set(ARACHNE_TEST_SOURCES
 	routing_cache_hnsw_dtype_test.cpp
 	anchor_manager_test.cpp
 	op_scheduler_policy_test.cpp
+	replacement_policy_test.cpp
 	util/distance_test.cpp
 )
 if(ARACHNE_USE_RAFT)
