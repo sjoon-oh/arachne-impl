@@ -14,20 +14,20 @@ TEST(FifoReplacementPolicyTest, SelectEvictionCandidateIsNulloptWhenEmpty) {
 
 TEST(FifoReplacementPolicyTest, SelectEvictionCandidateReturnsOldestTracked) {
 	FifoReplacementPolicy policy;
-	policy.onStitchAdded(1);
-	policy.onStitchAdded(2);
-	policy.onStitchAdded(3);
+	policy.onAnchorPromoted(1);
+	policy.onAnchorPromoted(2);
+	policy.onAnchorPromoted(3);
 
 	auto candidate = policy.selectEvictionCandidate(/*excluded=*/0);
 	ASSERT_TRUE(candidate.has_value());
 	EXPECT_EQ(*candidate, 1u);
 }
 
-TEST(FifoReplacementPolicyTest, RepeatedStitchAddDoesNotReorder) {
+TEST(FifoReplacementPolicyTest, RepeatedPromotionDoesNotReorder) {
 	FifoReplacementPolicy policy;
-	policy.onStitchAdded(1);
-	policy.onStitchAdded(2);
-	policy.onStitchAdded(1);  // second Stitch on the same Anchor: no reorder
+	policy.onAnchorPromoted(1);
+	policy.onAnchorPromoted(2);
+	policy.onAnchorPromoted(1);  // second dependency for the same Anchor: no reorder
 
 	auto candidate = policy.selectEvictionCandidate(/*excluded=*/0);
 	ASSERT_TRUE(candidate.has_value());
@@ -36,8 +36,8 @@ TEST(FifoReplacementPolicyTest, RepeatedStitchAddDoesNotReorder) {
 
 TEST(FifoReplacementPolicyTest, SelectEvictionCandidateSkipsExcluded) {
 	FifoReplacementPolicy policy;
-	policy.onStitchAdded(1);
-	policy.onStitchAdded(2);
+	policy.onAnchorPromoted(1);
+	policy.onAnchorPromoted(2);
 
 	auto candidate = policy.selectEvictionCandidate(/*excluded=*/1);
 	ASSERT_TRUE(candidate.has_value());
@@ -46,15 +46,15 @@ TEST(FifoReplacementPolicyTest, SelectEvictionCandidateSkipsExcluded) {
 
 TEST(FifoReplacementPolicyTest, SelectEvictionCandidateIsNulloptWhenOnlyExcludedIsTracked) {
 	FifoReplacementPolicy policy;
-	policy.onStitchAdded(1);
+	policy.onAnchorPromoted(1);
 
 	EXPECT_FALSE(policy.selectEvictionCandidate(/*excluded=*/1).has_value());
 }
 
 TEST(FifoReplacementPolicyTest, AnchorEvictedStopsItFromBeingSelected) {
 	FifoReplacementPolicy policy;
-	policy.onStitchAdded(1);
-	policy.onStitchAdded(2);
+	policy.onAnchorPromoted(1);
+	policy.onAnchorPromoted(2);
 
 	policy.onAnchorEvicted(1);
 
@@ -65,7 +65,7 @@ TEST(FifoReplacementPolicyTest, AnchorEvictedStopsItFromBeingSelected) {
 
 TEST(FifoReplacementPolicyTest, AnchorEvictedOfUntrackedAnchorIsANoop) {
 	FifoReplacementPolicy policy;
-	policy.onStitchAdded(1);
+	policy.onAnchorPromoted(1);
 
 	policy.onAnchorEvicted(999);
 
@@ -76,11 +76,11 @@ TEST(FifoReplacementPolicyTest, AnchorEvictedOfUntrackedAnchorIsANoop) {
 
 TEST(FifoReplacementPolicyTest, ReAddingAnEvictedAnchorGoesToTheBack) {
 	FifoReplacementPolicy policy;
-	policy.onStitchAdded(1);
-	policy.onStitchAdded(2);
+	policy.onAnchorPromoted(1);
+	policy.onAnchorPromoted(2);
 
 	policy.onAnchorEvicted(1);
-	policy.onStitchAdded(1);  // re-promoted: should now be newer than 2
+	policy.onAnchorPromoted(1);  // re-promoted: should now be newer than 2
 
 	auto candidate = policy.selectEvictionCandidate(/*excluded=*/0);
 	ASSERT_TRUE(candidate.has_value());

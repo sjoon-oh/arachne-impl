@@ -1,4 +1,4 @@
-#include "gpu/stitch_pool.hpp"
+#include "gpu/device_region_pool.hpp"
 
 #include <cuda_runtime.h>
 #include <gtest/gtest.h>
@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <optional>
 #include <random>
 #include <thread>
 #include <vector>
@@ -14,39 +15,38 @@
 
 namespace {
 
-using arachne::gpu::AccessMode;
 using arachne::gpu::AllocationPolicy;
 using arachne::gpu::DeviceContext;
 using arachne::gpu::kDefaultMetadataPoolBytes;
 using arachne::gpu::MemoryKind;
-using arachne::gpu::StitchHandle;
-using arachne::gpu::StitchPool;
+using arachne::gpu::DeviceRegionHandle;
+using arachne::gpu::DeviceRegionPool;
 
 // Parametrized over AllocationPolicy: both alternatives must satisfy the
-// exact same StitchPool contract, since callers (StitchPool itself
+// exact same DeviceRegionPool contract, since callers (DeviceRegionPool itself
 // included) never branch on which one is active -- see DeviceContext's
 // AllocationPolicy doc comment.
-class StitchPoolPolicyTest : public ::testing::TestWithParam<AllocationPolicy> {
+class DeviceRegionPoolPolicyTest : public ::testing::TestWithParam<AllocationPolicy> {
  protected:
 	DeviceContext MakeDevice() { return DeviceContext(/*device_id=*/0, GetParam()); }
 };
 
-TEST_P(StitchPoolPolicyTest, AllocateReturnsValidHandleAndTracksBytes) {
+TEST_P(DeviceRegionPoolPolicyTest, AllocateReturnsValidHandleAndTracksBytes) {
 	DeviceContext device = MakeDevice();
-	StitchPool pool(device);
+	DeviceRegionPool pool(device);
 
-	StitchHandle handle = pool.allocate(1024);
+	DeviceRegionHandle handle = pool.allocate(1024);
 
 	EXPECT_TRUE(handle.valid());
 	EXPECT_EQ(pool.bytesAllocated(), 1024u);
 }
 
-TEST_P(StitchPoolPolicyTest, CopyRoundTripsThroughDeviceMemory) {
+TEST_P(DeviceRegionPoolPolicyTest, CopyRoundTripsThroughDeviceMemory) {
 	DeviceContext device = MakeDevice();
-	StitchPool pool(device);
+	DeviceRegionPool pool(device);
 
 	constexpr std::size_t kBytes = 256;
-	StitchHandle handle = pool.allocate(kBytes);
+	DeviceRegionHandle handle = pool.allocate(kBytes);
 
 	std::vector<std::byte> host_in(kBytes);
 	for (std::size_t i = 0; i < kBytes; ++i) host_in[i] = std::byte{static_cast<unsigned char>(i)};
@@ -60,59 +60,56 @@ TEST_P(StitchPoolPolicyTest, CopyRoundTripsThroughDeviceMemory) {
 	pool.free(handle);
 }
 
-TEST_P(StitchPoolPolicyTest, FreeReclaimsBytesAndInvalidatesHandle) {
+TEST_P(DeviceRegionPoolPolicyTest, FreeReclaimsBytesAndInvalidatesHandle) {
 	DeviceContext device = MakeDevice();
-	StitchPool pool(device);
+	DeviceRegionPool pool(device);
 
-	StitchHandle handle = pool.allocate(512);
+	DeviceRegionHandle handle = pool.allocate(512);
 	ASSERT_EQ(pool.bytesAllocated(), 512u);
 
 	pool.free(handle);
 
 	EXPECT_EQ(pool.bytesAllocated(), 0u);
-	EXPECT_THROW(pool.access(handle, AccessMode::Read), std::invalid_argument);
+	EXPECT_THROW(pool.acquire(handle), std::invalid_argument);
 }
 
-TEST_P(StitchPoolPolicyTest, FreeOfInvalidHandleIsANoop) {
+TEST_P(DeviceRegionPoolPolicyTest, FreeOfInvalidHandleIsANoop) {
 	DeviceContext device = MakeDevice();
-	StitchPool pool(device);
+	DeviceRegionPool pool(device);
 
-	pool.free(StitchHandle{});  // default-constructed, never allocated
+	pool.free(DeviceRegionHandle{});  // default-constructed, never allocated
 
 	EXPECT_EQ(pool.bytesAllocated(), 0u);
 }
 
-TEST_P(StitchPoolPolicyTest, AccessOfNeverAllocatedHandleThrows) {
+TEST_P(DeviceRegionPoolPolicyTest, MultipleAllocationsAreIndependent) {
 	DeviceContext device = MakeDevice();
-	StitchPool pool(device);
+	DeviceRegionPool pool(device);
 
-	EXPECT_THROW(pool.access(StitchHandle{}, AccessMode::Read), std::invalid_argument);
-}
-
-TEST_P(StitchPoolPolicyTest, MultipleAllocationsAreIndependent) {
-	DeviceContext device = MakeDevice();
-	StitchPool pool(device);
-
-	StitchHandle a = pool.allocate(128);
-	StitchHandle b = pool.allocate(256);
+	DeviceRegionHandle a = pool.allocate(128);
+	DeviceRegionHandle b = pool.allocate(256);
 
 	EXPECT_NE(a.id, b.id);
 	EXPECT_EQ(pool.bytesAllocated(), 384u);
-	EXPECT_NE(pool.access(a, AccessMode::Read), pool.access(b, AccessMode::Read));
+	{
+		DeviceRegionPool::Lease lease_a = pool.acquire(a);
+		DeviceRegionPool::Lease lease_b = pool.acquire(b);
+		EXPECT_NE(lease_a.ptr(), lease_b.ptr());
+	}
 
 	pool.free(a);
 	EXPECT_EQ(pool.bytesAllocated(), 256u);
-	EXPECT_NO_THROW(pool.access(b, AccessMode::Read));
+	EXPECT_NO_THROW(pool.acquire(b));
 
 	pool.free(b);
 }
 
-TEST_P(StitchPoolPolicyTest, DataAndMetadataAllocationsAreTrackedSeparately) {
+TEST_P(DeviceRegionPoolPolicyTest, DataAndMetadataAllocationsAreTrackedSeparately) {
 	DeviceContext device = MakeDevice();
-	StitchPool pool(device);
+	DeviceRegionPool pool(device);
 
-	StitchHandle data = pool.allocate(1024, MemoryKind::Data);
-	StitchHandle metadata = pool.allocate(128, MemoryKind::Metadata);
+	DeviceRegionHandle data = pool.allocate(1024, MemoryKind::Data);
+	DeviceRegionHandle metadata = pool.allocate(128, MemoryKind::Metadata);
 
 	EXPECT_EQ(pool.bytesAllocated(MemoryKind::Data), 1024u);
 	EXPECT_EQ(pool.bytesAllocated(MemoryKind::Metadata), 128u);
@@ -125,12 +122,12 @@ TEST_P(StitchPoolPolicyTest, DataAndMetadataAllocationsAreTrackedSeparately) {
 	pool.free(metadata);
 }
 
-TEST_P(StitchPoolPolicyTest, MetadataAllocationRoundTripsThroughDeviceMemory) {
+TEST_P(DeviceRegionPoolPolicyTest, MetadataAllocationRoundTripsThroughDeviceMemory) {
 	DeviceContext device = MakeDevice();
-	StitchPool pool(device);
+	DeviceRegionPool pool(device);
 
 	constexpr std::size_t kBytes = 64;
-	StitchHandle handle = pool.allocate(kBytes, MemoryKind::Metadata);
+	DeviceRegionHandle handle = pool.allocate(kBytes, MemoryKind::Metadata);
 
 	std::vector<std::byte> host_in(kBytes, std::byte{0x5a});
 	pool.copyFromHost(handle, host_in.data(), kBytes);
@@ -142,11 +139,11 @@ TEST_P(StitchPoolPolicyTest, MetadataAllocationRoundTripsThroughDeviceMemory) {
 	pool.free(handle);
 }
 
-TEST_P(StitchPoolPolicyTest, CopyFromHostRejectsOversizedRequest) {
+TEST_P(DeviceRegionPoolPolicyTest, CopyFromHostRejectsOversizedRequest) {
 	DeviceContext device = MakeDevice();
-	StitchPool pool(device);
+	DeviceRegionPool pool(device);
 
-	StitchHandle handle = pool.allocate(16);
+	DeviceRegionHandle handle = pool.allocate(16);
 	std::vector<std::byte> host_in(32);
 
 	EXPECT_THROW(pool.copyFromHost(handle, host_in.data(), 32), std::out_of_range);
@@ -154,41 +151,169 @@ TEST_P(StitchPoolPolicyTest, CopyFromHostRejectsOversizedRequest) {
 	pool.free(handle);
 }
 
-TEST_P(StitchPoolPolicyTest, AcquireReturnsLeaseWithMatchingPointer) {
+TEST_P(DeviceRegionPoolPolicyTest, CopyFromHostRejectsOffsetPlusBytesExceedingAllocation) {
 	DeviceContext device = MakeDevice();
-	StitchPool pool(device);
+	DeviceRegionPool pool(device);
 
-	StitchHandle handle = pool.allocate(128);
-	void* expected = pool.access(handle, AccessMode::Read);
+	DeviceRegionHandle handle = pool.allocate(16);
+	std::vector<std::byte> host_in(8);
 
-	{
-		StitchPool::Lease lease = pool.acquire(handle);
-		EXPECT_EQ(lease.ptr(), expected);
-	}  // released here
+	// 12 (offset) + 8 (bytes) = 20 > 16 -- fits neither the fast in-range case
+	// nor a plain bytes-only check, only the offset-aware one.
+	EXPECT_THROW(pool.copyFromHost(handle, host_in.data(), 8, /*dst_offset=*/12), std::out_of_range);
 
 	pool.free(handle);
 }
 
-TEST_P(StitchPoolPolicyTest, AcquireOfInvalidHandleThrows) {
+TEST_P(DeviceRegionPoolPolicyTest, CopyRoundTripsWithHeaderOffset) {
+	// Mirrors the prepended-dirty-header layout Controller::make() uses: the
+	// first kHeaderBytes of the allocation are reserved, and the actual
+	// payload starts right after it.
 	DeviceContext device = MakeDevice();
-	StitchPool pool(device);
+	DeviceRegionPool pool(device);
 
-	EXPECT_THROW(pool.acquire(StitchHandle{}), std::invalid_argument);
+	constexpr std::size_t kHeaderBytes = 8;
+	constexpr std::size_t kPayloadBytes = 256;
+	DeviceRegionHandle handle = pool.allocate(kHeaderBytes + kPayloadBytes);
+
+	std::vector<std::byte> header_in(kHeaderBytes, std::byte{0xAA});
+	pool.copyFromHost(handle, header_in.data(), kHeaderBytes, /*dst_offset=*/0);
+
+	std::vector<std::byte> payload_in(kPayloadBytes);
+	for (std::size_t i = 0; i < kPayloadBytes; ++i) payload_in[i] = std::byte{static_cast<unsigned char>(i)};
+	pool.copyFromHost(handle, payload_in.data(), kPayloadBytes, /*dst_offset=*/kHeaderBytes);
+
+	std::vector<std::byte> header_out(kHeaderBytes);
+	pool.copyToHost(handle, header_out.data(), kHeaderBytes, /*src_offset=*/0);
+	EXPECT_EQ(header_in, header_out);
+
+	std::vector<std::byte> payload_out(kPayloadBytes);
+	pool.copyToHost(handle, payload_out.data(), kPayloadBytes, /*src_offset=*/kHeaderBytes);
+	EXPECT_EQ(payload_in, payload_out);
+
+	pool.free(handle);
 }
 
-TEST_P(StitchPoolPolicyTest, FreeWaitsForOutstandingLeaseToRelease) {
+TEST_P(DeviceRegionPoolPolicyTest, EnqueueCopyToHostBatchesMultipleHandlesBeforeOneFlush) {
+	// Three independent allocations, each given a distinct byte pattern,
+	// read back via three enqueueCopyToHost() calls sharing one `pending`
+	// and a single flush() -- proves the batched (Controller::
+	// writeBackDirtyRegions()'s) gather path actually lands every copy
+	// correctly, not just the single-handle copyToHost() convenience path.
+	DeviceContext device = MakeDevice();
+	DeviceRegionPool pool(device);
+
+	constexpr std::size_t kBytes = 128;
+	DeviceRegionHandle a = pool.allocate(kBytes);
+	DeviceRegionHandle b = pool.allocate(kBytes);
+	DeviceRegionHandle c = pool.allocate(kBytes);
+
+	std::vector<std::byte> in_a(kBytes, std::byte{0xA1});
+	std::vector<std::byte> in_b(kBytes, std::byte{0xB2});
+	std::vector<std::byte> in_c(kBytes, std::byte{0xC3});
+	pool.copyFromHost(a, in_a.data(), kBytes);
+	pool.copyFromHost(b, in_b.data(), kBytes);
+	pool.copyFromHost(c, in_c.data(), kBytes);
+
+	std::vector<std::byte> out_a(kBytes), out_b(kBytes), out_c(kBytes);
+	{
+		std::vector<DeviceRegionPool::Lease> pending;
+		pool.enqueueCopyToHost(a, out_a.data(), kBytes, /*src_offset=*/0, pending);
+		pool.enqueueCopyToHost(b, out_b.data(), kBytes, /*src_offset=*/0, pending);
+		pool.enqueueCopyToHost(c, out_c.data(), kBytes, /*src_offset=*/0, pending);
+		// Nothing is guaranteed to have landed yet -- only flush() proves it.
+		pool.flush();
+	}  // `pending`'s Leases release here, after flush() already proved every copy landed
+
+	EXPECT_EQ(in_a, out_a);
+	EXPECT_EQ(in_b, out_b);
+	EXPECT_EQ(in_c, out_c);
+
+	pool.free(a);
+	pool.free(b);
+	pool.free(c);
+}
+
+TEST_P(DeviceRegionPoolPolicyTest, HasCapacityReflectsBudgetAndOutstandingBytes) {
+	DeviceContext device = MakeDevice();
+	DeviceRegionPool pool(device);
+
+	EXPECT_TRUE(pool.hasCapacity(1024));
+	EXPECT_FALSE(pool.hasCapacity(device.budgetBytes(MemoryKind::Data) + 1));
+
+	DeviceRegionHandle handle = pool.allocate(1024);
+	EXPECT_TRUE(pool.hasCapacity(device.budgetBytes(MemoryKind::Data) - 1024));
+	EXPECT_FALSE(pool.hasCapacity(device.budgetBytes(MemoryKind::Data) - 1024 + 1));
+
+	pool.free(handle);
+	EXPECT_TRUE(pool.hasCapacity(device.budgetBytes(MemoryKind::Data)));
+}
+
+TEST_P(DeviceRegionPoolPolicyTest, TryAllocateReturnsNulloptWhenOverBudget) {
+	// Budget deliberately tiny so a modest request already exceeds it,
+	// regardless of how much real GPU memory is actually free.
+	DeviceContext device(/*device_id=*/0, GetParam(), /*data_pool_bytes=*/1024,
+											 arachne::gpu::kDefaultMetadataPoolBytes);
+	DeviceRegionPool pool(device);
+
+	std::optional<DeviceRegionHandle> handle = pool.tryAllocate(2048);
+	EXPECT_FALSE(handle.has_value());
+	EXPECT_EQ(pool.bytesAllocated(), 0u);
+}
+
+TEST_P(DeviceRegionPoolPolicyTest, TryAllocateSucceedsWithinBudgetAndUpdatesCapacity) {
+	DeviceContext device = MakeDevice();
+	DeviceRegionPool pool(device);
+
+	std::optional<DeviceRegionHandle> handle = pool.tryAllocate(1024);
+	ASSERT_TRUE(handle.has_value());
+	EXPECT_TRUE(handle->valid());
+	EXPECT_EQ(pool.bytesAllocated(), 1024u);
+
+	pool.free(*handle);
+}
+
+TEST_P(DeviceRegionPoolPolicyTest, AcquireReturnsLeaseWithMatchingPointer) {
+	DeviceContext device = MakeDevice();
+	DeviceRegionPool pool(device);
+
+	DeviceRegionHandle handle = pool.allocate(128);
+	void* first_ptr = nullptr;
+	{
+		DeviceRegionPool::Lease lease = pool.acquire(handle);
+		first_ptr = lease.ptr();
+		EXPECT_NE(first_ptr, nullptr);
+	}  // released here
+	{
+		// A second, separate acquire() (no compact() in between) must resolve
+		// to the same pointer.
+		DeviceRegionPool::Lease lease = pool.acquire(handle);
+		EXPECT_EQ(lease.ptr(), first_ptr);
+	}
+
+	pool.free(handle);
+}
+
+TEST_P(DeviceRegionPoolPolicyTest, AcquireOfInvalidHandleThrows) {
+	DeviceContext device = MakeDevice();
+	DeviceRegionPool pool(device);
+
+	EXPECT_THROW(pool.acquire(DeviceRegionHandle{}), std::invalid_argument);
+}
+
+TEST_P(DeviceRegionPoolPolicyTest, FreeWaitsForOutstandingLeaseToRelease) {
 	// While a Lease is held (on any thread), free() must not reclaim the
 	// memory -- it should block until the Lease is released. Proven here by
 	// timing: the holder sleeps before releasing, and free() must not return
 	// before that sleep elapses.
 	DeviceContext device = MakeDevice();
-	StitchPool pool(device);
+	DeviceRegionPool pool(device);
 
-	StitchHandle handle = pool.allocate(128);
+	DeviceRegionHandle handle = pool.allocate(128);
 	constexpr auto kHoldDuration = std::chrono::milliseconds(150);
 
 	std::thread holder([&] {
-		StitchPool::Lease lease = pool.acquire(handle);
+		DeviceRegionPool::Lease lease = pool.acquire(handle);
 		std::this_thread::sleep_for(kHoldDuration);
 		// lease released here, at thread exit
 	});
@@ -204,13 +329,13 @@ TEST_P(StitchPoolPolicyTest, FreeWaitsForOutstandingLeaseToRelease) {
 	EXPECT_GE(elapsed, kHoldDuration - std::chrono::milliseconds(20));
 }
 
-TEST_P(StitchPoolPolicyTest, FreeWaitsForAllOutstandingLeasesAcrossDifferentStreams) {
+TEST_P(DeviceRegionPoolPolicyTest, FreeWaitsForAllOutstandingLeasesAcrossDifferentStreams) {
 	// Two Leases on the same handle, acquired on two different streams --
 	// free() must wait for both, not just the first to release.
 	DeviceContext device = MakeDevice();
-	StitchPool pool(device);
+	DeviceRegionPool pool(device);
 
-	StitchHandle handle = pool.allocate(128);
+	DeviceRegionHandle handle = pool.allocate(128);
 	cudaStream_t stream_a = nullptr;
 	cudaStream_t stream_b = nullptr;
 	ASSERT_EQ(cudaStreamCreate(&stream_a), cudaSuccess);
@@ -219,11 +344,11 @@ TEST_P(StitchPoolPolicyTest, FreeWaitsForAllOutstandingLeasesAcrossDifferentStre
 	constexpr auto kHoldDuration = std::chrono::milliseconds(150);
 
 	std::thread holder_a([&] {
-		StitchPool::Lease lease = pool.acquire(handle, stream_a);
+		DeviceRegionPool::Lease lease = pool.acquire(handle, stream_a);
 		std::this_thread::sleep_for(kHoldDuration);
 	});
 	std::thread holder_b([&] {
-		StitchPool::Lease lease = pool.acquire(handle, stream_b);
+		DeviceRegionPool::Lease lease = pool.acquire(handle, stream_b);
 		std::this_thread::sleep_for(kHoldDuration);
 	});
 
@@ -241,23 +366,31 @@ TEST_P(StitchPoolPolicyTest, FreeWaitsForAllOutstandingLeasesAcrossDifferentStre
 	cudaStreamDestroy(stream_b);
 }
 
-TEST_P(StitchPoolPolicyTest, CompactRelocatesButPreservesDataAndByteTotal) {
+TEST_P(DeviceRegionPoolPolicyTest, CompactRelocatesButPreservesDataAndByteTotal) {
 	// compact() is invoked explicitly by the caller (Controller, as part of
 	// its Eviction -> Compaction -> Promotion pipeline) whenever it's
 	// already decided compaction is needed -- there's no internal occupancy
 	// heuristic left to satisfy here, it always does the relocation work
 	// when called (except under Naive, which has nothing to consolidate).
 	DeviceContext device = MakeDevice();
-	StitchPool pool(device);
+	DeviceRegionPool pool(device);
 
 	constexpr std::size_t kBytes = 128;
-	StitchHandle handle = pool.allocate(kBytes, MemoryKind::Data);
+	DeviceRegionHandle handle = pool.allocate(kBytes, MemoryKind::Data);
 	std::vector<std::byte> host_in(kBytes, std::byte{0x42});
 	pool.copyFromHost(handle, host_in.data(), kBytes);
 
-	void* before = pool.access(handle, AccessMode::Read);
-	StitchPool::CompactionResult result = pool.compact(MemoryKind::Data);
-	void* after = pool.access(handle, AccessMode::Read);
+	void* before;
+	{
+		DeviceRegionPool::Lease lease = pool.acquire(handle);
+		before = lease.ptr();
+	}
+	DeviceRegionPool::CompactionResult result = pool.compact(MemoryKind::Data);
+	void* after;
+	{
+		DeviceRegionPool::Lease lease = pool.acquire(handle);
+		after = lease.ptr();
+	}
 
 	if (GetParam() == AllocationPolicy::Naive) {
 		EXPECT_EQ(result.relocated_count, 0u);  // no-op under Naive
@@ -276,26 +409,26 @@ TEST_P(StitchPoolPolicyTest, CompactRelocatesButPreservesDataAndByteTotal) {
 	pool.free(handle);
 }
 
-TEST(StitchPoolTest, CompactWaitsForOutstandingLeaseToRelease) {
+TEST(DeviceRegionPoolTest, CompactWaitsForOutstandingLeaseToRelease) {
 	// Same timing argument as FreeWaitsForOutstandingLeaseToRelease, but for
 	// compact() -- it must not copy-and-relocate a handle out from under a
 	// still-held Lease. Pooled only: compact() is a no-op under Naive
 	// regardless, so there'd be nothing to time.
 	DeviceContext device(/*device_id=*/0, AllocationPolicy::Pooled);
-	StitchPool pool(device);
+	DeviceRegionPool pool(device);
 
-	StitchHandle handle = pool.allocate(128, MemoryKind::Data);
+	DeviceRegionHandle handle = pool.allocate(128, MemoryKind::Data);
 	constexpr auto kHoldDuration = std::chrono::milliseconds(150);
 
 	std::thread holder([&] {
-		StitchPool::Lease lease = pool.acquire(handle);
+		DeviceRegionPool::Lease lease = pool.acquire(handle);
 		std::this_thread::sleep_for(kHoldDuration);
 	});
 
 	std::this_thread::sleep_for(std::chrono::milliseconds(20));
 
 	auto start = std::chrono::steady_clock::now();
-	StitchPool::CompactionResult result = pool.compact(MemoryKind::Data);
+	DeviceRegionPool::CompactionResult result = pool.compact(MemoryKind::Data);
 	auto elapsed = std::chrono::steady_clock::now() - start;
 
 	holder.join();
@@ -305,18 +438,18 @@ TEST(StitchPoolTest, CompactWaitsForOutstandingLeaseToRelease) {
 	pool.free(handle);
 }
 
-INSTANTIATE_TEST_SUITE_P(PooledAndNaive, StitchPoolPolicyTest,
+INSTANTIATE_TEST_SUITE_P(PooledAndNaive, DeviceRegionPoolPolicyTest,
 													::testing::Values(AllocationPolicy::Pooled, AllocationPolicy::Naive),
 													[](const ::testing::TestParamInfo<AllocationPolicy>& info) {
 														return info.param == AllocationPolicy::Pooled ? "Pooled" : "Naive";
 													});
 
-TEST(StitchPoolTest, DefaultDeviceContextUsesPooledPolicy) {
+TEST(DeviceRegionPoolTest, DefaultDeviceContextUsesPooledPolicy) {
 	DeviceContext device;
 	EXPECT_EQ(device.allocationPolicy(), AllocationPolicy::Pooled);
 }
 
-TEST(StitchPoolTest, NaivePolicyDoesNotPreReserveAnArena) {
+TEST(DeviceRegionPoolTest, NaivePolicyDoesNotPreReserveAnArena) {
 	// Under Naive, DeviceContext shouldn't need to reserve
 	// kDefaultDataPoolBytes/kDefaultMetadataPoolBytes up front -- passing
 	// sizes that would be absurd to actually cudaMalloc (and would fail
@@ -338,7 +471,7 @@ TEST(StitchPoolTest, NaivePolicyDoesNotPreReserveAnArena) {
 // ---------------------------------------------------------------------------
 
 struct LiveEntry {
-	StitchHandle handle;
+	DeviceRegionHandle handle;
 	std::size_t bytes;
 	std::byte canary;
 };
@@ -348,7 +481,7 @@ struct LiveEntry {
 // compact() performs) or free against `pool`, keeping the total
 // simultaneously-live footprint under `max_live_bytes`. Returns whatever is
 // still live at the end -- the caller frees it.
-std::vector<LiveEntry> RunAllocDeallocChurn(StitchPool& pool, std::mt19937& rng, int iterations,
+std::vector<LiveEntry> RunAllocDeallocChurn(DeviceRegionPool& pool, std::mt19937& rng, int iterations,
 																						 std::size_t max_live_bytes) {
 	std::uniform_int_distribution<std::size_t> size_dist(1024, 1024 * 1024);  // 1 KiB..1 MiB
 	std::vector<LiveEntry> live;
@@ -360,7 +493,7 @@ std::vector<LiveEntry> RunAllocDeallocChurn(StitchPool& pool, std::mt19937& rng,
 			std::size_t bytes = size_dist(rng);
 			if (live_bytes + bytes > max_live_bytes) continue;
 
-			StitchHandle handle = pool.allocate(bytes, MemoryKind::Data);
+			DeviceRegionHandle handle = pool.allocate(bytes, MemoryKind::Data);
 			std::byte canary = std::byte{static_cast<unsigned char>(rng() & 0xFF)};
 			std::vector<std::byte> pattern(bytes, canary);
 			pool.copyFromHost(handle, pattern.data(), bytes);
@@ -377,7 +510,7 @@ std::vector<LiveEntry> RunAllocDeallocChurn(StitchPool& pool, std::mt19937& rng,
 	return live;
 }
 
-void VerifyLiveData(StitchPool& pool, const std::vector<LiveEntry>& live) {
+void VerifyLiveData(DeviceRegionPool& pool, const std::vector<LiveEntry>& live) {
 	for (const LiveEntry& entry : live) {
 		std::vector<std::byte> out(entry.bytes);
 		pool.copyToHost(entry.handle, out.data(), entry.bytes);
@@ -387,7 +520,7 @@ void VerifyLiveData(StitchPool& pool, const std::vector<LiveEntry>& live) {
 	}
 }
 
-TEST(StitchPoolStressTest, PooledPolicySurvivesExcessiveAllocDeallocAndCompaction) {
+TEST(DeviceRegionPoolStressTest, PooledPolicySurvivesExcessiveAllocDeallocAndCompaction) {
 	cudaSetDevice(0);
 	std::size_t free_bytes = 0;
 	std::size_t total_bytes = 0;
@@ -403,7 +536,7 @@ TEST(StitchPoolStressTest, PooledPolicySurvivesExcessiveAllocDeallocAndCompactio
 	ASSERT_GT(budget, 0u);
 
 	DeviceContext device(/*device_id=*/0, AllocationPolicy::Pooled, budget, kDefaultMetadataPoolBytes);
-	StitchPool pool(device);
+	DeviceRegionPool pool(device);
 
 	std::mt19937 rng(12345);
 	constexpr std::size_t kMaxLiveBytes = 128 * 1024 * 1024;  // 128 MiB
@@ -414,7 +547,7 @@ TEST(StitchPoolStressTest, PooledPolicySurvivesExcessiveAllocDeallocAndCompactio
 	VerifyLiveData(pool, live);
 
 	std::size_t before = pool.bytesAllocated(MemoryKind::Data);
-	StitchPool::CompactionResult result = pool.compact(MemoryKind::Data);
+	DeviceRegionPool::CompactionResult result = pool.compact(MemoryKind::Data);
 	std::size_t after = pool.bytesAllocated(MemoryKind::Data);
 
 	EXPECT_EQ(before, after);  // compaction changes addresses, not live totals
@@ -426,14 +559,14 @@ TEST(StitchPoolStressTest, PooledPolicySurvivesExcessiveAllocDeallocAndCompactio
 	for (const LiveEntry& entry : live) pool.free(entry.handle);
 }
 
-TEST(StitchPoolStressTest, NaivePolicySurvivesExcessiveAllocDealloc) {
+TEST(DeviceRegionPoolStressTest, NaivePolicySurvivesExcessiveAllocDealloc) {
 	// Naive still goes through RAFT/RMM's cuda_memory_resource for every
 	// single allocate()/free() (real cudaMalloc/cudaFree each time, no
 	// pooling) -- this exercises that path under the same kind of churn as
 	// the Pooled stress test above, to catch anything that was accidentally
 	// only correct when a pool was amortizing the calls.
 	DeviceContext device(/*device_id=*/0, AllocationPolicy::Naive);
-	StitchPool pool(device);
+	DeviceRegionPool pool(device);
 
 	std::mt19937 rng(54321);
 	constexpr std::size_t kMaxLiveBytes = 64 * 1024 * 1024;  // 64 MiB
@@ -447,7 +580,7 @@ TEST(StitchPoolStressTest, NaivePolicySurvivesExcessiveAllocDealloc) {
 	// consolidate) -- confirm that explicitly here rather than only relying
 	// on the parametrized CompactRelocatesButPreservesDataAndByteTotal case.
 	std::size_t before = pool.bytesAllocated(MemoryKind::Data);
-	StitchPool::CompactionResult result = pool.compact(MemoryKind::Data);
+	DeviceRegionPool::CompactionResult result = pool.compact(MemoryKind::Data);
 
 	EXPECT_EQ(result.relocated_count, 0u);
 	EXPECT_EQ(pool.bytesAllocated(MemoryKind::Data), before);

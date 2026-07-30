@@ -1,0 +1,414 @@
+#include "core/controller.hpp"
+
+#include <cuda_runtime.h>
+#include <gtest/gtest.h>
+
+#include <cstring>
+#include <optional>
+#include <unordered_map>
+#include <vector>
+
+#include "adapter/index_adapter.hpp"
+#include "adapter/region.hpp"
+#include "core/routing_cache.hpp"
+#include "gpu/device_region_pool.hpp"
+#include "gpu/dirty_header.hpp"
+#include "types.hpp"
+
+namespace {
+
+using namespace arachne;
+
+// ---------------------------------------------------------------------------
+// Test doubles: a minimal IRegion/IndexAdapter/RoutingCache good enough to
+// drive Controller's promotion/eviction machinery without a real index.
+// ---------------------------------------------------------------------------
+
+class FakeRegion : public IRegion {
+ public:
+	FakeRegion() = default;
+	FakeRegion(RegionId id, HostRegionView host) : id_(id), host_(host) {}
+
+	RegionId id() const override { return id_; }
+	RegionFootprint footprint() const override { return RegionFootprint{{id_}}; }
+	HostRegionView hostView() const override { return host_; }
+	LeaseHandle acquireWriteLease() override { return LeaseHandle{id_, ++epoch_}; }
+	void releaseWriteLease(LeaseHandle) override {}
+	void applyLocalModification(LeaseHandle, const ModificationDelta&) override {}
+	ReconciliationReport reconcileBoundary() override { return ReconciliationReport{}; }
+
+ private:
+	RegionId id_ = 0;
+	HostRegionView host_;
+	std::uint64_t epoch_ = 0;
+};
+
+// IndexAdapter double. traverseHost() is a fixed no-op response (the tests
+// below only exercise the Modify/promotion side); modifyHost() always
+// succeeds and reports `next_modified` as the RegionFootprint the insert
+// wants promoted -- the test sets this before each Controller::insert()
+// call, standing in for whatever a real index's insert logic would decide.
+class FakeAdapter : public IndexAdapter {
+ public:
+	std::vector<TraverseResult> traverseHost(const std::vector<TraverseRequest>& requests) override {
+		return std::vector<TraverseResult>(requests.size());
+	}
+
+	std::vector<ModifyResult> modifyHost(const std::vector<ModifyRequest>& requests) override {
+		std::vector<ModifyResult> results;
+		results.reserve(requests.size());
+		for (const ModifyRequest& request : requests) {
+			ModifyResult result;
+			result.ok = true;
+			result.touched = request.scope;
+			result.modified = next_modified;
+			results.push_back(result);
+		}
+		return results;
+	}
+
+	IRegion* resolveRegion(RegionId id) override {
+		auto it = regions_.find(id);
+		return it == regions_.end() ? nullptr : &it->second;
+	}
+
+	std::vector<RegionId> allRegions() const override {
+		std::vector<RegionId> ids;
+		ids.reserve(regions_.size());
+		for (const auto& [id, region] : regions_) ids.push_back(id);
+		return ids;
+	}
+
+	void addRegion(RegionId id, HostRegionView host) { regions_.emplace(id, FakeRegion(id, host)); }
+
+	RegionFootprint next_modified;
+
+ private:
+	std::unordered_map<RegionId, FakeRegion> regions_;
+};
+
+class FakeRoutingCache : public RoutingCache {
+ public:
+	FakeRoutingCache() : RoutingCache(/*dim=*/1, DistanceMetric::L2, VectorDType::Float32) {}
+
+	// Always "no match": keeps every query/insert lookup on the Hybrid path,
+	// which is all these tests need -- they exercise promoteAnchor()'s
+	// capacity/eviction logic via commitInsert(), not query routing itself.
+	std::optional<VectorId> nearest(const VectorView&) override { return std::nullopt; }
+	VectorId ensure(VectorId id, const VectorView&, float) override { return id; }
+	void erase(VectorId) override {}
+};
+
+// Builds a Record whose vector points at `value` -- callers must keep
+// `value` alive for the duration of the Controller::insert() call, which is
+// synchronous, so a stack float held by the test body is enough.
+Record MakeRecord(VectorId id, const float& value) {
+	Record record;
+	record.id = id;
+	record.vector = VectorView{&value, /*dim=*/1, VectorDType::Float32};
+	return record;
+}
+
+// Writes `bytes` into the device allocation backing `region` at `offset`,
+// synchronously, via the same public acquireRegion() seam a real adapter's
+// write kernel would use -- standing in for "a kernel just wrote here" (for
+// the payload) or "a kernel just atomicOr'd a dirty bit" (for the header).
+// The acquired Lease is released (falls out of scope) before returning, so
+// a subsequent eviction's free() doesn't block on it.
+void PokeDevice(Controller& controller, RegionId region, std::size_t offset, const std::vector<std::byte>& bytes) {
+	RegionAccess access = controller.acquireRegion(region);
+	ASSERT_TRUE(access.on_device);
+	gpu::DeviceRegionPool::Lease& lease = *access.device_lease;
+	ASSERT_EQ(cudaMemcpyAsync(static_cast<std::byte*>(lease.ptr()) + offset, bytes.data(), bytes.size(),
+														 cudaMemcpyHostToDevice, lease.stream()),
+						cudaSuccess);
+	ASSERT_EQ(cudaStreamSynchronize(lease.stream()), cudaSuccess);
+}
+
+// ---------------------------------------------------------------------------
+
+TEST(ControllerGpuResidencyTest, PromoteAllocatesGpuMemoryAndCopiesHostData) {
+	FakeAdapter adapter;
+	FakeRoutingCache routing_cache;
+	Controller controller(adapter, routing_cache);
+
+	constexpr std::size_t kBytes = 64;
+	std::vector<std::byte> host_data(kBytes, std::byte{0x42});
+	HostRegionView host{host_data.data(), kBytes, /*subregion_bytes=*/0};
+	adapter.addRegion(/*region=*/1, host);
+	controller.registerRegion(/*id=*/1, host);
+
+	// Before any promotion, the region is host-only.
+	RegionAccess before = controller.acquireRegion(1);
+	EXPECT_FALSE(before.on_device);
+
+	adapter.next_modified = RegionFootprint{{1}};
+	float vector_value = 1.0f;
+	InsertResult result = controller.insert(MakeRecord(/*id=*/100, vector_value));
+	ASSERT_TRUE(result.ok);
+
+	RegionAccess after = controller.acquireRegion(1);
+	ASSERT_TRUE(after.on_device);
+	ASSERT_TRUE(after.device_lease.has_value());
+
+	std::vector<std::byte> device_out(kBytes);
+	ASSERT_EQ(cudaMemcpyAsync(device_out.data(), after.device_lease->ptr(), kBytes, cudaMemcpyDeviceToHost,
+														 after.device_lease->stream()),
+						cudaSuccess);
+	ASSERT_EQ(cudaStreamSynchronize(after.device_lease->stream()), cudaSuccess);
+	EXPECT_EQ(device_out, host_data);
+}
+
+TEST(ControllerGpuResidencyTest, PromoteEvictsMultipleVictimsWhenOneIsNotEnoughCapacity) {
+	FakeAdapter adapter;
+	FakeRoutingCache routing_cache;
+	// Budget holds exactly 3 "small" (256-byte) regions. Promoting a 4th,
+	// "big" (512-byte) region can't be satisfied by reclaiming just one of
+	// them (freeing 256 still leaves only 256 of the 512 needed) -- it must
+	// evict two, proving promoteAnchor()'s eviction loop doesn't stop after
+	// a single victim. Sizes are multiples of 256 -- rmm::mr::pool_memory_resource
+	// requires the initial pool size to be 256-byte aligned.
+	constexpr std::size_t kSmallBytes = 256;
+	constexpr std::size_t kBigBytes = 512;
+	Controller controller(adapter, routing_cache, SchedulingConfig{}, nullptr,
+												 /*gpu_data_budget_bytes=*/3 * kSmallBytes, gpu::kDefaultMetadataPoolBytes);
+
+	std::vector<std::byte> data_a(kSmallBytes, std::byte{0xA});
+	std::vector<std::byte> data_b(kSmallBytes, std::byte{0xB});
+	std::vector<std::byte> data_c(kSmallBytes, std::byte{0xC});
+	std::vector<std::byte> data_d(kBigBytes, std::byte{0xD});
+	HostRegionView host_a{data_a.data(), kSmallBytes, 0};
+	HostRegionView host_b{data_b.data(), kSmallBytes, 0};
+	HostRegionView host_c{data_c.data(), kSmallBytes, 0};
+	HostRegionView host_d{data_d.data(), kBigBytes, 0};
+	adapter.addRegion(1, host_a);
+	adapter.addRegion(2, host_b);
+	adapter.addRegion(3, host_c);
+	adapter.addRegion(4, host_d);
+	controller.registerRegion(1, host_a);
+	controller.registerRegion(2, host_b);
+	controller.registerRegion(3, host_c);
+	controller.registerRegion(4, host_d);
+
+	float v1 = 1.0f, v2 = 2.0f, v3 = 3.0f, v4 = 4.0f;
+
+	adapter.next_modified = RegionFootprint{{1}};
+	ASSERT_TRUE(controller.insert(MakeRecord(101, v1)).ok);  // anchor 101 -> region 1 (oldest)
+	adapter.next_modified = RegionFootprint{{2}};
+	ASSERT_TRUE(controller.insert(MakeRecord(102, v2)).ok);  // anchor 102 -> region 2
+	adapter.next_modified = RegionFootprint{{3}};
+	ASSERT_TRUE(controller.insert(MakeRecord(103, v3)).ok);  // anchor 103 -> region 3 -- budget now full
+
+	adapter.next_modified = RegionFootprint{{4}};
+	ASSERT_TRUE(controller.insert(MakeRecord(104, v4)).ok);  // anchor 104 -> region 4, needs 2 evictions
+
+	EXPECT_FALSE(controller.acquireRegion(1).on_device);  // evicted (oldest, FIFO)
+	EXPECT_FALSE(controller.acquireRegion(2).on_device);  // evicted (second-oldest)
+	EXPECT_TRUE(controller.acquireRegion(3).on_device);   // untouched -- one eviction wasn't enough, but two was
+	EXPECT_TRUE(controller.acquireRegion(4).on_device);   // newly promoted
+}
+
+TEST(ControllerGpuResidencyTest, EvictionWritesBackOnlyWhenDirty) {
+	FakeAdapter adapter;
+	FakeRoutingCache routing_cache;
+	// Two regions with subregion tracking enabled (a real header exists):
+	// 248-byte payload, 124-byte subregions -> 2 subregions -> one 8-byte
+	// header word -> 256 bytes total per region. Sized so the budget below
+	// (region_bytes * 2) is a multiple of 256, since
+	// rmm::mr::pool_memory_resource requires the initial pool size to be
+	// 256-byte aligned.
+	constexpr std::size_t kPayloadBytes = 248;
+	constexpr std::size_t kSubregionBytes = 124;
+	const std::size_t header_bytes = gpu::DirtyHeaderBytes(kPayloadBytes, kSubregionBytes);
+	ASSERT_EQ(header_bytes, gpu::kDirtyWordBytes);
+	const std::size_t region_bytes = header_bytes + kPayloadBytes;
+	ASSERT_EQ(region_bytes, 256u);
+
+	Controller controller(adapter, routing_cache, SchedulingConfig{}, nullptr,
+												 /*gpu_data_budget_bytes=*/2 * region_bytes, gpu::kDefaultMetadataPoolBytes);
+
+	std::vector<std::byte> data_dirty(kPayloadBytes, std::byte{0x11});
+	std::vector<std::byte> data_clean(kPayloadBytes, std::byte{0x22});
+	HostRegionView host_dirty{data_dirty.data(), kPayloadBytes, kSubregionBytes};
+	HostRegionView host_clean{data_clean.data(), kPayloadBytes, kSubregionBytes};
+	adapter.addRegion(1, host_dirty);  // will be marked dirty before eviction
+	adapter.addRegion(2, host_clean);  // will NOT be marked dirty before eviction
+	controller.registerRegion(1, host_dirty);
+	controller.registerRegion(2, host_clean);
+
+	float v1 = 1.0f, v2 = 2.0f, v3 = 3.0f;
+	adapter.next_modified = RegionFootprint{{1}};
+	ASSERT_TRUE(controller.insert(MakeRecord(201, v1)).ok);
+	adapter.next_modified = RegionFootprint{{2}};
+	ASSERT_TRUE(controller.insert(MakeRecord(202, v2)).ok);  // budget now full
+
+	// Simulate a write kernel having touched both regions' device payloads,
+	// but only having atomicOr'd a dirty bit for region 1.
+	std::vector<std::byte> poison(kPayloadBytes, std::byte{0xFF});
+	PokeDevice(controller, /*region=*/1, /*offset=*/header_bytes, poison);
+	PokeDevice(controller, /*region=*/2, /*offset=*/header_bytes, poison);
+	std::vector<std::byte> dirty_word(gpu::kDirtyWordBytes, std::byte{0});
+	dirty_word[0] = std::byte{0x01};  // subregion 0's bit
+	PokeDevice(controller, /*region=*/1, /*offset=*/0, dirty_word);
+	// region 2's header is left all-zero -- never marked dirty.
+
+	// A 3rd region, same size, forces evicting region 1 (FIFO-oldest).
+	std::vector<std::byte> data_c(kPayloadBytes, std::byte{0x33});
+	HostRegionView host_c{data_c.data(), kPayloadBytes, kSubregionBytes};
+	adapter.addRegion(3, host_c);
+	controller.registerRegion(3, host_c);
+	adapter.next_modified = RegionFootprint{{3}};
+	ASSERT_TRUE(controller.insert(MakeRecord(203, v3)).ok);
+
+	EXPECT_FALSE(controller.acquireRegion(1).on_device);  // evicted
+	EXPECT_TRUE(controller.acquireRegion(2).on_device);   // still resident -- one eviction was enough
+	EXPECT_TRUE(controller.acquireRegion(3).on_device);
+
+	// Region 1 was dirty -> its poisoned device payload should have been
+	// written back to its host buffer.
+	EXPECT_EQ(data_dirty, poison);
+
+	// A 4th region now forces evicting region 2 (the next FIFO-oldest) --
+	// its device payload was poisoned exactly like region 1's, but it was
+	// never marked dirty, so its host buffer must come back untouched.
+	std::vector<std::byte> data_e(kPayloadBytes, std::byte{0x44});
+	HostRegionView host_e{data_e.data(), kPayloadBytes, kSubregionBytes};
+	adapter.addRegion(4, host_e);
+	controller.registerRegion(4, host_e);
+	adapter.next_modified = RegionFootprint{{4}};
+	ASSERT_TRUE(controller.insert(MakeRecord(204, v3)).ok);
+
+	EXPECT_FALSE(controller.acquireRegion(2).on_device);  // evicted
+	EXPECT_TRUE(controller.acquireRegion(3).on_device);
+	EXPECT_TRUE(controller.acquireRegion(4).on_device);
+	EXPECT_EQ(data_clean, std::vector<std::byte>(kPayloadBytes, std::byte{0x22}));  // untouched: never dirty
+}
+
+TEST(ControllerGpuResidencyTest, EvictionAlwaysWritesBackWhenNoHeaderExists) {
+	// subregion_bytes == 0 means no dirty header at all -- Arachne can't
+	// distinguish dirty from clean, so it must conservatively always write
+	// back (see writeBackDirtyRegions()'s doc comment).
+	FakeAdapter adapter;
+	FakeRoutingCache routing_cache;
+	// 256-byte regions, budget for exactly one at a time -- rmm::mr::
+	// pool_memory_resource requires the initial pool size to be a multiple
+	// of 256 bytes.
+	constexpr std::size_t kBytes = 256;
+	Controller controller(adapter, routing_cache, SchedulingConfig{}, nullptr, /*gpu_data_budget_bytes=*/kBytes,
+												 gpu::kDefaultMetadataPoolBytes);
+
+	std::vector<std::byte> data_a(kBytes, std::byte{0x11});
+	std::vector<std::byte> data_b(kBytes, std::byte{0x22});
+	HostRegionView host_a{data_a.data(), kBytes, /*subregion_bytes=*/0};
+	HostRegionView host_b{data_b.data(), kBytes, /*subregion_bytes=*/0};
+	adapter.addRegion(1, host_a);
+	adapter.addRegion(2, host_b);
+	controller.registerRegion(1, host_a);
+	controller.registerRegion(2, host_b);
+
+	float v1 = 1.0f, v2 = 2.0f;
+	adapter.next_modified = RegionFootprint{{1}};
+	ASSERT_TRUE(controller.insert(MakeRecord(301, v1)).ok);  // budget now full (1 region fits)
+
+	std::vector<std::byte> poison(kBytes, std::byte{0xFF});
+	PokeDevice(controller, /*region=*/1, /*offset=*/0, poison);  // never touch a dirty bit -- there is none
+
+	adapter.next_modified = RegionFootprint{{2}};
+	ASSERT_TRUE(controller.insert(MakeRecord(302, v2)).ok);  // evicts region 1
+
+	EXPECT_FALSE(controller.acquireRegion(1).on_device);
+	EXPECT_EQ(data_a, poison);  // written back unconditionally, despite no dirty bit ever being set
+}
+
+TEST(ControllerGpuResidencyTest, EvictionBatchesMultipleRegionsFromOneAnchorInOneCall) {
+	// One anchor depending on two Regions at once -- evicting it reclaims
+	// both in a single evictAnchor() call, exercising
+	// writeBackDirtyRegions()'s n > 1 batched-gather path (as opposed to the
+	// other tests here, which only ever evict one Region-per-anchor at a
+	// time). Region 1 is dirty, Region 2 is clean; both should still be
+	// correctly distinguished despite going through the same batch.
+	FakeAdapter adapter;
+	FakeRoutingCache routing_cache;
+	constexpr std::size_t kPayloadBytes = 248;
+	constexpr std::size_t kSubregionBytes = 124;
+	const std::size_t header_bytes = gpu::DirtyHeaderBytes(kPayloadBytes, kSubregionBytes);
+	const std::size_t region_bytes = header_bytes + kPayloadBytes;
+	ASSERT_EQ(region_bytes, 256u);
+
+	// Budget for regions 1+2 together (one anchor's whole footprint), plus
+	// region 3 needs its own room too -- forces evicting anchor 401
+	// entirely (both its regions) before region 3 fits.
+	Controller controller(adapter, routing_cache, SchedulingConfig{}, nullptr,
+												 /*gpu_data_budget_bytes=*/2 * region_bytes, gpu::kDefaultMetadataPoolBytes);
+
+	std::vector<std::byte> data_dirty(kPayloadBytes, std::byte{0x11});
+	std::vector<std::byte> data_clean(kPayloadBytes, std::byte{0x22});
+	std::vector<std::byte> data_c(kPayloadBytes, std::byte{0x33});
+	HostRegionView host_dirty{data_dirty.data(), kPayloadBytes, kSubregionBytes};
+	HostRegionView host_clean{data_clean.data(), kPayloadBytes, kSubregionBytes};
+	HostRegionView host_c{data_c.data(), kPayloadBytes, kSubregionBytes};
+	adapter.addRegion(1, host_dirty);
+	adapter.addRegion(2, host_clean);
+	adapter.addRegion(3, host_c);
+	controller.registerRegion(1, host_dirty);
+	controller.registerRegion(2, host_clean);
+	controller.registerRegion(3, host_c);
+
+	// A single insert whose footprint covers both regions 1 and 2 --
+	// anchor 401 now depends on both at once.
+	float v1 = 1.0f, v3 = 3.0f;
+	adapter.next_modified = RegionFootprint{{1, 2}};
+	ASSERT_TRUE(controller.insert(MakeRecord(401, v1)).ok);
+	ASSERT_TRUE(controller.acquireRegion(1).on_device);
+	ASSERT_TRUE(controller.acquireRegion(2).on_device);
+
+	std::vector<std::byte> poison(kPayloadBytes, std::byte{0xFF});
+	PokeDevice(controller, /*region=*/1, /*offset=*/header_bytes, poison);
+	PokeDevice(controller, /*region=*/2, /*offset=*/header_bytes, poison);
+	std::vector<std::byte> dirty_word(gpu::kDirtyWordBytes, std::byte{0});
+	dirty_word[0] = std::byte{0x01};
+	PokeDevice(controller, /*region=*/1, /*offset=*/0, dirty_word);  // only region 1 marked dirty
+
+	// Region 3 forces evicting anchor 401 -- both region 1 and region 2 are
+	// reclaimed together, in one evictAnchor() call.
+	adapter.next_modified = RegionFootprint{{3}};
+	ASSERT_TRUE(controller.insert(MakeRecord(402, v3)).ok);
+
+	EXPECT_FALSE(controller.acquireRegion(1).on_device);
+	EXPECT_FALSE(controller.acquireRegion(2).on_device);
+	EXPECT_TRUE(controller.acquireRegion(3).on_device);
+
+	EXPECT_EQ(data_dirty, poison);                                              // written back: was dirty
+	EXPECT_EQ(data_clean, std::vector<std::byte>(kPayloadBytes, std::byte{0x22}));  // untouched: never dirty
+}
+
+TEST(ControllerGpuResidencyTest, InsertRejectsDuplicateIdWithoutTouchingExistingState) {
+	FakeAdapter adapter;
+	FakeRoutingCache routing_cache;
+	constexpr std::size_t kBytes = 256;
+	Controller controller(adapter, routing_cache, SchedulingConfig{}, nullptr, /*gpu_data_budget_bytes=*/kBytes,
+												 gpu::kDefaultMetadataPoolBytes);
+
+	std::vector<std::byte> host_data(kBytes, std::byte{0x42});
+	HostRegionView host{host_data.data(), kBytes, 0};
+	adapter.addRegion(1, host);
+	controller.registerRegion(1, host);
+
+	adapter.next_modified = RegionFootprint{{1}};
+	float v1 = 1.0f, v2 = 2.0f;
+	ASSERT_TRUE(controller.insert(MakeRecord(501, v1)).ok);
+	ASSERT_TRUE(controller.acquireRegion(1).on_device);
+
+	// Same id again, different vector -- must be rejected outright, and must
+	// not disturb the Region the first insert already promoted.
+	InsertResult duplicate = controller.insert(MakeRecord(501, v2));
+	EXPECT_FALSE(duplicate.ok);
+	EXPECT_TRUE(controller.acquireRegion(1).on_device);
+
+	// remove() frees the id back up for reuse.
+	ASSERT_TRUE(controller.remove(501).ok);
+	adapter.next_modified = RegionFootprint{{1}};
+	EXPECT_TRUE(controller.insert(MakeRecord(501, v2)).ok);
+}
+
+}  // namespace

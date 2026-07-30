@@ -46,7 +46,14 @@ class SchedulingPolicy {
 			const ScheduledOperationQueue& queue, ScheduledKind batch_kind,
 			const ScheduledOperationBatch& current_batch) const = 0;
 
-	/// Additional per-candidate validation before appending.
+	/// Additional per-candidate validation before appending. Implementations
+	/// must, at minimum, reject a candidate whose ExecutionMode
+	/// (TraverseRequest::mode/ModifyRequest::mode) doesn't match
+	/// `current_batch`'s (once non-empty) -- OpScheduler dispatches a whole
+	/// batch to exactly one of IndexAdapter's Host/Device entry points (see
+	/// adapter/index_adapter.hpp), so a batch must be mode-homogeneous, not
+	/// just kind-homogeneous, or there'd be no single call that's correct
+	/// for the whole thing.
 	virtual bool canAppendToBatch(ScheduledKind batch_kind, const ScheduledOperation& candidate,
 																const ScheduledOperationBatch& current_batch) const = 0;
 };

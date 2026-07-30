@@ -1,8 +1,18 @@
 #include "core/scheduling_policy.hpp"
 
 #include <optional>
+#include <variant>
 
 namespace arachne {
+
+namespace {
+
+ExecutionMode ModeOf(const ScheduledOperation& op) {
+	if (std::holds_alternative<TraverseTask>(op)) return std::get<TraverseTask>(op).request.mode;
+	return std::get<ModifyTask>(op).request.mode;
+}
+
+}  // namespace
 
 ScheduledKind FifoSchedulingPolicy::chooseBatchKind(const ScheduledOperationQueue& queue) const {
 	if (queue.empty()) {
@@ -28,11 +38,15 @@ std::optional<std::size_t> FifoSchedulingPolicy::selectCandidateIndex(
 
 bool FifoSchedulingPolicy::canAppendToBatch(ScheduledKind batch_kind, const ScheduledOperation& candidate,
 																			 const ScheduledOperationBatch& current_batch) const {
-	(void)current_batch;
-	if (batch_kind == ScheduledKind::Traverse) {
-		return std::holds_alternative<TraverseTask>(candidate);
-	}
-	return std::holds_alternative<ModifyTask>(candidate);
+	bool kind_matches = (batch_kind == ScheduledKind::Traverse)
+													 ? std::holds_alternative<TraverseTask>(candidate)
+													 : std::holds_alternative<ModifyTask>(candidate);
+	if (!kind_matches) return false;
+
+	// A batch is dispatched to exactly one IndexAdapter Host/Device entry
+	// point, so every member must share the same ExecutionMode -- see
+	// canAppendToBatch()'s doc comment.
+	return current_batch.empty() || ModeOf(candidate) == ModeOf(current_batch.front());
 }
 
 }  // namespace arachne

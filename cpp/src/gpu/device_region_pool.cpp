@@ -1,4 +1,4 @@
-#include "gpu/stitch_pool.hpp"
+#include "gpu/device_region_pool.hpp"
 
 #include <cuda_runtime.h>
 
@@ -26,15 +26,15 @@ void CheckCuda(cudaError_t status, const char* what) {
 // Lease
 // ---------------------------------------------------------------------------
 
-StitchPool::Lease::Lease(StitchPool& pool, StitchHandle handle, cudaStream_t stream, void* ptr)
+DeviceRegionPool::Lease::Lease(DeviceRegionPool& pool, DeviceRegionHandle handle, cudaStream_t stream, void* ptr)
 		: pool_(&pool), handle_(handle), stream_(stream), ptr_(ptr) {}
 
-StitchPool::Lease::Lease(Lease&& other) noexcept
+DeviceRegionPool::Lease::Lease(Lease&& other) noexcept
 		: pool_(other.pool_), handle_(other.handle_), stream_(other.stream_), ptr_(other.ptr_) {
 	other.pool_ = nullptr;
 }
 
-StitchPool::Lease& StitchPool::Lease::operator=(Lease&& other) noexcept {
+DeviceRegionPool::Lease& DeviceRegionPool::Lease::operator=(Lease&& other) noexcept {
 	if (this == &other) return *this;
 	if (pool_ != nullptr) pool_->release(handle_, stream_);
 	pool_ = other.pool_;
@@ -45,21 +45,22 @@ StitchPool::Lease& StitchPool::Lease::operator=(Lease&& other) noexcept {
 	return *this;
 }
 
-StitchPool::Lease::~Lease() {
+DeviceRegionPool::Lease::~Lease() {
 	if (pool_ != nullptr) pool_->release(handle_, stream_);
 }
 
 // ---------------------------------------------------------------------------
-// StitchPool
+// DeviceRegionPool
 // ---------------------------------------------------------------------------
 
-StitchPool::StitchPool(DeviceContext& device) : device_(device) {}
+DeviceRegionPool::DeviceRegionPool(DeviceContext& device) : device_(device) {}
 
-StitchPool::~StitchPool() {
-	// Safety net, not the expected path: every Stitch should have been
-	// free()'d via removeStitch()/forget() (see core/anchor_manager.hpp)
-	// before the pool backing it goes away. Reclaim whatever is still
-	// outstanding (memory and any leftover Lease events) rather than leak.
+DeviceRegionPool::~DeviceRegionPool() {
+	// Safety net, not the expected path: every Region should have had its
+	// device residency reclaimed via RegionManager::forget()/removeDependency()
+	// (see core/region_manager.hpp) before the pool backing it goes away.
+	// Reclaim whatever is still outstanding (memory and any leftover Lease
+	// events) rather than leak.
 	for (auto& [id, allocation] : allocations_) {
 		for (auto& [stream, event] : allocation.last_used_events) {
 			cudaEventDestroy(event);
@@ -70,7 +71,7 @@ StitchPool::~StitchPool() {
 	}
 }
 
-cuda::mr::any_resource<cuda::mr::device_accessible>& StitchPool::resourceFor(MemoryKind kind) {
+cuda::mr::any_resource<cuda::mr::device_accessible>& DeviceRegionPool::resourceFor(MemoryKind kind) {
 	switch (kind) {
 		case MemoryKind::Metadata:
 			return device_.metadataResource();
@@ -80,16 +81,16 @@ cuda::mr::any_resource<cuda::mr::device_accessible>& StitchPool::resourceFor(Mem
 	}
 }
 
-StitchPool::Allocation StitchPool::allocationFor(StitchHandle handle) {
+DeviceRegionPool::Allocation DeviceRegionPool::allocationFor(DeviceRegionHandle handle) {
 	std::lock_guard<std::mutex> lock(mutex_);
 	auto it = allocations_.find(handle.id);
 	if (it == allocations_.end()) {
-		throw std::invalid_argument("StitchPool: handle is not a live allocation");
+		throw std::invalid_argument("DeviceRegionPool: handle is not a live allocation");
 	}
 	return it->second;
 }
 
-void StitchPool::awaitQuiescentLocked(std::uint64_t id, std::unique_lock<std::mutex>& lock) {
+void DeviceRegionPool::awaitQuiescentLocked(std::uint64_t id, std::unique_lock<std::mutex>& lock) {
 	cv_.wait(lock, [&] {
 		auto it = allocations_.find(id);
 		return it == allocations_.end() || it->second.in_use_count == 0;
@@ -112,7 +113,7 @@ void StitchPool::awaitQuiescentLocked(std::uint64_t id, std::unique_lock<std::mu
 	it->second.last_used_events.clear();
 }
 
-void StitchPool::release(StitchHandle handle, cudaStream_t stream) {
+void DeviceRegionPool::release(DeviceRegionHandle handle, cudaStream_t stream) {
 	std::lock_guard<std::mutex> lock(mutex_);
 	auto it = allocations_.find(handle.id);
 	if (it == allocations_.end()) return;  // freed out from under an outstanding Lease shouldn't
@@ -135,35 +136,50 @@ void StitchPool::release(StitchHandle handle, cudaStream_t stream) {
 	cv_.notify_all();
 }
 
-StitchHandle StitchPool::allocate(std::size_t bytes, MemoryKind kind) {
+DeviceRegionHandle DeviceRegionPool::allocate(std::size_t bytes, MemoryKind kind) {
 	void* ptr = resourceFor(kind).allocate(device_.resources().get_stream(), bytes,
 																					rmm::CUDA_ALLOCATION_ALIGNMENT);
 
 	std::lock_guard<std::mutex> lock(mutex_);
 	std::uint64_t id = next_id_++;
 	allocations_.emplace(id, Allocation{ptr, bytes, kind});
-	return StitchHandle{id};
+	return DeviceRegionHandle{id};
 }
 
-void* StitchPool::access(StitchHandle handle, AccessMode /*mode*/) {
-	return allocationFor(handle).device_ptr;
+bool DeviceRegionPool::hasCapacity(std::size_t bytes, MemoryKind kind) const {
+	return bytesAllocated(kind) + bytes <= device_.budgetBytes(kind);
 }
 
-StitchPool::Lease StitchPool::acquire(StitchHandle handle, cudaStream_t stream) {
+std::optional<DeviceRegionHandle> DeviceRegionPool::tryAllocate(std::size_t bytes, MemoryKind kind) {
+	if (!hasCapacity(bytes, kind)) {
+		ARACHNE_LOG_DEBUG("DeviceRegionPool::tryAllocate: {} bytes of kind {} would exceed budget ({} already allocated)",
+											 bytes, static_cast<int>(kind), bytesAllocated(kind));
+		return std::nullopt;
+	}
+	try {
+		return allocate(bytes, kind);
+	} catch (const std::exception& e) {
+		ARACHNE_LOG_DEBUG("DeviceRegionPool::tryAllocate: allocate({} bytes) failed despite passing the budget check: {}",
+											 bytes, e.what());
+		return std::nullopt;
+	}
+}
+
+DeviceRegionPool::Lease DeviceRegionPool::acquire(DeviceRegionHandle handle, cudaStream_t stream) {
 	std::lock_guard<std::mutex> lock(mutex_);
 	auto it = allocations_.find(handle.id);
 	if (it == allocations_.end()) {
-		throw std::invalid_argument("StitchPool::acquire: handle is not a live allocation");
+		throw std::invalid_argument("DeviceRegionPool::acquire: handle is not a live allocation");
 	}
 	++it->second.in_use_count;
 	return Lease(*this, handle, stream, it->second.device_ptr);
 }
 
-StitchPool::Lease StitchPool::acquire(StitchHandle handle) {
+DeviceRegionPool::Lease DeviceRegionPool::acquire(DeviceRegionHandle handle) {
 	return acquire(handle, device_.resources().get_stream().value());
 }
 
-void StitchPool::free(StitchHandle handle) {
+void DeviceRegionPool::free(DeviceRegionHandle handle) {
 	Allocation allocation;
 	{
 		std::unique_lock<std::mutex> lock(mutex_);
@@ -184,36 +200,58 @@ void StitchPool::free(StitchHandle handle) {
 									rmm::CUDA_ALLOCATION_ALIGNMENT);
 }
 
-void StitchPool::copyFromHost(StitchHandle handle, const void* host_src, std::size_t bytes) {
-	Allocation allocation = allocationFor(handle);
-	if (bytes > allocation.bytes) {
-		throw std::out_of_range("StitchPool::copyFromHost: bytes exceeds the allocation's size");
-	}
-	CheckCuda(cudaMemcpyAsync(allocation.device_ptr, host_src, bytes, cudaMemcpyHostToDevice,
-														 device_.resources().get_stream().value()),
-						"StitchPool::copyFromHost: cudaMemcpyAsync");
-	device_.resources().sync_stream();
+void DeviceRegionPool::copyFromHost(DeviceRegionHandle handle, const void* host_src, std::size_t bytes,
+																		 std::size_t dst_offset) {
+	std::vector<Lease> pending;
+	enqueueCopyFromHost(handle, host_src, bytes, dst_offset, pending);
+	flush();
+	// `pending`'s Lease releases here -- safe, flush() already proved the
+	// copy landed.
 }
 
-void StitchPool::copyToHost(StitchHandle handle, void* host_dst, std::size_t bytes) {
-	Allocation allocation = allocationFor(handle);
-	if (bytes > allocation.bytes) {
-		throw std::out_of_range("StitchPool::copyToHost: bytes exceeds the allocation's size");
+void DeviceRegionPool::enqueueCopyFromHost(DeviceRegionHandle handle, const void* host_src, std::size_t bytes,
+																						std::size_t dst_offset, std::vector<Lease>& pending) {
+	if (dst_offset + bytes > allocationFor(handle).bytes) {
+		throw std::out_of_range("DeviceRegionPool::enqueueCopyFromHost: dst_offset + bytes exceeds the allocation's size");
 	}
-	CheckCuda(cudaMemcpyAsync(host_dst, allocation.device_ptr, bytes, cudaMemcpyDeviceToHost,
-														 device_.resources().get_stream().value()),
-						"StitchPool::copyToHost: cudaMemcpyAsync");
-	device_.resources().sync_stream();
+	Lease lease = acquire(handle);  // guards the copy against a concurrent compact()/free()
+	void* dst = static_cast<std::byte*>(lease.ptr()) + dst_offset;
+	CheckCuda(cudaMemcpyAsync(dst, host_src, bytes, cudaMemcpyHostToDevice, lease.stream()),
+						"DeviceRegionPool::enqueueCopyFromHost: cudaMemcpyAsync");
+	pending.push_back(std::move(lease));
 }
 
-std::size_t StitchPool::bytesAllocated() const {
+void DeviceRegionPool::copyToHost(DeviceRegionHandle handle, void* host_dst, std::size_t bytes,
+																	 std::size_t src_offset) {
+	std::vector<Lease> pending;
+	enqueueCopyToHost(handle, host_dst, bytes, src_offset, pending);
+	flush();
+	// `pending`'s Lease releases here -- safe, flush() already proved the
+	// copy landed.
+}
+
+void DeviceRegionPool::enqueueCopyToHost(DeviceRegionHandle handle, void* host_dst, std::size_t bytes,
+																					std::size_t src_offset, std::vector<Lease>& pending) {
+	if (src_offset + bytes > allocationFor(handle).bytes) {
+		throw std::out_of_range("DeviceRegionPool::enqueueCopyToHost: src_offset + bytes exceeds the allocation's size");
+	}
+	Lease lease = acquire(handle);  // guards the copy against a concurrent compact()/free()
+	const void* src = static_cast<const std::byte*>(lease.ptr()) + src_offset;
+	CheckCuda(cudaMemcpyAsync(host_dst, src, bytes, cudaMemcpyDeviceToHost, lease.stream()),
+						"DeviceRegionPool::enqueueCopyToHost: cudaMemcpyAsync");
+	pending.push_back(std::move(lease));
+}
+
+void DeviceRegionPool::flush() { device_.resources().sync_stream(); }
+
+std::size_t DeviceRegionPool::bytesAllocated() const {
 	std::lock_guard<std::mutex> lock(mutex_);
 	std::size_t total = 0;
 	for (const auto& [id, allocation] : allocations_) total += allocation.bytes;
 	return total;
 }
 
-std::size_t StitchPool::bytesAllocated(MemoryKind kind) const {
+std::size_t DeviceRegionPool::bytesAllocated(MemoryKind kind) const {
 	std::lock_guard<std::mutex> lock(mutex_);
 	std::size_t total = 0;
 	for (const auto& [id, allocation] : allocations_) {
@@ -222,7 +260,7 @@ std::size_t StitchPool::bytesAllocated(MemoryKind kind) const {
 	return total;
 }
 
-StitchPool::CompactionResult StitchPool::compact(MemoryKind kind) {
+DeviceRegionPool::CompactionResult DeviceRegionPool::compact(MemoryKind kind) {
 	if (device_.allocationPolicy() == AllocationPolicy::Naive) {
 		// No shared arena under Naive -- see the declaration's doc comment.
 		return {};
@@ -272,7 +310,7 @@ StitchPool::CompactionResult StitchPool::compact(MemoryKind kind) {
 																									 rmm::CUDA_ALLOCATION_ALIGNMENT);
 			CheckCuda(cudaMemcpyAsync(new_ptr, allocation.device_ptr, allocation.bytes,
 																 cudaMemcpyDeviceToDevice, device_.resources().get_stream().value()),
-								"StitchPool::compact: cudaMemcpyAsync");
+								"DeviceRegionPool::compact: cudaMemcpyAsync");
 			moves.push_back(Move{id, new_ptr, allocation.device_ptr, allocation.bytes});
 		}
 	} catch (...) {
@@ -300,7 +338,7 @@ StitchPool::CompactionResult StitchPool::compact(MemoryKind kind) {
 																	rmm::CUDA_ALLOCATION_ALIGNMENT);
 	}
 
-	ARACHNE_LOG_DEBUG("StitchPool::compact: relocated {} allocation(s), {} bytes", moves.size(),
+	ARACHNE_LOG_DEBUG("DeviceRegionPool::compact: relocated {} allocation(s), {} bytes", moves.size(),
 										 live_bytes);
 	return CompactionResult{moves.size(), live_bytes};
 }

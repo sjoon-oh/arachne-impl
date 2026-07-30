@@ -180,8 +180,13 @@ ScheduledKind OpScheduler::kindOf(const ScheduledOperation& op) const {
 }
 
 std::size_t OpScheduler::targetBatchSizeFor(ScheduledKind kind) const {
-	return kind == ScheduledKind::Traverse ? batchSizeValue(ScheduledKind::Traverse)
-																				: batchSizeValue(ScheduledKind::Modify);
+	// Reads traverse_batch_size_/modify_batch_size_ directly rather than going
+	// through the locking batchSizeValue() -- this is only ever called from
+	// plannerLoop(), which already holds mutex_ (via the unique_lock it took
+	// for cv_incoming_.wait()) for the entire loop body; going through
+	// batchSizeValue()'s std::scoped_lock here would try to re-lock the same
+	// non-recursive mutex_ and deadlock.
+	return kind == ScheduledKind::Traverse ? traverse_batch_size_ : modify_batch_size_;
 }
 
 void OpScheduler::collectBatch(ScheduledOperationBatch& batch, ScheduledKind batch_kind,
@@ -214,35 +219,72 @@ void OpScheduler::collectBatch(ScheduledOperationBatch& batch, ScheduledKind bat
 void OpScheduler::executeBatch(ScheduledOperationBatch batch) {
 	if (batch.empty()) return;
 
-	for (auto& op : batch) {
-		if (kindOf(op) == ScheduledKind::Traverse) {
-			auto& task = std::get<TraverseTask>(op);
-			executeTask(task);
-		} else {
-			auto& task = std::get<ModifyTask>(op);
-			executeTask(task);
+	// SchedulingPolicy::canAppendToBatch() guarantees every collectBatch()
+	// result is kind-homogeneous (see its doc comment), so the front
+	// element's kind tells us which of the two batch paths applies to the
+	// whole thing.
+	if (kindOf(batch.front()) == ScheduledKind::Traverse) {
+		executeTraverseBatch(std::move(batch));
+	} else {
+		executeModifyBatch(std::move(batch));
+	}
+}
+
+void OpScheduler::executeTraverseBatch(ScheduledOperationBatch batch) {
+	std::vector<TraverseRequest> requests;
+	requests.reserve(batch.size());
+	for (auto& op : batch) requests.push_back(std::get<TraverseTask>(op).request);
+
+	// SchedulingPolicy::canAppendToBatch() guarantees every request in the
+	// batch shares the same ExecutionMode, so the front element's mode picks
+	// which single IndexAdapter entry point serves the whole batch.
+	bool device = requests.front().mode == ExecutionMode::GpuOnly;
+
+	try {
+		std::vector<TraverseResult> results =
+				device ? adapter_->traverseDevice(requests) : adapter_->traverseHost(requests);
+		if (results.size() != batch.size()) {
+			throw std::logic_error(
+					"IndexAdapter::traverseHost/traverseDevice: result count does not match request count");
+		}
+		for (std::size_t i = 0; i < batch.size(); ++i) {
+			std::get<TraverseTask>(batch[i]).promise.set_value(std::move(results[i]));
+		}
+	} catch (...) {
+		std::exception_ptr eptr = std::current_exception();
+		for (auto& op : batch) {
+			try {
+				std::get<TraverseTask>(op).promise.set_exception(eptr);
+			} catch (...) {
+			}
 		}
 	}
 }
 
-void OpScheduler::executeTask(TraverseTask& task) {
-	try {
-		task.promise.set_value(adapter_->traverse(task.request));
-	} catch (...) {
-		try {
-			task.promise.set_exception(std::current_exception());
-		} catch (...) {
-		}
-	}
-}
+void OpScheduler::executeModifyBatch(ScheduledOperationBatch batch) {
+	std::vector<ModifyRequest> requests;
+	requests.reserve(batch.size());
+	for (auto& op : batch) requests.push_back(std::get<ModifyTask>(op).request);
 
-void OpScheduler::executeTask(ModifyTask& task) {
+	bool device = requests.front().mode == ExecutionMode::GpuOnly;
+
 	try {
-		task.promise.set_value(adapter_->modify(task.request));
+		std::vector<ModifyResult> results =
+				device ? adapter_->modifyDevice(requests) : adapter_->modifyHost(requests);
+		if (results.size() != batch.size()) {
+			throw std::logic_error(
+					"IndexAdapter::modifyHost/modifyDevice: result count does not match request count");
+		}
+		for (std::size_t i = 0; i < batch.size(); ++i) {
+			std::get<ModifyTask>(batch[i]).promise.set_value(std::move(results[i]));
+		}
 	} catch (...) {
-		try {
-			task.promise.set_exception(std::current_exception());
-		} catch (...) {
+		std::exception_ptr eptr = std::current_exception();
+		for (auto& op : batch) {
+			try {
+				std::get<ModifyTask>(op).promise.set_exception(eptr);
+			} catch (...) {
+			}
 		}
 	}
 }

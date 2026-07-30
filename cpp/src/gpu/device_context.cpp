@@ -22,7 +22,7 @@ int SetActiveDevice(int device_id) {
 }
 
 // Type-erases either strategy behind the same any_resource<device_accessible>
-// StitchPool calls allocate()/deallocate() on -- see AllocationPolicy's doc
+// DeviceRegionPool calls allocate()/deallocate() on -- see AllocationPolicy's doc
 // comment. `upstream` is copied into whichever concrete resource gets
 // built (cheap: cuda_memory_resource is stateless, "all instances
 // equivalent").
@@ -55,6 +55,8 @@ DeviceContext::DeviceContext(int device_id, AllocationPolicy policy, std::size_t
 															std::size_t metadata_pool_bytes)
 		: device_id_(SetActiveDevice(device_id)),
 			policy_(policy),
+			data_pool_bytes_(data_pool_bytes),
+			metadata_pool_bytes_(metadata_pool_bytes),
 			data_resource_(MakeResource(policy_, memory_resource_, data_pool_bytes)),
 			metadata_resource_(MakeResource(policy_, memory_resource_, metadata_pool_bytes)) {
 	ARACHNE_LOG_INFO(

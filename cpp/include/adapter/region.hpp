@@ -8,13 +8,6 @@
 
 namespace arachne {
 
-/// Where a Region's authoritative mutable state currently lives.
-enum class ResidencyState {
-	Host,      // only the CPU-side index holds this region
-	Pending,   // promotion/eviction transfer in flight
-	Resident,  // materialized on GPU and eligible for GPU-only execution
-};
-
 /// The set of regions an operation touched, or is scoped to.
 struct RegionFootprint {
 	std::vector<RegionId> regions;
@@ -36,6 +29,30 @@ struct ModificationDelta {
 	std::vector<std::byte> payload;
 };
 
+/// Where a Region's data currently lives in host memory: a pointer/size
+/// pair the adapter reports and Arachne only ever records, never allocates
+/// or frees -- host memory stays entirely the index's own to manage (see
+/// IRegion::hostView()). Paired with gpu::DeviceRegionHandle (see
+/// gpu/device_region_handle.hpp) inside a Region (core/region_manager.hpp):
+/// together the two describe where one Region's data lives on each side of
+/// the host/device boundary.
+struct HostRegionView {
+	void* ptr = nullptr;
+	std::size_t bytes = 0;
+
+	/// Granularity, in bytes, at which Core should track which parts of this
+	/// Region were actually written to while it held a GPU write lease --
+	/// see gpu/dirty_header.hpp for the bitmap this drives and why the
+	/// adapter, not Core, is the one who should pick the value (it's tied to
+	/// the index's own natural write unit, e.g. roughly one graph node's
+	/// record for an HNSW-style adapter). 0 (the default) disables
+	/// fine-grained tracking: the whole Region is treated as a single
+	/// dirty/clean unit, which is the only real choice until Core's GPU
+	/// allocation for Regions is wired -- see Controller::make()'s doc
+	/// comment.
+	std::size_t subregion_bytes = 0;
+};
+
 struct ReconciliationReport {
 	bool closed = false;  // true if boundary connectivity/invariants now hold
 	RegionFootprint touched_neighbors;
@@ -43,29 +60,37 @@ struct ReconciliationReport {
 
 /// Index-agnostic callback surface a Region implementation exposes to
 /// Arachne's Core. Arachne never inspects index internals directly; it
-/// only drives residency, leasing, and reconciliation through IRegion, so
-/// any index can plug in as long as it can partition its state into objects
-/// implementing this interface.
+/// only drives leasing and reconciliation through IRegion, so any index can
+/// plug in as long as it can partition its state into objects implementing
+/// this interface. GPU residency itself -- whether/when a Region's bytes are
+/// actually copied onto or off of the device -- is entirely Arachne's own
+/// decision and mechanism (see core/controller.hpp's Controller::make()/
+/// evictAnchor()), not something an adapter opts into or performs; the
+/// adapter's only role here is to declare a Region exists and hand out
+/// leases over it.
 class IRegion {
  public:
 	virtual ~IRegion() = default;
 
 	virtual RegionId id() const = 0;
-	virtual ResidencyState residency() const = 0;
 
 	/// What this region covers. Used to compute Anchor footprints and
 	/// drift/coverage statistics without Core understanding the
 	/// underlying index structure.
 	virtual RegionFootprint footprint() const = 0;
 
-	/// Invoked by Core. Must bring the region's state onto GPU (or evict
-	/// it) and update residency() accordingly.
-	virtual void materializeOnDevice() = 0;
-	virtual void evictFromDevice() = 0;
+	/// Where this region's authoritative data currently lives in host
+	/// memory. Arachne records the returned pointer/size into the Region
+	/// record it registers for this id (see core/region_manager.hpp) purely
+	/// as a mapping -- it never dereferences, allocates, or frees it; the
+	/// adapter remains free to change its own host layout as long as this
+	/// stays accurate whenever Core calls it.
+	virtual HostRegionView hostView() const = 0;
 
 	/// Invoked by Core. acquireWriteLease grants this region GPU
 	/// modification authority for one epoch; callers are expected to have
-	/// already verified the region is Resident.
+	/// already verified the region is GPU-resident (Core's own
+	/// RegionManager-tracked state, not anything this interface reports).
 	virtual LeaseHandle acquireWriteLease() = 0;
 	virtual void releaseWriteLease(LeaseHandle handle) = 0;
 

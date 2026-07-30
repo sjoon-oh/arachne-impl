@@ -17,7 +17,7 @@ namespace arachne {
 /// External tuning knobs for Arachne's operation scheduling/batching layer.
 /// This layer intentionally stays index-agnostic: it only sees
 /// TraverseRequest/ModifyRequest and orchestrates when/how to call
-/// IndexAdapter::traverse/IndexAdapter::modify.
+/// IndexAdapter's Host/Device entry points.
 struct SchedulingConfig {
 	/// Maximum number of same-kind ops grouped together before dispatch.
 	/// Traverse and modify each have independent knobs.
@@ -77,10 +77,16 @@ private:
 	std::size_t targetBatchSizeFor(ScheduledKind kind) const;
 	void collectBatch(ScheduledOperationBatch& batch, ScheduledKind batch_kind,
 									 std::size_t batch_target, std::unique_lock<std::mutex>& lock);
+	// Dispatches a whole (kind- and mode-homogeneous, see SchedulingPolicy::
+	// canAppendToBatch()) batch to exactly one of IndexAdapter's
+	// traverseHost()/traverseDevice() or modifyHost()/modifyDevice() in one
+	// call, rather than looping one request at a time -- see those methods'
+	// doc comments (adapter/index_adapter.hpp) for why a genuinely
+	// batch-aware index needs this shape to get real GPU throughput out of a
+	// batch.
 	void executeBatch(ScheduledOperationBatch batch);
-
-	void executeTask(TraverseTask& task);
-	void executeTask(ModifyTask& task);
+	void executeTraverseBatch(ScheduledOperationBatch batch);
+	void executeModifyBatch(ScheduledOperationBatch batch);
 
 	void setBatchSizeValue(ScheduledKind kind, std::size_t size);
 	void setExecutionThreadValue(std::size_t threads);

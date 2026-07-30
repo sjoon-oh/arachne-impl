@@ -6,7 +6,7 @@
 #include <raft/core/device_resources.hpp>
 #include <rmm/mr/cuda_memory_resource.hpp>
 
-#include "gpu/stitch_handle.hpp"
+#include "gpu/device_region_handle.hpp"
 
 namespace arachne::gpu {
 
@@ -26,7 +26,7 @@ inline constexpr std::size_t kDefaultMetadataPoolBytes = std::size_t{1} << 26;  
 /// How DeviceContext backs dataResource()/metadataResource(). Both
 /// alternatives are `cuda::mr::any_resource<cuda::mr::device_accessible>`
 /// underneath (CCCL's own type-erased memory_resource wrapper) so
-/// StitchPool -- and anything else built against DeviceContext -- calls the
+/// DeviceRegionPool -- and anything else built against DeviceContext -- calls the
 /// exact same allocate()/deallocate() surface regardless of which is
 /// active; adding a third strategy later (e.g. an async/stream-ordered
 /// pool) only touches MakeResource() in device_context.cpp.
@@ -36,15 +36,15 @@ enum class AllocationPolicy {
 	/// (rmm::mr::pool_memory_resource, coalescing best-fit) -- Arachne
 	/// manages the pool itself; cudaMalloc/cudaFree happen rarely, only when
 	/// a pool's current reservation is exhausted. This is the
-	/// fragmentation-manageable policy StitchPool::compact() is meant to
+	/// fragmentation-manageable policy DeviceRegionPool::compact() is meant to
 	/// operate on.
 	Pooled,
-	/// No pre-reservation, no suballocation: every StitchPool::allocate()
+	/// No pre-reservation, no suballocation: every DeviceRegionPool::allocate()
 	/// issues its own independent cudaMalloc, and free() its own cudaFree
 	/// (rmm::mr::cuda_memory_resource directly). Simplest possible strategy,
 	/// and the natural baseline/fallback -- fragmentation here is the CUDA
 	/// driver's own allocator's problem, entirely outside Arachne's control
-	/// either way, so there is nothing for StitchPool::compact() to do under
+	/// either way, so there is nothing for DeviceRegionPool::compact() to do under
 	/// this policy.
 	Naive,
 };
@@ -52,13 +52,13 @@ enum class AllocationPolicy {
 /// Owns Arachne's CUDA device selection, the RAFT resources handle (default
 /// stream, stream pool, and lazily-created cuBLAS/cuSOLVER/cuSPARSE handles
 /// -- see raft::device_resources), and the two device memory resources
-/// every gpu::StitchPool allocates against (see MemoryKind in
-/// gpu/stitch_handle.hpp):
+/// every gpu::DeviceRegionPool allocates against (see MemoryKind in
+/// gpu/device_region_handle.hpp):
 ///
 ///  - dataResource(): Anchor-driven, promote/evict-eligible index/vector-
 ///    data memory (MemoryKind::Data).
 ///  - metadataResource(): a physically separate resource for state that
-///    needs CPU/GPU sync but must never be evicted the way Stitch data can
+///    needs CPU/GPU sync but must never be evicted the way Region data can
 ///    be (MemoryKind::Metadata).
 ///
 /// Both are constructed according to `policy` (see AllocationPolicy) from
@@ -68,11 +68,11 @@ enum class AllocationPolicy {
 ///
 /// One DeviceContext per physical GPU. Owned by Controller (see
 /// core/controller.hpp) -- Controller is already the class that owns every
-/// other piece of Arachne's own policy state (AnchorManager, OpScheduler),
+/// other piece of Arachne's own policy state (RegionManager, OpScheduler),
 /// and GPU residency accounting is exactly that kind of state, not a
 /// pluggable dependency like IndexAdapter/RoutingCache.
 ///
-/// Multi-GPU sharding is future work -- StitchPool's callers don't need to
+/// Multi-GPU sharding is future work -- DeviceRegionPool's callers don't need to
 /// change for it.
 class DeviceContext {
  public:
@@ -86,13 +86,28 @@ class DeviceContext {
 	int deviceId() const { return device_id_; }
 	AllocationPolicy allocationPolicy() const { return policy_; }
 
+	/// The self-imposed ceiling gpu::DeviceRegionPool::hasCapacity()/
+	/// tryAllocate() enforce for `kind` (data_pool_bytes/metadata_pool_bytes
+	/// as passed to the constructor, or the defaults above) -- this is
+	/// Arachne's own accounting of how much `kind` memory it is willing to
+	/// have resident at once, independent of whether the allocator backing
+	/// it physically pre-reserves that much (Pooled) or not (Naive, where
+	/// nothing stops the CUDA driver from granting more; Arachne caps itself
+	/// anyway so promotion/eviction decisions are deterministic and don't
+	/// depend on racing actual GPU memory pressure). Not a query against
+	/// live GPU state (see cudaMemGetInfo for that) -- purely the number
+	/// this DeviceContext was configured with.
+	std::size_t budgetBytes(MemoryKind kind) const {
+		return kind == MemoryKind::Metadata ? metadata_pool_bytes_ : data_pool_bytes_;
+	}
+
 	raft::device_resources& resources() { return resources_; }
 	const raft::device_resources& resources() const { return resources_; }
 
 	/// The raw cudaMalloc/cudaFree resource dataResource()/metadataResource()
 	/// are themselves built from (directly, under Naive; as a
 	/// pool_memory_resource's upstream, under Pooled). Not meant for
-	/// StitchPool to allocate against directly -- see MemoryKind's doc
+	/// DeviceRegionPool to allocate against directly -- see MemoryKind's doc
 	/// comment.
 	rmm::mr::cuda_memory_resource& memoryResource() { return memory_resource_; }
 
@@ -111,6 +126,8 @@ class DeviceContext {
 	// memory_resource_ (their upstream).
 	int device_id_;
 	AllocationPolicy policy_;
+	std::size_t data_pool_bytes_;
+	std::size_t metadata_pool_bytes_;
 	raft::device_resources resources_;
 	rmm::mr::cuda_memory_resource memory_resource_;
 	cuda::mr::any_resource<cuda::mr::device_accessible> data_resource_;

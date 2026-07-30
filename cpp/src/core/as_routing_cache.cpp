@@ -95,8 +95,8 @@ void ASRoutingCache::compactImpl() {
 
 	// Phase 2: build the shadow with no lock held at all -- the expensive
 	// part. Both readers and writers of active_ proceed fully concurrently.
-	// There is no per-id state left to preserve here (Stitches live in
-	// Core's AnchorManager) -- just (id, vector, max_distance) triples.
+	// There is no per-id state left to preserve here (Region dependencies
+	// live in Core's RegionManager) -- just (id, vector, max_distance) triples.
 	std::size_t shadow_capacity = std::max(snapshot.size() * 2, initial_capacity_);
 	std::unique_ptr<RefreshManager> shadow = makeRefreshManager(shadow_capacity);
 	std::unordered_set<VectorId> migrated;

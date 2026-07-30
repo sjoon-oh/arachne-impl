@@ -3,16 +3,21 @@ find_package(GTest CONFIG REQUIRED)
 set(ARACHNE_TEST_SOURCES
 	routing_cache_hnsw_test.cpp
 	routing_cache_hnsw_dtype_test.cpp
-	anchor_manager_test.cpp
+	region_manager_test.cpp
 	op_scheduler_policy_test.cpp
 	replacement_policy_test.cpp
+	gpu/dirty_header_test.cpp
 	util/distance_test.cpp
+	gpu/device_region_pool_test.cpp
+	controller_test.cpp
+	stress/stress_index.cpp
+	stress/stress_index_test.cpp
+	stress/stress_index_stage2_test.cpp
 )
-if(ARACHNE_USE_RAFT)
-	list(APPEND ARACHNE_TEST_SOURCES gpu/stitch_pool_test.cpp)
-endif()
 
 add_executable(arachne_tests ${ARACHNE_TEST_SOURCES})
+
+target_include_directories(arachne_tests PRIVATE stress)
 
 target_link_libraries(arachne_tests PRIVATE
 	arachne::core

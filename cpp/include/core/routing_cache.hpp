@@ -26,8 +26,8 @@ enum class DistanceMetric { L2, InnerProduct, Cosine };
 /// -- "is the incoming query vector close enough to a previously seen one
 /// (an Anchor, identified only by its VectorId) that routing to GPU is
 /// worthwhile?" -- and nothing else. It does not know what an Anchor id
-/// means beyond that: no Stitch/write-lease bookkeeping, no eviction
-/// policy. That all lives in Core's AnchorManager instead. RoutingCache
+/// means beyond that: no Region dependency/write-lease bookkeeping, no
+/// eviction policy. That all lives in Core's RegionManager instead. RoutingCache
 /// just needs very fast insert/erase, since Anchors churn constantly as
 /// queries stream in; ASRoutingCacheHnsw (hnswlib-backed) is the first
 /// concrete implementation, with Locality Sensitive Hashing remaining a

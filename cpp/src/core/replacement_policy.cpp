@@ -4,7 +4,7 @@
 
 namespace arachne {
 
-void FifoReplacementPolicy::onStitchAdded(VectorId anchor_id) {
+void FifoReplacementPolicy::onAnchorPromoted(VectorId anchor_id) {
 	std::lock_guard<std::mutex> lock(mutex_);
 	if (tracked_.insert(anchor_id).second) {
 		order_.push_back(anchor_id);
