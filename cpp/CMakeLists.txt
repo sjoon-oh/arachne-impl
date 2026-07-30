@@ -16,6 +16,19 @@ endif()
 
 option(ARACHNE_BUILD_TESTS "Build unit tests (requires GTest, see conda/arachne-blackwell.yml)" ON)
 
+# Fine-grained per-module/feature latency + lock-contention CSV tracing, for
+# paper-grade benchmark breakdown graphs (see include/telemetry/trace.hpp
+# and include/telemetry/instrumented_mutex.hpp). Off by default: every
+# ARACHNE_TRACE_SCOPE() call site compiles to nothing at all, and
+# RegionManager/OpScheduler keep their plain std::mutex + std::condition_variable
+# pairing, when this is OFF -- a normal build/test run carries zero trace
+# overhead. PUBLIC (not PRIVATE) below because whether a given header sees
+# ARACHNE_ENABLE_TRACING changes actual member types (e.g. RegionManager's
+# mutex_), not just internal .cpp behavior -- every consumer of arachne_core
+# (tests included) must agree with the library on this or the types mismatch
+# at link time.
+option(ARACHNE_ENABLE_TRACING "Enable fine-grained latency/lock-contention CSV tracing" OFF)
+
 # Resolve conda-provided dependencies (raft, ...) from the active env.
 if(DEFINED ENV{CONDA_PREFIX})
 	list(APPEND CMAKE_PREFIX_PATH $ENV{CONDA_PREFIX})
@@ -50,8 +63,16 @@ set(ARACHNE_CORE_SOURCES
 	src/gpu/device_region_pool.cpp
 )
 
+if(ARACHNE_ENABLE_TRACING)
+	list(APPEND ARACHNE_CORE_SOURCES src/telemetry/trace.cpp)
+endif()
+
 add_library(arachne_core ${ARACHNE_CORE_SOURCES})
 add_library(arachne::core ALIAS arachne_core)
+
+if(ARACHNE_ENABLE_TRACING)
+	target_compile_definitions(arachne_core PUBLIC ARACHNE_ENABLE_TRACING)
+endif()
 
 target_include_directories(arachne_core PUBLIC
 	$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>

@@ -91,7 +91,7 @@ class FakeRoutingCache : public RoutingCache {
  public:
 	FakeRoutingCache() : RoutingCache(/*dim=*/1, DistanceMetric::L2, VectorDType::Float32) {}
 
-	std::optional<VectorId> nearest(const VectorView&) override { return std::nullopt; }
+	std::optional<VectorId> nearestImpl(const VectorView&) override { return std::nullopt; }
 	VectorId ensure(VectorId id, const VectorView& vector, float) override {
 		ensured.push_back(id);
 		const auto* bytes = static_cast<const std::byte*>(vector.data);

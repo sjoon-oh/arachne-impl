@@ -22,7 +22,7 @@ ASRoutingCache::~ASRoutingCache() {
 	if (compaction_thread_.joinable()) compaction_thread_.join();
 }
 
-std::optional<VectorId> ASRoutingCache::nearest(const VectorView& query) {
+std::optional<VectorId> ASRoutingCache::nearestImpl(const VectorView& query) {
 	if (query.dtype != dtype_) {
 		throw std::invalid_argument("ASRoutingCache::nearest: VectorView::dtype does not match this cache's dtype");
 	}

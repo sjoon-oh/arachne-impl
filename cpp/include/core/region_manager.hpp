@@ -19,9 +19,30 @@
 #include "core/replacement_policy.hpp"
 #include "core/routing_cache.hpp"
 #include "gpu/device_region_pool.hpp"
+#include "telemetry/instrumented_mutex.hpp"
 #include "types.hpp"
 
 namespace arachne {
+
+// mutex_'s type, switched by the same ARACHNE_ENABLE_TRACING build option
+// that gates every ARACHNE_TRACE_SCOPE() call (see telemetry/trace.hpp) --
+// when on, records lock_/idle_cv_ wait time into "RegionManager-lockwait.csv"
+// (see telemetry/instrumented_mutex.hpp's own doc comment); when off, this
+// is exactly std::mutex, zero overhead. std::condition_variable::wait()
+// only accepts std::unique_lock<std::mutex> specifically (it isn't a
+// template over the lock type), so coordinator_cv_/idle_cv_ must switch to
+// std::condition_variable_any -- which accepts any BasicLockable type --
+// whenever mutex_ isn't literally std::mutex.
+#ifdef ARACHNE_ENABLE_TRACING
+class RegionManagerMutex : public telemetry::InstrumentedMutex {
+ public:
+	RegionManagerMutex() : InstrumentedMutex("RegionManager") {}
+};
+using RegionManagerCondVar = std::condition_variable_any;
+#else
+using RegionManagerMutex = std::mutex;
+using RegionManagerCondVar = std::condition_variable;
+#endif
 
 /// The single physical-mapping record for one RegionId: where its data
 /// lives in host memory (`host`, reported by the adapter via
@@ -376,7 +397,7 @@ class RegionManager {
 	// an explicit waitIdle()/shutdown() call does.
 	void coordinatorLoop();
 
-	mutable std::mutex mutex_;
+	mutable RegionManagerMutex mutex_;
 	std::unordered_map<RegionId, Region> regions_;
 	std::unordered_map<RegionId, std::unordered_set<VectorId>> dependents_;
 	std::unordered_map<VectorId, std::unordered_set<RegionId>> dependencies_;
@@ -403,8 +424,8 @@ class RegionManager {
 	CoordinatorConfig coordinator_config_;
 
 	std::thread coordinator_;
-	std::condition_variable coordinator_cv_;  // the Coordinator's own wake signal
-	std::condition_variable idle_cv_;         // what waitIdle() blocks on
+	RegionManagerCondVar coordinator_cv_;  // the Coordinator's own wake signal
+	RegionManagerCondVar idle_cv_;         // what waitIdle() blocks on
 	bool coordinator_running_ = false;
 	bool coordinator_stop_requested_ = false;
 	bool coordinator_force_wake_ = false;  // set by waitIdle()/shutdown() to skip the trigger_interval wait

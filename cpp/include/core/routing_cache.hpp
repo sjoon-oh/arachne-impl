@@ -1,5 +1,7 @@
 #pragma once
 
+#include <atomic>
+#include <cstdint>
 #include <optional>
 
 #include "types.hpp"
@@ -58,8 +60,21 @@ class RoutingCache {
 
 	/// The id of the registered entry nearest to `query`, or nullopt if the
 	/// cache is empty or the closest candidate's own max_distance (set when
-	/// it was registered via ensure()) doesn't cover `query`.
-	virtual std::optional<VectorId> nearest(const VectorView& query) = 0;
+	/// it was registered via ensure()) doesn't cover `query`. Not itself
+	/// virtual -- see nearestImpl() below for the hook a concrete
+	/// implementation actually overrides; this wrapper's only job is
+	/// recording the hit/miss (see stats()) uniformly across every
+	/// implementation, current or future, so a concrete RoutingCache never
+	/// has to remember to do that bookkeeping itself.
+	std::optional<VectorId> nearest(const VectorView& query) {
+		std::optional<VectorId> result = nearestImpl(query);
+		if (result.has_value()) {
+			hits_.fetch_add(1, std::memory_order_relaxed);
+		} else {
+			misses_.fetch_add(1, std::memory_order_relaxed);
+		}
+		return result;
+	}
 
 	/// Returns the id of the entry for `vector` -- either the existing one
 	/// found via the same per-anchor "close enough" test as nearest(), or a
@@ -69,10 +84,34 @@ class RoutingCache {
 
 	virtual void erase(VectorId id) = 0;
 
+	/// Cumulative nearest() outcomes since construction -- hits (a candidate
+	/// within its own registered radius was found) vs. misses (cache empty,
+	/// or the closest candidate's radius didn't cover the query), the
+	/// Anchor-routing-cache-specific counterpart to ControllerStats/
+	/// RegionManager::Stats. Independent atomics (relaxed ordering): each is
+	/// a running total nothing else needs to observe atomically alongside.
+	struct Stats {
+		std::uint64_t hits = 0;
+		std::uint64_t misses = 0;
+	};
+	Stats stats() const {
+		return Stats{hits_.load(std::memory_order_relaxed), misses_.load(std::memory_order_relaxed)};
+	}
+
  protected:
+	/// The actual per-implementation lookup -- same contract nearest() above
+	/// documents (nullopt means "no candidate within its own registered
+	/// max_distance"). Protected, not public: callers always go through
+	/// nearest() so hit/miss accounting can never be bypassed.
+	virtual std::optional<VectorId> nearestImpl(const VectorView& query) = 0;
+
 	std::uint32_t dim_;
 	DistanceMetric metric_;
 	VectorDType dtype_;
+
+ private:
+	std::atomic<std::uint64_t> hits_{0};
+	std::atomic<std::uint64_t> misses_{0};
 };
 
 }  // namespace arachne

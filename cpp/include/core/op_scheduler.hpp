@@ -12,8 +12,24 @@
 
 #include "adapter/index_adapter.hpp"
 #include "core/scheduling_policy.hpp"
+#include "telemetry/instrumented_mutex.hpp"
 
 namespace arachne {
+
+// See core/region_manager.hpp's own RegionManagerMutex/RegionManagerCondVar
+// for the full rationale -- same pairing here, just scoped to OpScheduler's
+// own mutex_/cv_incoming_/cv_dispatch_ instead ("OpScheduler-lockwait.csv"
+// when ARACHNE_ENABLE_TRACING is on).
+#ifdef ARACHNE_ENABLE_TRACING
+class OpSchedulerMutex : public telemetry::InstrumentedMutex {
+ public:
+	OpSchedulerMutex() : InstrumentedMutex("OpScheduler") {}
+};
+using OpSchedulerCondVar = std::condition_variable_any;
+#else
+using OpSchedulerMutex = std::mutex;
+using OpSchedulerCondVar = std::condition_variable;
+#endif
 
 /// External tuning knobs for Arachne's operation scheduling/batching layer.
 /// This layer intentionally stays index-agnostic: it only sees
@@ -96,7 +112,7 @@ private:
 	ScheduledKind kindOf(const ScheduledOperation& op) const;
 	std::size_t targetBatchSizeFor(ScheduledKind kind) const;
 	void collectBatch(ScheduledOperationBatch& batch, ScheduledKind batch_kind,
-									 std::size_t batch_target, std::unique_lock<std::mutex>& lock);
+									 std::size_t batch_target, std::unique_lock<OpSchedulerMutex>& lock);
 	// Dispatches a whole (kind- and mode-homogeneous, see SchedulingPolicy::
 	// canAppendToBatch()) batch to exactly one of IAdapter's
 	// traverseHost()/traverseDevice() or modifyHost()/modifyDevice() in one
@@ -130,9 +146,9 @@ private:
 	std::function<void(std::size_t)> on_worker_start_;
 
 	// Lifecycle / threading
-	mutable std::mutex mutex_;
-	std::condition_variable cv_incoming_;
-	std::condition_variable cv_dispatch_;
+	mutable OpSchedulerMutex mutex_;
+	OpSchedulerCondVar cv_incoming_;
+	OpSchedulerCondVar cv_dispatch_;
 	bool running_ = false;
 	bool stop_requested_ = false;
 	std::thread planner_;

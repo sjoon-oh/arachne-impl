@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "logging.hpp"
+#include "telemetry/trace.hpp"
 
 namespace arachne {
 
@@ -48,6 +49,7 @@ Controller::Controller(IAdapter& adapter, RoutingCache& routing_cache, Schedulin
 }
 
 SearchResult Controller::search(const Query& query) {
+	ARACHNE_TRACE_SCOPE("Controller", "search");
 	SearchPlan plan = routeSearch(query);
 	// An Anchor is only worth minting/registering when this query actually
 	// needs a Hybrid (host-driven) traversal -- a GpuOnly hit means existing
@@ -69,6 +71,7 @@ SearchResult Controller::search(const Query& query) {
 }
 
 InsertResult Controller::insert(const Record& record) {
+	ARACHNE_TRACE_SCOPE("Controller", "insert");
 	// Claim record.id before doing anything else -- see insert()'s doc
 	// comment (controller.hpp). The insert-into-set-and-check-result-atomically
 	// pattern here is what makes two concurrent insert() calls for the same
@@ -125,6 +128,7 @@ InsertResult Controller::insert(const Record& record) {
 }
 
 DeleteResult Controller::remove(VectorId id) {
+	ARACHNE_TRACE_SCOPE("Controller", "remove");
 	RemovePlan plan = routeRemove(id);
 	ModifyResult result = dispatch(plan.request);
 	DeleteResult final_result = commitRemove(plan, result);
@@ -189,6 +193,7 @@ Controller::RemovePlan Controller::routeRemove(VectorId id) {
 }
 
 TraverseResult Controller::dispatch(const TraverseRequest& request, VectorId promotion_anchor_id) {
+	ARACHNE_TRACE_SCOPE("Controller", "dispatchTraverse");
 	// The one entry point search() and insert()'s own placement lookup both
 	// go through. recordTraversal()/requestPromotion() run inside the
 	// on_complete closure -- on the OpScheduler execution worker thread that
@@ -211,18 +216,24 @@ TraverseResult Controller::dispatch(const TraverseRequest& request, VectorId pro
 }
 
 ModifyResult Controller::dispatch(const ModifyRequest& request) {
+	ARACHNE_TRACE_SCOPE("Controller", "dispatchModify");
 	return scheduler_.schedule(request).get();
 }
 
 SearchResult Controller::commitSearch(const TraverseResult& result, bool final_was_hybrid) {
+	ARACHNE_TRACE_SCOPE("Controller", "commitSearch");
 	SearchResult output = result.result;
 	output.served_gpu_only = !final_was_hybrid;
 	return output;
 }
 
-InsertResult Controller::commitInsert(const ModifyResult& result) { return InsertResult{result.ok}; }
+InsertResult Controller::commitInsert(const ModifyResult& result) {
+	ARACHNE_TRACE_SCOPE("Controller", "commitInsert");
+	return InsertResult{result.ok};
+}
 
 DeleteResult Controller::commitRemove(const RemovePlan& plan, const ModifyResult& result) {
+	ARACHNE_TRACE_SCOPE("Controller", "commitRemove");
 	if (result.ok) {
 		// Mirror image of insert()'s promotion request: a deleted anchor's
 		// Region dependencies (if it ever had any -- releaseAnchor() is a
@@ -239,6 +250,7 @@ DeleteResult Controller::commitRemove(const RemovePlan& plan, const ModifyResult
 }
 
 Controller::RoutingDecision Controller::route(const Query& query) {
+	ARACHNE_TRACE_SCOPE("Controller", "route");
 	RoutingDecision decision;
 	if (std::optional<VectorId> anchor_id = routing_cache_.nearest(query.vector)) {
 		// Copied out of region_manager_ rather than referenced: it's guarded by

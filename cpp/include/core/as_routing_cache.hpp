@@ -102,7 +102,6 @@ class ASRoutingCache : public RoutingCache {
 
 	~ASRoutingCache() override;
 
-	std::optional<VectorId> nearest(const VectorView& query) override;
 	VectorId ensure(VectorId id, const VectorView& vector, float max_distance) override;
 	void erase(VectorId id) override;
 
@@ -148,6 +147,8 @@ class ASRoutingCache : public RoutingCache {
 	virtual std::unique_ptr<RefreshManager> makeRefreshManager(std::size_t capacity) const = 0;
 
  private:
+	std::optional<VectorId> nearestImpl(const VectorView& query) override;
+
 	/// Launches compactImpl() on a background thread if one isn't already
 	/// running. Reaps (joins) the previous compaction thread first; by the
 	/// time a new one is triggered, the old one has necessarily already

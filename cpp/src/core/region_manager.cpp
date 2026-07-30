@@ -5,6 +5,7 @@
 
 #include "gpu/dirty_header.hpp"
 #include "logging.hpp"
+#include "telemetry/trace.hpp"
 
 namespace arachne {
 
@@ -27,7 +28,7 @@ RegionManager::RegionManager(std::unique_ptr<ReplacementPolicy> replacement_poli
 RegionManager::~RegionManager() { shutdown(); }
 
 void RegionManager::registerRegion(RegionId id, HostRegionView host) {
-	std::lock_guard<std::mutex> lock(mutex_);
+	std::lock_guard<RegionManagerMutex> lock(mutex_);
 	if (regions_.find(id) != regions_.end()) return;
 
 	Region region;
@@ -37,12 +38,12 @@ void RegionManager::registerRegion(RegionId id, HostRegionView host) {
 }
 
 bool RegionManager::isRegistered(RegionId id) const {
-	std::lock_guard<std::mutex> lock(mutex_);
+	std::lock_guard<RegionManagerMutex> lock(mutex_);
 	return regions_.find(id) != regions_.end();
 }
 
 Region RegionManager::regionOf(RegionId id) const {
-	std::lock_guard<std::mutex> lock(mutex_);
+	std::lock_guard<RegionManagerMutex> lock(mutex_);
 	auto it = regions_.find(id);
 	if (it == regions_.end()) {
 		throw std::invalid_argument("RegionManager: region is not registered");
@@ -51,14 +52,14 @@ Region RegionManager::regionOf(RegionId id) const {
 }
 
 std::vector<RegionId> RegionManager::regionsOf(VectorId anchor_id) const {
-	std::lock_guard<std::mutex> lock(mutex_);
+	std::lock_guard<RegionManagerMutex> lock(mutex_);
 	auto it = dependencies_.find(anchor_id);
 	if (it == dependencies_.end()) return {};
 	return std::vector<RegionId>(it->second.begin(), it->second.end());
 }
 
 bool RegionManager::addDependency(VectorId anchor_id, RegionId region_id) {
-	std::lock_guard<std::mutex> lock(mutex_);
+	std::lock_guard<RegionManagerMutex> lock(mutex_);
 	if (regions_.find(region_id) == regions_.end()) return false;
 
 	dependents_[region_id].insert(anchor_id);
@@ -67,7 +68,7 @@ bool RegionManager::addDependency(VectorId anchor_id, RegionId region_id) {
 }
 
 bool RegionManager::removeDependency(VectorId anchor_id, RegionId region_id) {
-	std::lock_guard<std::mutex> lock(mutex_);
+	std::lock_guard<RegionManagerMutex> lock(mutex_);
 	auto dep_it = dependencies_.find(anchor_id);
 	if (dep_it == dependencies_.end() || dep_it->second.erase(region_id) == 0) return false;
 	if (dep_it->second.empty()) dependencies_.erase(dep_it);
@@ -83,7 +84,7 @@ bool RegionManager::removeDependency(VectorId anchor_id, RegionId region_id) {
 }
 
 std::vector<RegionId> RegionManager::forget(VectorId anchor_id) {
-	std::lock_guard<std::mutex> lock(mutex_);
+	std::lock_guard<RegionManagerMutex> lock(mutex_);
 	auto dep_it = dependencies_.find(anchor_id);
 	if (dep_it == dependencies_.end()) return {};
 
@@ -103,19 +104,19 @@ std::vector<RegionId> RegionManager::forget(VectorId anchor_id) {
 }
 
 void RegionManager::setLease(RegionId id, LeaseHandle lease) {
-	std::lock_guard<std::mutex> lock(mutex_);
+	std::lock_guard<RegionManagerMutex> lock(mutex_);
 	auto it = regions_.find(id);
 	if (it != regions_.end()) it->second.lease = lease;
 }
 
 void RegionManager::setDevice(RegionId id, gpu::DeviceRegionHandle device) {
-	std::lock_guard<std::mutex> lock(mutex_);
+	std::lock_guard<RegionManagerMutex> lock(mutex_);
 	auto it = regions_.find(id);
 	if (it != regions_.end()) it->second.device = device;
 }
 
 void RegionManager::clearResidency(RegionId id) {
-	std::lock_guard<std::mutex> lock(mutex_);
+	std::lock_guard<RegionManagerMutex> lock(mutex_);
 	auto it = regions_.find(id);
 	if (it == regions_.end()) return;
 
@@ -129,7 +130,7 @@ void RegionManager::clearResidency(RegionId id) {
 
 void RegionManager::start(IAdapter& adapter, gpu::DeviceRegionPool& device_region_pool, RoutingCache& routing_cache,
 													 CoordinatorConfig config) {
-	std::lock_guard<std::mutex> lock(mutex_);
+	std::lock_guard<RegionManagerMutex> lock(mutex_);
 	if (coordinator_running_) {
 		throw std::logic_error("RegionManager coordinator already started");
 	}
@@ -144,7 +145,7 @@ void RegionManager::start(IAdapter& adapter, gpu::DeviceRegionPool& device_regio
 
 void RegionManager::shutdown() {
 	{
-		std::lock_guard<std::mutex> lock(mutex_);
+		std::lock_guard<RegionManagerMutex> lock(mutex_);
 		if (!coordinator_running_) return;
 		coordinator_stop_requested_ = true;
 		coordinator_force_wake_ = true;
@@ -153,7 +154,7 @@ void RegionManager::shutdown() {
 
 	if (coordinator_.joinable()) coordinator_.join();
 
-	std::lock_guard<std::mutex> lock(mutex_);
+	std::lock_guard<RegionManagerMutex> lock(mutex_);
 	coordinator_running_ = false;
 	coordinator_stop_requested_ = false;
 	adapter_ = nullptr;
@@ -167,6 +168,7 @@ std::uint64_t RegionManager::currentEpochLocked(VectorId anchor_id) const {
 }
 
 void RegionManager::requestPromotion(VectorId anchor_id, RegionFootprint footprint, VectorView vector) {
+	ARACHNE_TRACE_SCOPE("RegionManager", "requestPromotion");
 	// A pure enqueue onto RegionManager's own MPSC intake queue -- no
 	// replacement_policy_ interaction here at all. Only the Coordinator
 	// thread (the queue's single consumer) ever hands candidates to the
@@ -182,12 +184,13 @@ void RegionManager::requestPromotion(VectorId anchor_id, RegionFootprint footpri
 		candidate.vector_bytes.assign(bytes, bytes + static_cast<std::size_t>(vector.dim) * VectorElementSize(vector.dtype));
 	}
 
-	std::lock_guard<std::mutex> lock(mutex_);
+	std::lock_guard<RegionManagerMutex> lock(mutex_);
 	candidate.epoch = currentEpochLocked(anchor_id);
 	pending_promotions_.push_back(std::move(candidate));
 }
 
 void RegionManager::releaseAnchor(VectorId anchor_id) {
+	ARACHNE_TRACE_SCOPE("RegionManager", "releaseAnchor");
 	// Immediate: dependency-graph bookkeeping, write-lease release, and
 	// clearResidency() all happen synchronously here -- so a Region orphaned
 	// by `anchor_id` is instantly eligible to be re-promoted fresh for a
@@ -210,7 +213,7 @@ void RegionManager::releaseAnchor(VectorId anchor_id) {
 	// storage, enqueued before this call, now carries a stale epoch and will
 	// be discarded by processPromotions() rather than acted on.
 	{
-		std::lock_guard<std::mutex> lock(mutex_);
+		std::lock_guard<RegionManagerMutex> lock(mutex_);
 		++anchor_epoch_[anchor_id];
 	}
 	if (routing_cache_ != nullptr) routing_cache_->erase(anchor_id);
@@ -230,14 +233,15 @@ void RegionManager::releaseAnchor(VectorId anchor_id) {
 
 	stat_anchor_evictions_.fetch_add(1, std::memory_order_relaxed);
 
-	std::lock_guard<std::mutex> lock(mutex_);
+	std::lock_guard<RegionManagerMutex> lock(mutex_);
 	for (Region& region : snapshots) pending_reclaims_.push_back(std::move(region));
 }
 
 void RegionManager::recordTraversal(const RegionFootprint& touched) {
+	ARACHNE_TRACE_SCOPE("RegionManager", "recordTraversal");
 	std::unordered_set<VectorId> anchors;
 	{
-		std::lock_guard<std::mutex> lock(mutex_);
+		std::lock_guard<RegionManagerMutex> lock(mutex_);
 		for (RegionId region_id : touched.regions) {
 			auto it = dependents_.find(region_id);
 			if (it == dependents_.end()) continue;  // unregistered, or currently orphaned
@@ -248,7 +252,7 @@ void RegionManager::recordTraversal(const RegionFootprint& touched) {
 }
 
 void RegionManager::waitIdle() {
-	std::unique_lock<std::mutex> lock(mutex_);
+	std::unique_lock<RegionManagerMutex> lock(mutex_);
 	coordinator_force_wake_ = true;
 	lock.unlock();
 	coordinator_cv_.notify_all();
@@ -275,14 +279,14 @@ RegionManager::Stats RegionManager::stats() const {
 	result.regions_written_back_total = stat_regions_written_back_.load(std::memory_order_relaxed);
 	result.anchor_evictions_total = stat_anchor_evictions_.load(std::memory_order_relaxed);
 	result.compactions_total = stat_compactions_total_.load(std::memory_order_relaxed);
-	std::lock_guard<std::mutex> lock(mutex_);
+	std::lock_guard<RegionManagerMutex> lock(mutex_);
 	if (device_region_pool_ != nullptr) result.gpu_bytes_allocated = device_region_pool_->bytesAllocated();
 	return result;
 }
 
 void RegionManager::coordinatorLoop() {
 	while (true) {
-		std::unique_lock<std::mutex> lock(mutex_);
+		std::unique_lock<RegionManagerMutex> lock(mutex_);
 		coordinator_cv_.wait_for(lock, coordinator_config_.trigger_interval,
 															[this] { return coordinator_stop_requested_ || coordinator_force_wake_; });
 		bool forced = coordinator_force_wake_;
@@ -373,6 +377,7 @@ std::optional<gpu::DeviceRegionHandle> RegionManager::allocateWithCompaction(
 RegionManager::MakeResult RegionManager::make(VectorId anchor_id, RegionId region,
 																							 std::vector<gpu::DeviceRegionPool::Lease>& pending,
 																							 std::vector<std::vector<std::byte>>& zero_headers) {
+	ARACHNE_TRACE_SCOPE("RegionManager", "make");
 	for (RegionId existing : regionsOf(anchor_id)) {
 		if (existing == region) return MakeResult::Promoted;  // already a dependent
 	}
@@ -425,12 +430,13 @@ RegionManager::MakeResult RegionManager::make(VectorId anchor_id, RegionId regio
 }
 
 void RegionManager::processPromotions() {
+	ARACHNE_TRACE_SCOPE("RegionManager", "processPromotions");
 	std::vector<gpu::DeviceRegionPool::Lease> pending;
 	std::vector<std::vector<std::byte>> zero_headers;
 
 	while (std::optional<PromotionCandidate> candidate = replacement_policy_->selectNextPromotionCandidate()) {
 		{
-			std::lock_guard<std::mutex> lock(mutex_);
+			std::lock_guard<RegionManagerMutex> lock(mutex_);
 			if (currentEpochLocked(candidate->anchor_id) != candidate->epoch) {
 				ARACHNE_LOG_DEBUG("processPromotions: anchor {} epoch stale, discarding candidate", candidate->anchor_id);
 				continue;
@@ -506,6 +512,7 @@ void RegionManager::processPromotions() {
 }
 
 void RegionManager::evictAnchorNow(VectorId anchor_id) {
+	ARACHNE_TRACE_SCOPE("RegionManager", "evictAnchorNow");
 	std::vector<RegionId> orphaned = forget(anchor_id);
 	replacement_policy_->onAnchorEvicted(anchor_id);
 	if (routing_cache_ != nullptr) routing_cache_->erase(anchor_id);
@@ -531,6 +538,7 @@ void RegionManager::evictAnchorNow(VectorId anchor_id) {
 }
 
 void RegionManager::reclaimRegions(const std::vector<Region>& snapshots) {
+	ARACHNE_TRACE_SCOPE("RegionManager", "reclaimRegions");
 	std::vector<Region> resident;
 	for (const Region& region : snapshots) {
 		if (region.device.valid()) resident.push_back(region);
@@ -554,6 +562,7 @@ bool AnyDirtyWordSet(const std::vector<std::byte>& header) {
 }  // namespace
 
 void RegionManager::writeBackDirtyRegions(const std::vector<Region>& regions) {
+	ARACHNE_TRACE_SCOPE("RegionManager", "writeBackDirtyRegions");
 	const std::size_t n = regions.size();
 	std::vector<std::size_t> header_bytes(n);
 	std::vector<std::vector<std::byte>> header_buffers(n);

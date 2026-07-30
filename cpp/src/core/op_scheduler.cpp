@@ -3,6 +3,8 @@
 #include <stdexcept>
 #include <utility>
 
+#include "telemetry/trace.hpp"
+
 namespace arachne {
 
 OpScheduler::OpScheduler(SchedulingConfig config, std::unique_ptr<SchedulingPolicy> policy)
@@ -195,7 +197,7 @@ std::size_t OpScheduler::targetBatchSizeFor(ScheduledKind kind) const {
 
 void OpScheduler::collectBatch(ScheduledOperationBatch& batch, ScheduledKind batch_kind,
 															std::size_t batch_target,
-															std::unique_lock<std::mutex>& lock) {
+															std::unique_lock<OpSchedulerMutex>& lock) {
 	while (batch.size() < batch_target) {
 		if (queue_.empty()) {
 			if (batch.empty() || batch_wait_timeout_.count() == 0) {
@@ -235,6 +237,7 @@ void OpScheduler::executeBatch(ScheduledOperationBatch batch) {
 }
 
 void OpScheduler::executeTraverseBatch(ScheduledOperationBatch batch) {
+	ARACHNE_TRACE_SCOPE("OpScheduler", "executeTraverseBatch");
 	std::vector<TraverseRequest> requests;
 	requests.reserve(batch.size());
 	for (auto& op : batch) requests.push_back(std::get<TraverseTask>(op).request);
@@ -271,6 +274,7 @@ void OpScheduler::executeTraverseBatch(ScheduledOperationBatch batch) {
 }
 
 void OpScheduler::executeModifyBatch(ScheduledOperationBatch batch) {
+	ARACHNE_TRACE_SCOPE("OpScheduler", "executeModifyBatch");
 	std::vector<ModifyRequest> requests;
 	requests.reserve(batch.size());
 	for (auto& op : batch) requests.push_back(std::get<ModifyTask>(op).request);

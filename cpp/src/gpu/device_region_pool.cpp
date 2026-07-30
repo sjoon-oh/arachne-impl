@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "logging.hpp"
+#include "telemetry/trace.hpp"
 
 namespace arachne::gpu {
 
@@ -151,6 +152,7 @@ bool DeviceRegionPool::hasCapacity(std::size_t bytes, MemoryKind kind) const {
 }
 
 std::optional<DeviceRegionHandle> DeviceRegionPool::tryAllocate(std::size_t bytes, MemoryKind kind) {
+	ARACHNE_TRACE_SCOPE("DeviceRegionPool", "tryAllocate");
 	if (!hasCapacity(bytes, kind)) {
 		ARACHNE_LOG_DEBUG("DeviceRegionPool::tryAllocate: {} bytes of kind {} would exceed budget ({} already allocated)",
 											 bytes, static_cast<int>(kind), bytesAllocated(kind));
@@ -166,6 +168,7 @@ std::optional<DeviceRegionHandle> DeviceRegionPool::tryAllocate(std::size_t byte
 }
 
 DeviceRegionPool::Lease DeviceRegionPool::acquire(DeviceRegionHandle handle, cudaStream_t stream) {
+	ARACHNE_TRACE_SCOPE("DeviceRegionPool", "acquire");
 	std::lock_guard<std::mutex> lock(mutex_);
 	auto it = allocations_.find(handle.id);
 	if (it == allocations_.end()) {
@@ -208,6 +211,7 @@ DeviceRegionPool::Lease DeviceRegionPool::acquire(DeviceRegionHandle handle) {
 }
 
 void DeviceRegionPool::free(DeviceRegionHandle handle) {
+	ARACHNE_TRACE_SCOPE("DeviceRegionPool", "free");
 	Allocation allocation;
 	{
 		std::unique_lock<std::mutex> lock(mutex_);
@@ -270,7 +274,10 @@ void DeviceRegionPool::enqueueCopyToHost(DeviceRegionHandle handle, void* host_d
 	pending.push_back(std::move(lease));
 }
 
-void DeviceRegionPool::flush() { device_.resources().sync_stream(); }
+void DeviceRegionPool::flush() {
+	ARACHNE_TRACE_SCOPE("DeviceRegionPool", "flush");
+	device_.resources().sync_stream();
+}
 
 std::size_t DeviceRegionPool::bytesAllocated() const {
 	std::lock_guard<std::mutex> lock(mutex_);
@@ -289,6 +296,7 @@ std::size_t DeviceRegionPool::bytesAllocated(MemoryKind kind) const {
 }
 
 DeviceRegionPool::CompactionResult DeviceRegionPool::compact(MemoryKind kind) {
+	ARACHNE_TRACE_SCOPE("DeviceRegionPool", "compact");
 	if (device_.allocationPolicy() == AllocationPolicy::Naive) {
 		// No shared arena under Naive -- see the declaration's doc comment.
 		return {};

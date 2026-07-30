@@ -98,7 +98,7 @@ class FakeRoutingCache : public RoutingCache {
 	// Always "no match": keeps every query/insert lookup on the Hybrid path,
 	// which is all these tests need -- they exercise promoteAnchor()'s
 	// capacity/eviction logic via commitInsert(), not query routing itself.
-	std::optional<VectorId> nearest(const VectorView&) override { return std::nullopt; }
+	std::optional<VectorId> nearestImpl(const VectorView&) override { return std::nullopt; }
 	VectorId ensure(VectorId id, const VectorView&, float) override { return id; }
 	void erase(VectorId) override {}
 };
