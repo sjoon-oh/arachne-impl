@@ -128,9 +128,24 @@ TEST_P(StressIndexStage1Test, InsertThenSearchMatchesBruteForceGroundTruth) {
 		}
 	}
 
+	// Promotion/eviction is now lazy (RegionManager's Coordinator) -- wait for
+	// it to fully catch up before asserting on stats(), rather than relying
+	// on however much of it happened to land during the insert/search/delete
+	// loops above.
+	controller.waitIdle();
 	ControllerStats stats = controller.stats();
 	EXPECT_GT(stats.regions_promoted_total, 0u);
-	EXPECT_EQ(stats.regions_evicted_total, 0u);  // budget was sized to avoid eviction in this stage
+	// The budget comfortably fits every registered Region, so *capacity*-
+	// driven eviction (RegionManager::evictAnchorNow(), via
+	// processPromotions()'s OutOfCapacity retry loop) should never fire here.
+	// regions_evicted_total can still be nonzero though: it also counts a
+	// Region freed because one of the kNumDeletes ids above happened to be
+	// its sole remaining dependent at the moment it was deleted (see
+	// RegionManager::releaseAnchor()) -- a legitimate, timing-dependent
+	// consequence of deleting an early-inserted (and therefore often
+	// sparsely-shared) Anchor, not eviction under pressure. Bounded by
+	// kNumDeletes since at most one Region can be orphaned per delete.
+	EXPECT_LE(stats.regions_evicted_total, kNumDeletes);
 }
 
 INSTANTIATE_TEST_SUITE_P(AllDTypes, StressIndexStage1Test,

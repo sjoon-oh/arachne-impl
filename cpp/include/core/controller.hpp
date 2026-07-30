@@ -14,7 +14,6 @@
 #include "core/routing_cache.hpp"
 #include "gpu/device_context.hpp"
 #include "gpu/device_region_pool.hpp"
-#include "gpu/dirty_header.hpp"
 
 namespace arachne {
 
@@ -42,57 +41,62 @@ struct RegionAccess {
 	std::optional<gpu::DeviceRegionPool::Lease> device_lease;  // engaged iff on_device
 };
 
-/// Snapshot of Controller::stats(): structured, queryable state -- the
-/// counterpart to the ARACHNE_LOG_DEBUG lines already threaded through
-/// make()/evictAnchor()/writeBackDirtyRegions(), for callers (tests,
-/// operators) that need to assert or graph on Arachne's internal state
-/// rather than scrape log text. `gpu_bytes_allocated` is a live read
-/// (delegates to gpu::DeviceRegionPool::bytesAllocated()); the four `_total`
-/// fields are monotonically increasing counters for the Controller's whole
-/// lifetime, not point-in-time state -- e.g. `regions_evicted_total` counts every Region
-/// ever reclaimed, not how many are currently evicted (there's no such
-/// thing as "currently evicted": an evicted Region is just back to
-/// host-only, indistinguishable from one never promoted).
+/// Snapshot of Controller::stats(): structured, queryable state -- a thin
+/// copy of RegionManager::Stats (see its own doc comment), which is where
+/// GPU residency management -- and its counters -- actually live now.
+/// Kept as Controller's own type for API stability. `gpu_bytes_allocated`
+/// is a live read (delegates to gpu::DeviceRegionPool::bytesAllocated());
+/// the four `_total` fields are monotonically increasing counters for the
+/// Controller's whole lifetime, not point-in-time state -- e.g.
+/// `regions_evicted_total` counts every Region ever reclaimed, not how many
+/// are currently evicted (there's no such thing as "currently evicted": an
+/// evicted Region is just back to host-only, indistinguishable from one
+/// never promoted).
 struct ControllerStats {
 	std::size_t gpu_bytes_allocated = 0;
-	std::uint64_t regions_promoted_total = 0;       // make() calls that newly acquired a lease
-	std::uint64_t regions_evicted_total = 0;        // Regions reclaimed via evictAnchor() (any anchor)
+	std::uint64_t regions_promoted_total = 0;       // RegionManager::make() calls that newly acquired a lease
+	std::uint64_t regions_evicted_total = 0;        // Regions reclaimed via RegionManager (any anchor)
 	std::uint64_t regions_written_back_total = 0;   // of those, how many actually had data copied back
-	std::uint64_t anchor_evictions_total = 0;       // evictAnchor() calls that reclaimed >=1 Region
-	std::uint64_t compactions_total = 0;            // make() falling back to gpu::DeviceRegionPool::compact()
+	std::uint64_t anchor_evictions_total = 0;       // anchor releases that reclaimed >=1 Region
+	std::uint64_t compactions_total = 0;            // RegionManager falling back to gpu::DeviceRegionPool::compact()
 };
 
 /// Arachne's core management controller: the index-agnostic control plane that
-/// decides where SEARCH/INSERT/DELETE run and how GPU residency/write
-/// authority is managed, per the Quick Summary. This is the class meant to
-/// carry Arachne's actual design as it gets built out; everything here is
-/// implemented against IndexAdapter/IRegion and RoutingCache only, never
-/// against a concrete index or a concrete Anchor storage structure.
+/// decides where SEARCH/INSERT/DELETE run, per the Quick Summary. This is
+/// the class meant to carry Arachne's actual design as it gets built out;
+/// everything here is implemented against IAdapter/IRegion and RoutingCache
+/// only, never against a concrete index or a concrete Anchor storage
+/// structure.
 ///
 /// Splits "is this query close to something we've seen" (RoutingCache,
 /// injected -- pure identity/routing signal, pluggable) from "which Regions
 /// has that Anchor promoted, and what does each Region's own
-/// host/device/lease state look like" (RegionManager, owned directly --
-/// Controller's own policy-state, not pluggable). Controller is the only
-/// thing that talks to both.
+/// host/device/lease state look like, and when does GPU residency actually
+/// change" (RegionManager, owned directly -- see its own doc comment for why
+/// it now owns the whole GPU-residency policy, not just bookkeeping).
+/// Controller routes and schedules; RegionManager's own Coordinator decides
+/// and performs promotion/eviction. Controller is the only thing that talks
+/// to both RoutingCache and RegionManager.
 class Controller {
  public:
-	// `replacement_policy` defaults to FifoReplacementPolicy when left null,
-	// mirroring OpScheduler's own SchedulingPolicy default (see
-	// core/op_scheduler.hpp) -- see ReplacementPolicy's doc comment.
-	// `gpu_data_budget_bytes`/`gpu_metadata_budget_bytes` become the
-	// DeviceContext this Controller owns' budgetBytes() for each MemoryKind
-	// -- the ceiling make()'s gpu::DeviceRegionPool::tryAllocate() calls
+	// `replacement_policy` is forwarded to region_manager_ (which owns it --
+	// see RegionManager's own doc comment), defaulting to
+	// FifoReplacementPolicy when left null, mirroring OpScheduler's own
+	// SchedulingPolicy default. `gpu_data_budget_bytes`/
+	// `gpu_metadata_budget_bytes` become the DeviceContext this Controller
+	// owns' budgetBytes() for each MemoryKind -- the ceiling
+	// RegionManager::make()'s gpu::DeviceRegionPool::tryAllocate() calls
 	// enforce (see its own doc comment). Defaulted to the same
 	// kDefaultDataPoolBytes/kDefaultMetadataPoolBytes DeviceContext itself
 	// defaults to; overriding them is mainly useful for tests that want to
 	// exercise capacity-exhaustion/eviction without allocating gigabytes of
 	// real Region data first.
-	Controller(IndexAdapter& adapter, RoutingCache& routing_cache,
+	Controller(IAdapter& adapter, RoutingCache& routing_cache,
 			 SchedulingConfig scheduling_config = {},
 			 std::unique_ptr<ReplacementPolicy> replacement_policy = nullptr,
 			 std::size_t gpu_data_budget_bytes = gpu::kDefaultDataPoolBytes,
-			 std::size_t gpu_metadata_budget_bytes = gpu::kDefaultMetadataPoolBytes);
+			 std::size_t gpu_metadata_budget_bytes = gpu::kDefaultMetadataPoolBytes,
+			 CoordinatorConfig coordinator_config = {});
 
 	SearchResult search(const Query& query);
 
@@ -112,8 +116,8 @@ class Controller {
 	/// declares `id` promotion/eviction-eligible and records where its data
 	/// lives in host memory. An index calls this once it decides a piece of
 	/// its own state should be a candidate for GPU residency -- before that
-	/// call, Arachne has no knowledge of `id` at all, and make() will refuse
-	/// to promote any Anchor onto it.
+	/// call, Arachne has no knowledge of `id` at all, and RegionManager will
+	/// refuse to promote any Anchor onto it.
 	void registerRegion(RegionId id, HostRegionView host);
 
 	/// Resolves where `region`'s data currently lives -- see RegionAccess's
@@ -128,6 +132,16 @@ class Controller {
 	/// gpu::DeviceRegionPool::bytesAllocated(), which takes its own lock.
 	ControllerStats stats() const;
 
+	/// Blocks until RegionManager's Coordinator has fully caught up with
+	/// every insert()/remove() call made so far -- see
+	/// RegionManager::waitIdle()'s own doc comment. Not needed on the normal
+	/// async path (promotion/eviction happen off of insert()/remove()'s own
+	/// critical path by design); exists for callers that need a synchronous
+	/// checkpoint -- e.g. a test asserting on GPU residency right after a
+	/// batch of inserts, or an operator wanting a clean point before
+	/// shutdown.
+	void waitIdle();
+
  private:
 	struct SearchPlan {
 		TraverseRequest primary;
@@ -135,7 +149,6 @@ class Controller {
 	};
 
 	struct InsertPlan {
-		VectorId anchor_id = 0;
 		ModifyRequest request;
 	};
 
@@ -152,187 +165,85 @@ class Controller {
 		SearchPlan routeSearch(const Query& query);
 		// `candidates` is the result of the lookup traversal insert() runs
 		// first (see its doc comment) -- routeInsert() folds `candidates.touched`
-		// into the resulting ModifyRequest::scope and moves (not copies)
-		// `candidates.hint` into ModifyRequest::hint, since `candidates` isn't
-		// needed for anything else afterward.
+		// into the resulting ModifyRequest::scope (which may later be narrowed
+		// to a single already-promoted Region -- see the loop below), and moves
+		// (not copies) `candidates.hint` into ModifyRequest::hint, since
+		// `candidates` isn't needed for anything else afterward. Promotion
+		// itself is already requested by the time this runs -- see dispatch()'s
+		// own doc comment.
 		InsertPlan routeInsert(const Record& record, TraverseResult candidates);
 		RemovePlan routeRemove(VectorId id);
 
-	TraverseResult dispatch(const TraverseRequest& request);
+	// `promotion_anchor_id`, when nonzero, requests replacement_policy_
+	// consider `promotion_anchor_id` a promotion candidate for whatever
+	// Regions this traversal touches -- see RegionManager::requestPromotion().
+	// Both this and the recordTraversal() hotness signal run on the
+	// OpScheduler execution worker thread that actually computed the result
+	// (via OpScheduler::schedule()'s on_complete hook), not on whichever
+	// thread calls this and blocks on the future -- see that hook's own doc
+	// comment for why: it keeps contention on RegionManager's lock bounded by
+	// the (small, fixed) worker pool instead of by however many
+	// search()/insert() callers happen to be concurrently in flight. The same
+	// callback also passes `request.query.vector` through to
+	// requestPromotion() -- safe to capture here (before the worker thread
+	// even runs) because the original caller is still blocked on this call's
+	// own future.get() below, keeping the caller-owned buffer alive for the
+	// callback's duration; see PromotionCandidate's own doc comment
+	// (replacement_policy.hpp) for why RegionManager needs its own copy
+	// beyond that point. Defaults to 0 (no promotion request) -- e.g.
+	// verify()'s traversal.
+	TraverseResult dispatch(const TraverseRequest& request, VectorId promotion_anchor_id = 0);
 	ModifyResult dispatch(const ModifyRequest& request);
 
-	SearchResult commitSearch(const SearchPlan& plan, const TraverseResult& result,
-													 bool final_was_hybrid);
-	InsertResult commitInsert(const InsertPlan& plan, const ModifyResult& result);
+	// RegionManager now owns RoutingCache registration/erasure itself, at
+	// actual promotion-grant/eviction time (see its own class doc comment) --
+	// commitSearch()/commitInsert()/commitRemove() no longer touch
+	// routing_cache_ at all. What's left of the "commit" step is just
+	// shaping each primitive's final public Result type from what dispatch()
+	// returned (plus, for commitRemove(), the release of `anchor_id`'s own
+	// Region dependencies, which stays here since it's keyed off the Modify
+	// primitive's own success, not the lookup traversal's).
+	SearchResult commitSearch(const TraverseResult& result, bool final_was_hybrid);
+	InsertResult commitInsert(const ModifyResult& result);
 	DeleteResult commitRemove(const RemovePlan& plan, const ModifyResult& result);
-
-	// Workload drift (design point 2 trigger).
-	void recordTraversalForDrift(bool touched_host);
-
-	// Anchor-centric Promotion (design point 4): grants `anchor_id` a
-	// dependency on every region in `footprint`. 1) registers `anchor_id` in
-	// routing_cache_ under `anchor_vector` so future queries route to it, 2)
-	// calls make() per region -- which, the first time any Anchor depends on
-	// that region, acquires a write lease for it and allocates its GPU
-	// memory, then *enqueues* (does not yet wait for) the host-to-device copy
-	// of its data, appending onto the `pending`/`zero_headers` batch shared
-	// across this whole call -- and 3) if make() reports
-	// MakeResult::OutOfCapacity for a region, keeps asking
-	// replacement_policy_ for the next Anchor to reclaim (excluding
-	// `anchor_id` itself) and evicting it via evictAnchor(), retrying make()
-	// after each one -- not just once, since a single victim's Regions may
-	// be smaller than what's needed here. Gives up on a region (leaving it
-	// unpromoted for this call) once there's no eviction candidate left, or
-	// once make() reports MakeResult::NotEligible (a reason no amount of
-	// eviction can fix, e.g. an unregistered region or an adapter that
-	// refuses to lease it) -- a future call can try again for the capacity
-	// case. Once every region in `footprint` has been attempted, flushes the
-	// whole batch in a single gpu::DeviceRegionPool::flush() call -- one
-	// scatter-gather round trip for the entire Anchor's footprint, mirroring
-	// writeBackDirtyRegions()'s own batched-gather shape for the opposite
-	// (device-to-host) direction, rather than one acquire+copy+sync per
-	// Region.
-	void promoteAnchor(VectorId anchor_id, const VectorView& anchor_vector,
-									const RegionFootprint& footprint);
-
-	// Reclaims every Region dependency currently held by `anchor_id`: for
-	// each Region that consequently has zero remaining dependents (see
-	// RegionManager::forget()'s doc comment -- Regions still depended on by
-	// some other Anchor are left alone, since they're still promoted for a
-	// reason), releases the write lease. The GPU-resident ones among them
-	// (region.device.valid()) are then batch-written-back in one call to
-	// writeBackDirtyRegions() below -- not one write-back per Region --
-	// before each is freed. Then clears every Region's residency back to
-	// host-only. Notifies replacement_policy_ so it stops tracking
-	// `anchor_id`. The mechanism promoteAnchor() calls through
-	// replacement_policy_->selectEvictionCandidate() when it needs room, and
-	// the one verify() below uses on a mismatch.
-	void evictAnchor(VectorId anchor_id);
-
-	// Batched write-back for every Region in `regions` being reclaimed
-	// (evictAnchor() above calls this once per evictAnchor() call, across
-	// every orphaned Region that call produced -- not once per Region), each
-	// still GPU-resident (region.device.valid()) and not yet freed. Arachne
-	// itself never sets a dirty bit -- that's the adapter/kernel's job (it
-	// atomicOr's into the per-Region dirty-bitmap header prepended to the
-	// Region's device data, see gpu/dirty_header.hpp and make()'s doc
-	// comment) -- so this only ever *reads* those headers back and decides
-	// which Regions' data is worth copying back. Two phases, each one
-	// batched gather (many Regions' device-to-host copies enqueued via
-	// gpu::DeviceRegionPool::enqueueCopyToHost() on one stream, then a
-	// single gpu::DeviceRegionPool::flush()) rather than one
-	// acquire+copy+sync per Region:
-	//  1) Gather every Region's dirty-bitmap header (skipping Regions with
-	//     subregion_bytes == 0 -- see HostRegionView::subregion_bytes --
-	//     which have no header at all, since there's nothing to gather for
-	//     them).
-	//  2) Gather the actual data for every Region that needs writing back:
-	//     confirmed dirty (some header word was nonzero) or, for a Region
-	//     with no header to check, conservatively assumed dirty -- Arachne
-	//     has no way to distinguish dirty from clean without one, so it
-	//     always writes back rather than risk silently dropping a write.
-	//     Skips Regions confirmed clean, since their host copy is already
-	//     authoritative and copying it back would be wasted device-to-host
-	//     traffic.
-	// Granularity note: phase 2 reads "any header bit set" per Region and,
-	// if so, copies back that Region's *entire* data -- it does not (yet)
-	// copy back just the dirty subregions individually, which would need
-	// per-subregion offset/length copies instead of one contiguous gather
-	// entry per Region. That refinement is future work.
-	void writeBackDirtyRegions(const std::vector<Region>& regions);
 
 	// Selective verification (design point 3). Not yet wired into search().
 	// On mismatch, reclaims every Region dependency on `anchor_id` (via
-	// evictAnchor()) since the regions it currently points at no longer
-	// represent its locality.
+	// region_manager_.releaseAnchor()) since the regions it currently points
+	// at no longer represent its locality.
 	void verify(const Query& query, VectorId anchor_id, const TraverseResult& gpu_only_result);
 
-	// Outcome of make() below, distinguishing two very different reasons a
-	// Region can fail to become available for `anchor_id`: promoteAnchor()
-	// only retries-via-eviction on OutOfCapacity (evicting something might
-	// actually help); it gives up immediately on NotEligible (evicting
-	// anything changes nothing -- the region itself, or the adapter's
-	// willingness to resolve/lease it, is the problem).
-	enum class MakeResult {
-		Promoted,       // anchor_id now depends on region (already did, or just started).
-		NotEligible,    // unregistered, adapter can't resolve/lease it -- not retryable.
-		OutOfCapacity,  // registered and lease-eligible, but no room on GPU right now -- retryable.
-	};
-
-	// Capacity-aware allocation with a compaction fallback, used by make()
-	// below in place of a bare gpu::DeviceRegionPool::tryAllocate() call.
-	// Tries tryAllocate() first, exactly like before compaction was wired in
-	// here. If that fails *and* gpu::DeviceRegionPool::hasCapacity() says
-	// `bytes` should fit under the current budget anyway, this Controller
-	// concludes the live bytes are fragmented (not genuinely over budget --
-	// see gpu::DeviceRegionPool::compact()'s own doc comment for why
-	// Controller, not DeviceRegionPool, is the one that decides when to
-	// compact) and runs gpu::DeviceRegionPool::compact(MemoryKind::Data)
-	// once, then retries the allocation exactly once more. Returns nullopt
-	// (same as tryAllocate()) if it still doesn't fit either way -- the
-	// caller (make()) treats that identically to a plain tryAllocate()
-	// failure.
-	std::optional<gpu::DeviceRegionHandle> allocateWithCompaction(std::size_t bytes);
-
-	// Region promotion (design point 4): if `region` is not yet registered
-	// (see registerRegion()), fails immediately -- an unregistered region was
-	// never opted into promotion/eviction. If it's registered but not yet
-	// promoted by anyone (region_manager_'s lease is invalid), acquires a
-	// write lease for it and allocates device memory sized to
-	// region_manager_.regionOf(region).host.bytes plus, if host.subregion_bytes
-	// is nonzero, gpu::DirtyHeaderBytes(host.bytes, host.subregion_bytes)
-	// (see gpu/dirty_header.hpp) prepended for the per-subregion dirty bitmap
-	// a write kernel is expected to atomicOr into. Does not copy anything
-	// synchronously: the header's zero-fill (a scratch buffer appended to
-	// `zero_headers` so it outlives this call -- freshly allocated device
-	// memory is not guaranteed to already be zero-filled) and the Region's
-	// host data are each *enqueued* via device_region_pool_.enqueueCopyFromHost()
-	// onto `pending`, which the caller (promoteAnchor()) is responsible for
-	// flushing exactly once after every Region in the Anchor's footprint has
-	// been attempted -- see promoteAnchor()'s own doc comment. Only once the
-	// lease and the GPU allocation both succeed are the results recorded via
-	// region_manager_.setLease()/setDevice() -- if the allocation can't be
-	// made (see allocateWithCompaction() above), the just-acquired lease is
-	// released again and nothing is recorded, so a failed attempt here never
-	// leaves partial state behind. If `region` is already promoted by some
-	// other Anchor, `anchor_id` simply becomes an additional dependent of the
-	// existing lease -- Regions have exactly one lease (and one GPU
-	// allocation) shared by every dependent, not one independent copy per
-	// Anchor. Either way on success, records the dependency via
-	// region_manager_.addDependency() and notifies replacement_policy_. See
-	// MakeResult above for what a non-Promoted return means and who's
-	// expected to react to it.
-	MakeResult make(VectorId anchor_id, RegionId region, std::vector<gpu::DeviceRegionPool::Lease>& pending,
-								 std::vector<std::vector<std::byte>>& zero_headers);
-
-	IndexAdapter& adapter_;
+	IAdapter& adapter_;
 	RoutingCache& routing_cache_;
-	OpScheduler scheduler_;
-	RegionManager region_manager_;
-	// Strategy (design point 4): see ReplacementPolicy's doc comment.
-	std::unique_ptr<ReplacementPolicy> replacement_policy_;
 	// GPU residency accounting (design point 4): Arachne-owned, not the
 	// adapter's -- see gpu/device_context.hpp and gpu/device_region_pool.hpp.
-	// make() allocates through device_region_pool_ (capacity-aware, via
-	// tryAllocate()) and evictAnchor()/writeBackDirtyRegions() free through
-	// it -- see their doc comments.
+	// region_manager_'s Coordinator allocates/frees through
+	// device_region_pool_ -- see RegionManager's own doc comment for why it,
+	// not Controller, now owns that whole policy.
 	gpu::DeviceContext device_;
 	gpu::DeviceRegionPool device_region_pool_;
-	VectorId next_anchor_id_ = 1;
-	std::uint64_t drift_window_host_ = 0;
-	std::uint64_t drift_window_total_ = 0;
-
-	// ControllerStats' backing counters -- see stats() and ControllerStats'
-	// own doc comment. Independent atomics rather than a mutex-guarded
-	// struct: each is bumped from a different, already-locked-elsewhere call
-	// site (make(), evictAnchor(), writeBackDirtyRegions()) and read
-	// independently by stats(), so there's no cross-field invariant that
-	// would need them updated as one atomic unit.
-	std::atomic<std::uint64_t> stat_regions_promoted_{0};
-	std::atomic<std::uint64_t> stat_regions_evicted_{0};
-	std::atomic<std::uint64_t> stat_regions_written_back_{0};
-	std::atomic<std::uint64_t> stat_anchor_evictions_{0};
-	std::atomic<std::uint64_t> stat_compactions_total_{0};
+	// Declared after device_region_pool_ deliberately: RegionManager's
+	// Coordinator thread (started in the constructor body, stopped in
+	// RegionManager's own destructor) touches device_region_pool_ up until
+	// shutdown() joins it, so it must be destroyed -- reverse declaration
+	// order -- *before* device_region_pool_/device_ are torn down.
+	RegionManager region_manager_;
+	// Declared last of the threading members deliberately: members destroy
+	// in reverse declaration order, so scheduler_ -- and the execution
+	// worker threads it owns -- must stop *before* device_/device_region_pool_
+	// tear down (a worker thread's thread_local g_worker_stream, set from
+	// gpu::DeviceContext::workerStream(), would otherwise dangle for
+	// however long the worker takes to notice shutdown() and stop, and any
+	// adapter that calls Controller::acquireRegion() from within
+	// traverseDevice()/modifyDevice() -- unlike the adapters in this
+	// codebase's own tests today -- would be touching already-destroyed GPU
+	// state).
+	OpScheduler scheduler_;
+	// Minted from search()'s own calling thread whenever a query needs a
+	// Hybrid traversal (see search()'s doc comment) -- atomic because
+	// multiple concurrent search() calls mint from this independently, with
+	// no other lock protecting it.
+	std::atomic<VectorId> next_anchor_id_{1};
 
 	// Which VectorIds insert() currently considers live -- see insert()'s
 	// own doc comment. A plain mutex-guarded set, independent of

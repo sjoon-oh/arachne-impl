@@ -4,7 +4,7 @@
 
 namespace arachne {
 
-IndexImpl::IndexImpl(std::unique_ptr<IndexAdapter> adapter,
+IndexImpl::IndexImpl(std::unique_ptr<IAdapter> adapter,
 							 std::unique_ptr<RoutingCache> routing_cache,
 							 const SchedulingConfig& scheduling_config)
 	: adapter_(std::move(adapter)),

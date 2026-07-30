@@ -82,9 +82,9 @@ struct ModifyResult {
 /// link_list_locks_/label_lookup_lock, is generally fine as-is; one that
 /// isn't needs its own locking, or the caller must be configured with
 /// max_execution_threads = 1).
-class IndexAdapter {
+class IAdapter {
  public:
-	virtual ~IndexAdapter() = default;
+	virtual ~IAdapter() = default;
 
 	/// Host-orchestrated entry point: the index is free to do its own walk
 	/// here, touching GPU-resident data incrementally (e.g. per graph hop,
@@ -139,15 +139,15 @@ class IndexAdapter {
 	virtual std::vector<RegionId> allRegions() const = 0;
 };
 
-inline std::vector<TraverseResult> IndexAdapter::traverseDevice(const std::vector<TraverseRequest>&) {
+inline std::vector<TraverseResult> IAdapter::traverseDevice(const std::vector<TraverseRequest>&) {
 	throw std::logic_error(
-			"IndexAdapter::traverseDevice: not implemented by this adapter (a GpuOnly request was "
+			"IAdapter::traverseDevice: not implemented by this adapter (a GpuOnly request was "
 			"routed to an adapter with no device-native traversal)");
 }
 
-inline std::vector<ModifyResult> IndexAdapter::modifyDevice(const std::vector<ModifyRequest>&) {
+inline std::vector<ModifyResult> IAdapter::modifyDevice(const std::vector<ModifyRequest>&) {
 	throw std::logic_error(
-			"IndexAdapter::modifyDevice: not implemented by this adapter (a GpuOnly request was "
+			"IAdapter::modifyDevice: not implemented by this adapter (a GpuOnly request was "
 			"routed to an adapter with no device-native modification)");
 }
 

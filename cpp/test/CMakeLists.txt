@@ -4,7 +4,9 @@ set(ARACHNE_TEST_SOURCES
 	routing_cache_hnsw_test.cpp
 	routing_cache_hnsw_dtype_test.cpp
 	region_manager_test.cpp
+	region_manager_coordinator_test.cpp
 	op_scheduler_policy_test.cpp
+	op_scheduler_worker_start_test.cpp
 	replacement_policy_test.cpp
 	gpu/dirty_header_test.cpp
 	util/distance_test.cpp
@@ -13,6 +15,7 @@ set(ARACHNE_TEST_SOURCES
 	stress/stress_index.cpp
 	stress/stress_index_test.cpp
 	stress/stress_index_stage2_test.cpp
+	stress/stress_index_stage3_test.cpp
 )
 
 add_executable(arachne_tests ${ARACHNE_TEST_SOURCES})

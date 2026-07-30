@@ -171,6 +171,34 @@ DeviceRegionPool::Lease DeviceRegionPool::acquire(DeviceRegionHandle handle, cud
 	if (it == allocations_.end()) {
 		throw std::invalid_argument("DeviceRegionPool::acquire: handle is not a live allocation");
 	}
+
+	// Cross-stream safety: if some other stream's now-released Lease on this
+	// allocation might still have work in flight, make `stream`'s upcoming
+	// work wait for it -- via a GPU-side cudaStreamWaitEvent, not a host
+	// block -- before handing out a Lease on `stream`. This is what lets
+	// multiple streams (per-worker compute streams, the management stream --
+	// see DeviceContext::workerStream()/managementStream()) safely interleave
+	// access to the same Region: without it, a kernel on one stream and a
+	// promotion/eviction/write-back copy on another could touch the same
+	// device memory with no ordering between them at all, since they no
+	// longer share one canonical stream's implicit FIFO ordering. Consumes
+	// (destroys and erases) every event it waits on: `stream`'s own future
+	// work -- and the event it will eventually record at its own release()
+	// -- is now guaranteed ordered-after everything those events
+	// represented, so a later acquire() on yet another stream only needs to
+	// wait on `stream`'s own eventual release() event, not re-wait on these.
+	// Entries already on `stream` itself are left alone -- same-stream
+	// ordering is already implicit in CUDA's own enqueue order.
+	for (auto event_it = it->second.last_used_events.begin(); event_it != it->second.last_used_events.end();) {
+		if (event_it->first == stream) {
+			++event_it;
+			continue;
+		}
+		cudaStreamWaitEvent(stream, event_it->second, 0);
+		cudaEventDestroy(event_it->second);
+		event_it = it->second.last_used_events.erase(event_it);
+	}
+
 	++it->second.in_use_count;
 	return Lease(*this, handle, stream, it->second.device_ptr);
 }

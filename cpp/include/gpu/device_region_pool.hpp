@@ -142,10 +142,23 @@ class DeviceRegionPool {
 	/// before they were changed to acquire() internally. Throws
 	/// std::invalid_argument if `handle` was never returned by allocate() on
 	/// this pool, or was already freed.
+	///
+	/// Cross-stream safety: before handing back the Lease, inserts a
+	/// GPU-side cudaStreamWaitEvent on `stream` for every other stream's
+	/// still-pending "last used" event recorded against `handle` (see
+	/// Allocation::last_used_events) -- so work enqueued against the
+	/// returned Lease is guaranteed ordered-after any prior, now-released
+	/// use of this same allocation on a *different* stream, without a host
+	/// block. This is what makes it safe for Arachne to give different
+	/// callers (per-worker compute streams, the management stream -- see
+	/// DeviceContext) genuinely different streams over the same Region:
+	/// without this, two streams touching the same allocation would have no
+	/// ordering between them at all, since they no longer share one
+	/// canonical stream's implicit FIFO order.
 	Lease acquire(DeviceRegionHandle handle, cudaStream_t stream);
 
-	/// Same as the two-argument overload, on DeviceContext's own canonical
-	/// stream.
+	/// Same as the two-argument overload, on DeviceContext's own management
+	/// stream (see DeviceContext::managementStream()).
 	Lease acquire(DeviceRegionHandle handle);
 
 	/// Releases the allocation backing `handle`. No-op if `handle` is

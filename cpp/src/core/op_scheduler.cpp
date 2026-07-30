@@ -18,18 +18,19 @@ OpScheduler::OpScheduler(SchedulingConfig config, std::unique_ptr<SchedulingPoli
 
 OpScheduler::~OpScheduler() { shutdown(); }
 
-void OpScheduler::start(IndexAdapter& adapter) {
+void OpScheduler::start(IAdapter& adapter, std::function<void(std::size_t)> on_worker_start) {
 	std::scoped_lock lock(mutex_);
 	if (running_) {
 		throw std::logic_error("OpScheduler already started");
 	}
 	adapter_ = &adapter;
+	on_worker_start_ = std::move(on_worker_start);
 	stop_requested_ = false;
 	running_ = true;
 	planner_ = std::thread(&OpScheduler::plannerLoop, this);
 	execution_workers_.reserve(max_execution_threads_);
 	for (std::size_t i = 0; i < max_execution_threads_; ++i) {
-		execution_workers_.emplace_back(&OpScheduler::workerLoop, this);
+		execution_workers_.emplace_back(&OpScheduler::workerLoop, this, i);
 	}
 }
 
@@ -57,10 +58,12 @@ void OpScheduler::shutdown() {
 	running_ = false;
 	stop_requested_ = false;
 	adapter_ = nullptr;
+	on_worker_start_ = nullptr;
 	execution_workers_.clear();
 }
 
-std::future<TraverseResult> OpScheduler::schedule(TraverseRequest request) {
+std::future<TraverseResult> OpScheduler::schedule(TraverseRequest request,
+																									 std::function<void(const TraverseResult&)> on_complete) {
 	std::promise<TraverseResult> promise;
 	auto future = promise.get_future();
 
@@ -73,7 +76,7 @@ std::future<TraverseResult> OpScheduler::schedule(TraverseRequest request) {
 		}
 
 		queue_.emplace_back(TraverseTask{next_id_++, std::chrono::steady_clock::now(), std::move(request),
-																	 std::move(promise)});
+																	 std::move(promise), std::move(on_complete)});
 	}
 
 	cv_incoming_.notify_one();
@@ -150,7 +153,8 @@ void OpScheduler::plannerLoop() {
 	}
 }
 
-void OpScheduler::workerLoop() {
+void OpScheduler::workerLoop(std::size_t worker_index) {
+	if (on_worker_start_) on_worker_start_(worker_index);
 	while (true) {
 		ScheduledOperationBatch batch;
 		{
@@ -237,7 +241,7 @@ void OpScheduler::executeTraverseBatch(ScheduledOperationBatch batch) {
 
 	// SchedulingPolicy::canAppendToBatch() guarantees every request in the
 	// batch shares the same ExecutionMode, so the front element's mode picks
-	// which single IndexAdapter entry point serves the whole batch.
+	// which single IAdapter entry point serves the whole batch.
 	bool device = requests.front().mode == ExecutionMode::GpuOnly;
 
 	try {
@@ -245,10 +249,15 @@ void OpScheduler::executeTraverseBatch(ScheduledOperationBatch batch) {
 				device ? adapter_->traverseDevice(requests) : adapter_->traverseHost(requests);
 		if (results.size() != batch.size()) {
 			throw std::logic_error(
-					"IndexAdapter::traverseHost/traverseDevice: result count does not match request count");
+					"IAdapter::traverseHost/traverseDevice: result count does not match request count");
 		}
 		for (std::size_t i = 0; i < batch.size(); ++i) {
-			std::get<TraverseTask>(batch[i]).promise.set_value(std::move(results[i]));
+			TraverseTask& task = std::get<TraverseTask>(batch[i]);
+			// Runs on this worker thread, before set_value() -- see
+			// schedule()'s doc comment for the ordering guarantee this gives a
+			// caller blocked on the returned future.
+			if (task.on_complete) task.on_complete(results[i]);
+			task.promise.set_value(std::move(results[i]));
 		}
 	} catch (...) {
 		std::exception_ptr eptr = std::current_exception();
@@ -273,7 +282,7 @@ void OpScheduler::executeModifyBatch(ScheduledOperationBatch batch) {
 				device ? adapter_->modifyDevice(requests) : adapter_->modifyHost(requests);
 		if (results.size() != batch.size()) {
 			throw std::logic_error(
-					"IndexAdapter::modifyHost/modifyDevice: result count does not match request count");
+					"IAdapter::modifyHost/modifyDevice: result count does not match request count");
 		}
 		for (std::size_t i = 0; i < batch.size(); ++i) {
 			std::get<ModifyTask>(batch[i]).promise.set_value(std::move(results[i]));

@@ -8,6 +8,7 @@
 #include <cstring>
 #include <optional>
 #include <random>
+#include <stdexcept>
 #include <thread>
 #include <vector>
 
@@ -17,6 +18,7 @@ namespace {
 
 using arachne::gpu::AllocationPolicy;
 using arachne::gpu::DeviceContext;
+using arachne::gpu::kDefaultDataPoolBytes;
 using arachne::gpu::kDefaultMetadataPoolBytes;
 using arachne::gpu::MemoryKind;
 using arachne::gpu::DeviceRegionHandle;
@@ -438,6 +440,52 @@ TEST(DeviceRegionPoolTest, CompactWaitsForOutstandingLeaseToRelease) {
 	pool.free(handle);
 }
 
+TEST_P(DeviceRegionPoolPolicyTest, CrossStreamAcquireOrdersAfterPriorStreamsReleasedWork) {
+	// Exercises acquire()'s cross-stream event-wait (see its own doc comment):
+	// a Lease released on stream A, with its enqueued write not yet known to
+	// have landed, followed immediately by a *different* stream B acquiring
+	// the same handle -- with no host-side sync in between. If acquire()
+	// didn't insert a GPU-side wait for stream A's outstanding work before
+	// handing back the stream B Lease, stream B's read below could run before
+	// stream A's write actually completes, reading stale/undefined bytes
+	// instead of `pattern`. Large enough (1 MiB) that the write is not
+	// instantaneous, to give a real window for this race to manifest if the
+	// wait were missing.
+	DeviceContext device = MakeDevice();
+	DeviceRegionPool pool(device);
+
+	constexpr std::size_t kBytes = 1024 * 1024;
+	DeviceRegionHandle handle = pool.allocate(kBytes);
+
+	cudaStream_t stream_a = nullptr;
+	cudaStream_t stream_b = nullptr;
+	ASSERT_EQ(cudaStreamCreate(&stream_a), cudaSuccess);
+	ASSERT_EQ(cudaStreamCreate(&stream_b), cudaSuccess);
+
+	std::vector<std::byte> pattern(kBytes, std::byte{0xAA});
+	{
+		DeviceRegionPool::Lease lease = pool.acquire(handle, stream_a);
+		ASSERT_EQ(cudaMemcpyAsync(lease.ptr(), pattern.data(), kBytes, cudaMemcpyHostToDevice, stream_a),
+							cudaSuccess);
+		// `lease` releases here -- only an event is recorded on stream_a, no
+		// host wait for the copy to actually finish.
+	}
+
+	std::vector<std::byte> out(kBytes);
+	{
+		DeviceRegionPool::Lease lease = pool.acquire(handle, stream_b);  // different stream, no sync since above
+		ASSERT_EQ(cudaMemcpyAsync(out.data(), lease.ptr(), kBytes, cudaMemcpyDeviceToHost, stream_b),
+							cudaSuccess);
+	}
+	ASSERT_EQ(cudaStreamSynchronize(stream_b), cudaSuccess);
+
+	EXPECT_EQ(out, pattern);
+
+	pool.free(handle);
+	cudaStreamDestroy(stream_a);
+	cudaStreamDestroy(stream_b);
+}
+
 INSTANTIATE_TEST_SUITE_P(PooledAndNaive, DeviceRegionPoolPolicyTest,
 													::testing::Values(AllocationPolicy::Pooled, AllocationPolicy::Naive),
 													[](const ::testing::TestParamInfo<AllocationPolicy>& info) {
@@ -447,6 +495,45 @@ INSTANTIATE_TEST_SUITE_P(PooledAndNaive, DeviceRegionPoolPolicyTest,
 TEST(DeviceRegionPoolTest, DefaultDeviceContextUsesPooledPolicy) {
 	DeviceContext device;
 	EXPECT_EQ(device.allocationPolicy(), AllocationPolicy::Pooled);
+}
+
+TEST(DeviceContextStreamTest, DefaultWorkerStreamCountIsOne) {
+	DeviceContext device;
+	EXPECT_EQ(device.workerStreamCount(), 1u);
+}
+
+TEST(DeviceContextStreamTest, WorkerStreamCountMatchesConstructorParam) {
+	DeviceContext device(/*device_id=*/0, AllocationPolicy::Pooled, kDefaultDataPoolBytes,
+											 kDefaultMetadataPoolBytes, /*worker_stream_count=*/4);
+	EXPECT_EQ(device.workerStreamCount(), 4u);
+}
+
+TEST(DeviceContextStreamTest, WorkerStreamsAreDistinctFromEachOtherAndFromManagementStream) {
+	// Controller relies on this to route promotion/eviction traffic (the
+	// management stream) and per-worker kernel launches (the worker streams)
+	// onto genuinely independent CUDA streams -- see
+	// DeviceContext::managementStream()/workerStream()'s own doc comments for
+	// why that separation matters.
+	DeviceContext device(/*device_id=*/0, AllocationPolicy::Pooled, kDefaultDataPoolBytes,
+											 kDefaultMetadataPoolBytes, /*worker_stream_count=*/4);
+
+	std::vector<cudaStream_t> streams;
+	streams.push_back(device.managementStream());
+	for (std::size_t i = 0; i < device.workerStreamCount(); ++i) streams.push_back(device.workerStream(i));
+
+	for (std::size_t i = 0; i < streams.size(); ++i) {
+		EXPECT_NE(streams[i], nullptr) << "stream " << i;
+		for (std::size_t j = i + 1; j < streams.size(); ++j) {
+			EXPECT_NE(streams[i], streams[j]) << "streams " << i << " and " << j << " should be distinct";
+		}
+	}
+}
+
+TEST(DeviceContextStreamTest, WorkerStreamOutOfRangeThrows) {
+	DeviceContext device(/*device_id=*/0, AllocationPolicy::Pooled, kDefaultDataPoolBytes,
+											 kDefaultMetadataPoolBytes, /*worker_stream_count=*/2);
+	EXPECT_NO_THROW(device.workerStream(1));
+	EXPECT_THROW(device.workerStream(2), std::out_of_range);
 }
 
 TEST(DeviceRegionPoolTest, NaivePolicyDoesNotPreReserveAnArena) {

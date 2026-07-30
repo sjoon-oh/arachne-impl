@@ -2,19 +2,58 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <atomic>
+#include <memory>
 #include <random>
 #include <thread>
 #include <vector>
+
+#include "core/replacement_policy.hpp"
 
 namespace {
 
 using arachne::HostRegionView;
 using arachne::LeaseHandle;
+using arachne::PromotionCandidate;
 using arachne::Region;
+using arachne::RegionFootprint;
 using arachne::RegionId;
 using arachne::RegionManager;
+using arachne::ReplacementPolicy;
 using arachne::VectorId;
+
+// Everything a RecordingReplacementPolicy has observed, kept outside the
+// policy object itself (which RegionManager takes ownership of via
+// unique_ptr) so a test can still inspect it after construction.
+struct RecordedPolicyEvents {
+	std::vector<PromotionCandidate> enqueued;
+	std::vector<VectorId> evicted;
+	std::vector<VectorId> touched;
+};
+
+// Records every notification it receives verbatim (no dedup/filtering of its
+// own), and never offers a candidate back out (onRelocationTrigger()/
+// selectNextPromotionCandidate()/selectNextEvictionCandidate() all report
+// "nothing to do") -- purpose-built to observe exactly which
+// ReplacementPolicy hooks RegionManager calls, when, and how many times, in
+// isolation from replacement_policy_test.cpp's own FifoReplacementPolicy
+// coverage of a real policy's *reaction* to the same hooks.
+class RecordingReplacementPolicy : public ReplacementPolicy {
+ public:
+	explicit RecordingReplacementPolicy(RecordedPolicyEvents* events) : events_(events) {}
+
+	void enqueueCandidate(PromotionCandidate candidate) override { events_->enqueued.push_back(std::move(candidate)); }
+	void onAnchorEvicted(VectorId anchor_id) override { events_->evicted.push_back(anchor_id); }
+	void onAnchorTouched(VectorId anchor_id) override { events_->touched.push_back(anchor_id); }
+	bool onRelocationTrigger() override { return false; }
+	bool hasPendingCandidates() const override { return false; }
+	std::optional<PromotionCandidate> selectNextPromotionCandidate() override { return std::nullopt; }
+	std::optional<VectorId> selectNextEvictionCandidate(VectorId) override { return std::nullopt; }
+
+ private:
+	RecordedPolicyEvents* events_;
+};
 
 TEST(RegionManagerTest, RegionOfUnregisteredThrows) {
 	RegionManager manager;
@@ -189,6 +228,94 @@ TEST(RegionManagerTest, SharedRegionExposesTheSameLeaseToEveryDependent) {
 	EXPECT_EQ(manager.regionOf(42).lease.epoch, 5u);
 	// Both anchors resolve the same RegionId to the identical Region record.
 	EXPECT_EQ(manager.regionsOf(1)[0], manager.regionsOf(2)[0]);
+}
+
+// ---------------------------------------------------------------------------
+// recordTraversal(): the traverse-level hotness signal (see
+// core/replacement_policy.hpp's onAnchorTouched() doc comment) -- exercised
+// directly against RegionManager's dependency graph, with no Coordinator/
+// adapter/GPU involved, since fan-out from touched Regions to dependent
+// Anchors is pure bookkeeping.
+// ---------------------------------------------------------------------------
+
+TEST(RegionManagerTest, RecordTraversalNotifiesEveryDependentAnchorOfEachTouchedRegion) {
+	RecordedPolicyEvents events;
+	RegionManager manager(std::make_unique<RecordingReplacementPolicy>(&events));
+	manager.registerRegion(10, HostRegionView{});
+	manager.registerRegion(20, HostRegionView{});
+	manager.addDependency(1, 10);
+	manager.addDependency(2, 20);
+
+	manager.recordTraversal(RegionFootprint{{10, 20}});
+
+	std::sort(events.touched.begin(), events.touched.end());
+	ASSERT_EQ(events.touched.size(), 2u);
+	EXPECT_EQ(events.touched[0], 1u);
+	EXPECT_EQ(events.touched[1], 2u);
+}
+
+TEST(RegionManagerTest, RecordTraversalDedupesAnAnchorDependingOnMultipleTouchedRegions) {
+	RecordedPolicyEvents events;
+	RegionManager manager(std::make_unique<RecordingReplacementPolicy>(&events));
+	manager.registerRegion(10, HostRegionView{});
+	manager.registerRegion(20, HostRegionView{});
+	manager.addDependency(1, 10);
+	manager.addDependency(1, 20);  // anchor 1 depends on both touched regions
+
+	manager.recordTraversal(RegionFootprint{{10, 20}});
+
+	ASSERT_EQ(events.touched.size(), 1u);  // reported once per recordTraversal() call, not once per region
+	EXPECT_EQ(events.touched[0], 1u);
+}
+
+TEST(RegionManagerTest, RecordTraversalOfUnregisteredRegionIsANoop) {
+	RecordedPolicyEvents events;
+	RegionManager manager(std::make_unique<RecordingReplacementPolicy>(&events));
+
+	EXPECT_NO_THROW(manager.recordTraversal(RegionFootprint{{999}}));  // never registered
+	EXPECT_TRUE(events.touched.empty());
+}
+
+TEST(RegionManagerTest, RecordTraversalOfOrphanedRegionIsANoop) {
+	RecordedPolicyEvents events;
+	RegionManager manager(std::make_unique<RecordingReplacementPolicy>(&events));
+	manager.registerRegion(10, HostRegionView{});  // registered, but nobody depends on it
+
+	manager.recordTraversal(RegionFootprint{{10}});
+	EXPECT_TRUE(events.touched.empty());
+}
+
+TEST(RegionManagerTest, RecordTraversalOfEmptyFootprintIsANoop) {
+	RecordedPolicyEvents events;
+	RegionManager manager(std::make_unique<RecordingReplacementPolicy>(&events));
+	manager.registerRegion(10, HostRegionView{});
+	manager.addDependency(1, 10);
+
+	manager.recordTraversal(RegionFootprint{});
+	EXPECT_TRUE(events.touched.empty());
+}
+
+// ---------------------------------------------------------------------------
+// requestPromotion(): a pure enqueue onto RegionManager's own MPSC intake
+// queue (pending_promotions_) -- must *not* touch replacement_policy_ at all
+// on the calling thread. Only the Coordinator thread (started via start())
+// ever drains that queue and hands candidates to the policy via
+// enqueueCandidate() -- see the class doc comment (region_manager.hpp) and
+// ReplacementPolicy::enqueueCandidate()'s own doc comment for why. This test
+// never calls start(), so if requestPromotion() ever touched the policy
+// directly, events.enqueued would already be non-empty here.
+// ---------------------------------------------------------------------------
+
+TEST(RegionManagerTest, RequestPromotionDoesNotTouchReplacementPolicyDirectly) {
+	RecordedPolicyEvents events;
+	RegionManager manager(std::make_unique<RecordingReplacementPolicy>(&events));
+	manager.registerRegion(1, HostRegionView{});
+
+	manager.requestPromotion(100, RegionFootprint{{1}});
+
+	EXPECT_TRUE(events.enqueued.empty());
+	EXPECT_TRUE(events.evicted.empty());
+	EXPECT_TRUE(events.touched.empty());
 }
 
 // ---------------------------------------------------------------------------

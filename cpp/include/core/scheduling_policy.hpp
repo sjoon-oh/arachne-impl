@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cstddef>
 #include <deque>
+#include <functional>
 #include <future>
 #include <optional>
 #include <variant>
@@ -19,6 +20,15 @@ struct TraverseTask {
 	std::chrono::steady_clock::time_point enqueued_at;
 	TraverseRequest request;
 	std::promise<TraverseResult> promise;
+	// Invoked on the execution worker thread, with the freshly computed
+	// result, right before the promise is fulfilled -- see
+	// OpScheduler::schedule(TraverseRequest, ...)'s own doc comment for why:
+	// this lets a caller (Controller) do result-dependent bookkeeping on the
+	// bounded set of worker threads instead of on whichever (unboundedly
+	// many, concurrent) thread happens to call future.get(). OpScheduler
+	// itself never interprets this -- same shape as start()'s
+	// on_worker_start callback.
+	std::function<void(const TraverseResult&)> on_complete;
 };
 
 struct ModifyTask {
@@ -50,7 +60,7 @@ class SchedulingPolicy {
 	/// must, at minimum, reject a candidate whose ExecutionMode
 	/// (TraverseRequest::mode/ModifyRequest::mode) doesn't match
 	/// `current_batch`'s (once non-empty) -- OpScheduler dispatches a whole
-	/// batch to exactly one of IndexAdapter's Host/Device entry points (see
+	/// batch to exactly one of IAdapter's Host/Device entry points (see
 	/// adapter/index_adapter.hpp), so a batch must be mode-homogeneous, not
 	/// just kind-homogeneous, or there'd be no single call that's correct
 	/// for the whole thing.

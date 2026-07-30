@@ -16,7 +16,7 @@ namespace arachne::util {
 /// normalization; a candidate for Core's future verification-path
 /// distance/margin comparisons and promotion/eviction scoring) -- not
 /// index-facing primitives. An underlying index's own traversal/
-/// modification math stays behind IndexAdapter/IRegion, untouched by this.
+/// modification math stays behind IAdapter/IRegion, untouched by this.
 
 /// Squared Euclidean (L2) distance between `a` and `b`, each `dim` floats.
 float SquaredL2Distance(const float* a, const float* b, std::uint32_t dim);

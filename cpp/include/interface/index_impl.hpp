@@ -16,7 +16,7 @@ namespace arachne {
 /// Controller wired to them.
 class IndexImpl : public Index {
  public:
-	IndexImpl(std::unique_ptr<IndexAdapter> adapter, std::unique_ptr<RoutingCache> routing_cache,
+	IndexImpl(std::unique_ptr<IAdapter> adapter, std::unique_ptr<RoutingCache> routing_cache,
 				 const SchedulingConfig& scheduling_config = {});
 
 	SearchResult search(const Query& query) override;
@@ -24,7 +24,7 @@ class IndexImpl : public Index {
 	DeleteResult remove(VectorId id) override;
 
  private:
-	std::unique_ptr<IndexAdapter> adapter_;
+	std::unique_ptr<IAdapter> adapter_;
 	std::unique_ptr<RoutingCache> routing_cache_;
 	Controller controller_;
 };

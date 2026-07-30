@@ -14,7 +14,6 @@ if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
 	set(CMAKE_CUDA_ARCHITECTURES 100 120)
 endif()
 
-option(ARACHNE_USE_RAFT "Link against RAFT (installed via the conda env) for GPU primitives" ON)
 option(ARACHNE_BUILD_TESTS "Build unit tests (requires GTest, see conda/arachne-blackwell.yml)" ON)
 
 # Resolve conda-provided dependencies (raft, ...) from the active env.
@@ -38,22 +37,18 @@ set(ARACHNE_CORE_SOURCES
 		src/core/op_scheduler.cpp
 		src/core/scheduling_policy.cpp
 		src/core/replacement_policy.cpp
-		src/core/anchor_manager.cpp
+		src/core/region_manager.cpp
 		src/core/as_routing_cache.cpp
 	src/core/as_routing_cache_hnsw.cpp
 	src/util/distance.cpp
+	# GPU device/memory management (arachne/gpu) -- built on
+	# raft::device_resources and RMM. Arachne is a GPU-accelerated ANNS
+	# control plane by definition, so RAFT is a hard, unconditional
+	# dependency of arachne_core, not an optional one -- see
+	# gpu/device_context.hpp and gpu/device_region_pool.hpp.
+	src/gpu/device_context.cpp
+	src/gpu/device_region_pool.cpp
 )
-if(ARACHNE_USE_RAFT)
-	# GPU device/memory management (arachne/gpu) -- built on raft::device_resources
-	# and RMM, so it only compiles/links when RAFT is actually available. See
-	# gpu/device_context.hpp and gpu/stitch_pool.hpp; Controller only declares
-	# its gpu:: members under the matching ARACHNE_WITH_RAFT compile definition
-	# set below.
-	list(APPEND ARACHNE_CORE_SOURCES
-		src/gpu/device_context.cpp
-		src/gpu/stitch_pool.cpp
-	)
-endif()
 
 add_library(arachne_core ${ARACHNE_CORE_SOURCES})
 add_library(arachne::core ALIAS arachne_core)
@@ -71,9 +66,8 @@ target_include_directories(arachne_core PRIVATE
 target_compile_features(arachne_core PUBLIC cxx_std_20)
 target_link_libraries(arachne_core PRIVATE hnswlib)
 
-# logging.hpp needs fmt::format directly (see its own comment) regardless of
-# which ARACHNE_USE_RAFT branch is active -- the spdlog fallback pulls fmt
-# in transitively, but raft::raft does not, so this can't be left implicit.
+# logging.hpp needs fmt::format directly (see its own comment) -- raft::raft
+# does not pull it in transitively, so this can't be left implicit.
 find_package(fmt CONFIG REQUIRED)
 target_link_libraries(arachne_core PUBLIC fmt::fmt)
 
@@ -88,16 +82,8 @@ target_link_libraries(arachne_core PRIVATE hwy::hwy)
 find_package(Threads REQUIRED)
 target_link_libraries(arachne_core PUBLIC Threads::Threads)
 
-if(ARACHNE_USE_RAFT)
-	find_package(raft CONFIG REQUIRED)
-	target_link_libraries(arachne_core PUBLIC raft::raft)
-	target_compile_definitions(arachne_core PUBLIC ARACHNE_WITH_RAFT)
-else()
-	# Logging fallback when RAFT (and its bundled rapids-logger/spdlog) isn't
-	# linked -- see cpp/include/arachne/logging.hpp.
-	find_package(spdlog CONFIG REQUIRED)
-	target_link_libraries(arachne_core PUBLIC spdlog::spdlog)
-endif()
+find_package(raft CONFIG REQUIRED)
+target_link_libraries(arachne_core PUBLIC raft::raft)
 
 if(ARACHNE_BUILD_TESTS)
 	enable_testing()

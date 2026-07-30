@@ -83,6 +83,11 @@ TEST(StressIndexStage2Test, EvictionCyclingPreservesCorrectnessUnderTinyGpuBudge
 	}
 	EXPECT_EQ(index.liveCount(), kCapacity);
 
+	// Promotion/eviction is now lazy (RegionManager's Coordinator) -- wait for
+	// it to fully catch up before asserting on stats()/acquireRegion() below,
+	// rather than relying on however much of it happened to land during the
+	// insert loop above.
+	controller.waitIdle();
 	ControllerStats stats = controller.stats();
 	// Eviction was actually forced -- not just capacity-checked and skipped.
 	EXPECT_GT(stats.regions_promoted_total, 0u);

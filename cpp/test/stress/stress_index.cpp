@@ -188,6 +188,10 @@ std::vector<TraverseResult> StressIndex::traverseDevice(const std::vector<Traver
 	return traverseHost(requests);
 }
 
+std::vector<ModifyResult> StressIndex::modifyDevice(const std::vector<ModifyRequest>& requests) {
+	return modifyHost(requests);
+}
+
 std::vector<ModifyResult> StressIndex::modifyHost(const std::vector<ModifyRequest>& requests) {
 	std::vector<ModifyResult> results;
 	results.reserve(requests.size());

@@ -20,7 +20,7 @@ namespace {
 using namespace arachne;
 
 // ---------------------------------------------------------------------------
-// Test doubles: a minimal IRegion/IndexAdapter/RoutingCache good enough to
+// Test doubles: a minimal IRegion/IAdapter/RoutingCache good enough to
 // drive Controller's promotion/eviction machinery without a real index.
 // ---------------------------------------------------------------------------
 
@@ -43,15 +43,20 @@ class FakeRegion : public IRegion {
 	std::uint64_t epoch_ = 0;
 };
 
-// IndexAdapter double. traverseHost() is a fixed no-op response (the tests
-// below only exercise the Modify/promotion side); modifyHost() always
-// succeeds and reports `next_modified` as the RegionFootprint the insert
-// wants promoted -- the test sets this before each Controller::insert()
-// call, standing in for whatever a real index's insert logic would decide.
-class FakeAdapter : public IndexAdapter {
+// IAdapter double. traverseHost() reports `next_touched` as every returned
+// TraverseResult::touched -- Promotion is driven by this (see
+// Controller::commitInsert()'s doc comment), so the test sets this before
+// each Controller::insert() call, standing in for whatever a real index's
+// lookup-traversal logic would decide is this Anchor's locality.
+// modifyHost() always succeeds and echoes the request's own scope back as
+// ModifyResult::touched -- ModifyResult::modified is left at its default
+// (empty): nothing in Controller reads it anymore.
+class FakeAdapter : public IAdapter {
  public:
 	std::vector<TraverseResult> traverseHost(const std::vector<TraverseRequest>& requests) override {
-		return std::vector<TraverseResult>(requests.size());
+		std::vector<TraverseResult> results(requests.size());
+		for (TraverseResult& result : results) result.touched = next_touched;
+		return results;
 	}
 
 	std::vector<ModifyResult> modifyHost(const std::vector<ModifyRequest>& requests) override {
@@ -61,7 +66,6 @@ class FakeAdapter : public IndexAdapter {
 			ModifyResult result;
 			result.ok = true;
 			result.touched = request.scope;
-			result.modified = next_modified;
 			results.push_back(result);
 		}
 		return results;
@@ -81,7 +85,7 @@ class FakeAdapter : public IndexAdapter {
 
 	void addRegion(RegionId id, HostRegionView host) { regions_.emplace(id, FakeRegion(id, host)); }
 
-	RegionFootprint next_modified;
+	RegionFootprint next_touched;
 
  private:
 	std::unordered_map<RegionId, FakeRegion> regions_;
@@ -142,10 +146,11 @@ TEST(ControllerGpuResidencyTest, PromoteAllocatesGpuMemoryAndCopiesHostData) {
 	RegionAccess before = controller.acquireRegion(1);
 	EXPECT_FALSE(before.on_device);
 
-	adapter.next_modified = RegionFootprint{{1}};
+	adapter.next_touched = RegionFootprint{{1}};
 	float vector_value = 1.0f;
 	InsertResult result = controller.insert(MakeRecord(/*id=*/100, vector_value));
 	ASSERT_TRUE(result.ok);
+	controller.waitIdle();  // promotion is now lazy -- wait for RegionManager's Coordinator to catch up
 
 	RegionAccess after = controller.acquireRegion(1);
 	ASSERT_TRUE(after.on_device);
@@ -192,15 +197,16 @@ TEST(ControllerGpuResidencyTest, PromoteEvictsMultipleVictimsWhenOneIsNotEnoughC
 
 	float v1 = 1.0f, v2 = 2.0f, v3 = 3.0f, v4 = 4.0f;
 
-	adapter.next_modified = RegionFootprint{{1}};
+	adapter.next_touched = RegionFootprint{{1}};
 	ASSERT_TRUE(controller.insert(MakeRecord(101, v1)).ok);  // anchor 101 -> region 1 (oldest)
-	adapter.next_modified = RegionFootprint{{2}};
+	adapter.next_touched = RegionFootprint{{2}};
 	ASSERT_TRUE(controller.insert(MakeRecord(102, v2)).ok);  // anchor 102 -> region 2
-	adapter.next_modified = RegionFootprint{{3}};
+	adapter.next_touched = RegionFootprint{{3}};
 	ASSERT_TRUE(controller.insert(MakeRecord(103, v3)).ok);  // anchor 103 -> region 3 -- budget now full
 
-	adapter.next_modified = RegionFootprint{{4}};
+	adapter.next_touched = RegionFootprint{{4}};
 	ASSERT_TRUE(controller.insert(MakeRecord(104, v4)).ok);  // anchor 104 -> region 4, needs 2 evictions
+	controller.waitIdle();  // promotion/eviction is now lazy -- wait for the Coordinator to catch up
 
 	EXPECT_FALSE(controller.acquireRegion(1).on_device);  // evicted (oldest, FIFO)
 	EXPECT_FALSE(controller.acquireRegion(2).on_device);  // evicted (second-oldest)
@@ -237,10 +243,11 @@ TEST(ControllerGpuResidencyTest, EvictionWritesBackOnlyWhenDirty) {
 	controller.registerRegion(2, host_clean);
 
 	float v1 = 1.0f, v2 = 2.0f, v3 = 3.0f;
-	adapter.next_modified = RegionFootprint{{1}};
+	adapter.next_touched = RegionFootprint{{1}};
 	ASSERT_TRUE(controller.insert(MakeRecord(201, v1)).ok);
-	adapter.next_modified = RegionFootprint{{2}};
+	adapter.next_touched = RegionFootprint{{2}};
 	ASSERT_TRUE(controller.insert(MakeRecord(202, v2)).ok);  // budget now full
+	controller.waitIdle();  // promotion is now lazy -- wait for the Coordinator to catch up
 
 	// Simulate a write kernel having touched both regions' device payloads,
 	// but only having atomicOr'd a dirty bit for region 1.
@@ -257,8 +264,9 @@ TEST(ControllerGpuResidencyTest, EvictionWritesBackOnlyWhenDirty) {
 	HostRegionView host_c{data_c.data(), kPayloadBytes, kSubregionBytes};
 	adapter.addRegion(3, host_c);
 	controller.registerRegion(3, host_c);
-	adapter.next_modified = RegionFootprint{{3}};
+	adapter.next_touched = RegionFootprint{{3}};
 	ASSERT_TRUE(controller.insert(MakeRecord(203, v3)).ok);
+	controller.waitIdle();  // eviction/promotion is now lazy -- wait for the Coordinator to catch up
 
 	EXPECT_FALSE(controller.acquireRegion(1).on_device);  // evicted
 	EXPECT_TRUE(controller.acquireRegion(2).on_device);   // still resident -- one eviction was enough
@@ -275,8 +283,9 @@ TEST(ControllerGpuResidencyTest, EvictionWritesBackOnlyWhenDirty) {
 	HostRegionView host_e{data_e.data(), kPayloadBytes, kSubregionBytes};
 	adapter.addRegion(4, host_e);
 	controller.registerRegion(4, host_e);
-	adapter.next_modified = RegionFootprint{{4}};
+	adapter.next_touched = RegionFootprint{{4}};
 	ASSERT_TRUE(controller.insert(MakeRecord(204, v3)).ok);
+	controller.waitIdle();  // eviction is now lazy -- wait for the Coordinator to catch up
 
 	EXPECT_FALSE(controller.acquireRegion(2).on_device);  // evicted
 	EXPECT_TRUE(controller.acquireRegion(3).on_device);
@@ -307,14 +316,16 @@ TEST(ControllerGpuResidencyTest, EvictionAlwaysWritesBackWhenNoHeaderExists) {
 	controller.registerRegion(2, host_b);
 
 	float v1 = 1.0f, v2 = 2.0f;
-	adapter.next_modified = RegionFootprint{{1}};
+	adapter.next_touched = RegionFootprint{{1}};
 	ASSERT_TRUE(controller.insert(MakeRecord(301, v1)).ok);  // budget now full (1 region fits)
+	controller.waitIdle();  // promotion is now lazy -- wait for the Coordinator to catch up
 
 	std::vector<std::byte> poison(kBytes, std::byte{0xFF});
 	PokeDevice(controller, /*region=*/1, /*offset=*/0, poison);  // never touch a dirty bit -- there is none
 
-	adapter.next_modified = RegionFootprint{{2}};
+	adapter.next_touched = RegionFootprint{{2}};
 	ASSERT_TRUE(controller.insert(MakeRecord(302, v2)).ok);  // evicts region 1
+	controller.waitIdle();  // eviction is now lazy -- wait for the Coordinator to catch up
 
 	EXPECT_FALSE(controller.acquireRegion(1).on_device);
 	EXPECT_EQ(data_a, poison);  // written back unconditionally, despite no dirty bit ever being set
@@ -357,8 +368,9 @@ TEST(ControllerGpuResidencyTest, EvictionBatchesMultipleRegionsFromOneAnchorInOn
 	// A single insert whose footprint covers both regions 1 and 2 --
 	// anchor 401 now depends on both at once.
 	float v1 = 1.0f, v3 = 3.0f;
-	adapter.next_modified = RegionFootprint{{1, 2}};
+	adapter.next_touched = RegionFootprint{{1, 2}};
 	ASSERT_TRUE(controller.insert(MakeRecord(401, v1)).ok);
+	controller.waitIdle();  // promotion is now lazy -- wait for the Coordinator to catch up
 	ASSERT_TRUE(controller.acquireRegion(1).on_device);
 	ASSERT_TRUE(controller.acquireRegion(2).on_device);
 
@@ -371,8 +383,9 @@ TEST(ControllerGpuResidencyTest, EvictionBatchesMultipleRegionsFromOneAnchorInOn
 
 	// Region 3 forces evicting anchor 401 -- both region 1 and region 2 are
 	// reclaimed together, in one evictAnchor() call.
-	adapter.next_modified = RegionFootprint{{3}};
+	adapter.next_touched = RegionFootprint{{3}};
 	ASSERT_TRUE(controller.insert(MakeRecord(402, v3)).ok);
+	controller.waitIdle();  // eviction is now lazy -- wait for the Coordinator to catch up
 
 	EXPECT_FALSE(controller.acquireRegion(1).on_device);
 	EXPECT_FALSE(controller.acquireRegion(2).on_device);
@@ -394,9 +407,10 @@ TEST(ControllerGpuResidencyTest, InsertRejectsDuplicateIdWithoutTouchingExisting
 	adapter.addRegion(1, host);
 	controller.registerRegion(1, host);
 
-	adapter.next_modified = RegionFootprint{{1}};
+	adapter.next_touched = RegionFootprint{{1}};
 	float v1 = 1.0f, v2 = 2.0f;
 	ASSERT_TRUE(controller.insert(MakeRecord(501, v1)).ok);
+	controller.waitIdle();  // promotion is now lazy -- wait for the Coordinator to catch up
 	ASSERT_TRUE(controller.acquireRegion(1).on_device);
 
 	// Same id again, different vector -- must be rejected outright, and must
@@ -407,7 +421,8 @@ TEST(ControllerGpuResidencyTest, InsertRejectsDuplicateIdWithoutTouchingExisting
 
 	// remove() frees the id back up for reuse.
 	ASSERT_TRUE(controller.remove(501).ok);
-	adapter.next_modified = RegionFootprint{{1}};
+	controller.waitIdle();  // release is now lazy -- wait for the Coordinator to catch up
+	adapter.next_touched = RegionFootprint{{1}};
 	EXPECT_TRUE(controller.insert(MakeRecord(501, v2)).ok);
 }
 

@@ -44,7 +44,7 @@ class StressRegion final : public IRegion {
 /// A brute-force, full-scan "index" standing in for a real ANNS index
 /// (HNSW/IVF/...), built to validate Arachne's own orchestration rather
 /// than to be a good index: Arachne drives any adapter purely through
-/// IndexAdapter/IRegion and never looks inside it, so a correct-but-naive
+/// IAdapter/IRegion and never looks inside it, so a correct-but-naive
 /// full scan exercises the exact same Controller machinery (routing,
 /// promotion/eviction, scheduling, write-back) a real graph/cluster index
 /// would, without this project needing to also get a real index's own
@@ -69,7 +69,7 @@ class StressRegion final : public IRegion {
 /// 3's many-caller-threads stress exercises this for real; a single-caller
 /// stage-1 test only ever has one batch in flight at a time, but the lock
 /// costs nothing extra either way).
-class StressIndex final : public IndexAdapter {
+class StressIndex final : public IAdapter {
  public:
 	StressIndex(std::uint32_t dim, VectorDType dtype, std::size_t capacity, std::size_t vectors_per_region);
 	~StressIndex() override;
@@ -86,8 +86,16 @@ class StressIndex final : public IndexAdapter {
 	/// Controller::make()) -- true until stage 4 adds a real write kernel,
 	/// since host and device stay byte-identical otherwise. Lets a
 	/// GpuOnly-routed lookup (see Controller::route()/routeSearch()) succeed
-	/// instead of hitting IndexAdapter::traverseDevice()'s default throw.
+	/// instead of hitting IAdapter::traverseDevice()'s default throw.
 	std::vector<TraverseResult> traverseDevice(const std::vector<TraverseRequest>& requests) override;
+
+	/// Same reasoning as traverseDevice() above, for the Modify side: a
+	/// GpuOnly insert can now legitimately reach here whenever its own
+	/// lookup traversal's promotion request (see Controller::insert()'s doc
+	/// comment) has already been granted a Region by the time routeInsert()
+	/// checks -- delegating to modifyHost() lets that succeed instead of
+	/// hitting IAdapter::modifyDevice()'s default throw.
+	std::vector<ModifyResult> modifyDevice(const std::vector<ModifyRequest>& requests) override;
 
 	IRegion* resolveRegion(RegionId id) override;
 	std::vector<RegionId> allRegions() const override;
@@ -131,7 +139,7 @@ class StressIndex final : public IndexAdapter {
 
 	// See BruteForceGroundTruth()'s own doc comment for why this reaches
 	// into private state directly rather than going through the public
-	// IndexAdapter surface.
+	// IAdapter surface.
 	friend std::vector<Neighbor> BruteForceGroundTruth(const StressIndex& index, const VectorView& query,
 																											std::uint32_t top_k);
 };
