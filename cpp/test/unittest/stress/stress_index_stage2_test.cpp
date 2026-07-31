@@ -42,15 +42,11 @@ using arachne::stress::testsupport::GenerateVectors;
 TEST(StressIndexStage2Test, EvictionCyclingPreservesCorrectnessUnderTinyGpuBudget) {
 	constexpr std::uint32_t kDim = 128;
 	constexpr VectorDType kDType = VectorDType::Float32;
-	// 10 vectors/Region, 200 Regions total (2000 vectors) -- but the budget
-	// below only ever holds ~16 Regions at once, so promoting the ~161st
-	// through ~200th Region each require evicting older ones first (each one
-	// potentially needing every one of an older Region's 10 dependents
-	// evicted before it actually frees -- see evictAnchor()'s doc comment on
-	// why a non-last-dependent eviction must still stop FIFO from tracking
-	// that anchor, or this loop would never terminate), and by the end
-	// essentially the whole dataset has cycled through GPU residency at
-	// least once.
+	// 10 vectors/Region, 200 Regions total (2000 vectors), but the budget
+	// below only ever holds ~16 Regions at once -- promoting later Regions
+	// forces evicting older ones first (see evictAnchor()'s doc comment), so
+	// by the end essentially the whole dataset has cycled through GPU
+	// residency at least once.
 	constexpr std::size_t kVectorsPerRegion = 10;
 	constexpr std::size_t kCapacity = 2000;
 	constexpr std::size_t kRegionsThatFitBudget = 16;
@@ -64,12 +60,13 @@ TEST(StressIndexStage2Test, EvictionCyclingPreservesCorrectnessUnderTinyGpuBudge
 	std::size_t header_bytes = arachne::gpu::DirtyHeaderBytes(region_payload_bytes, kDim * element_size);
 	std::size_t region_total_bytes = region_payload_bytes + header_bytes;
 	std::size_t budget = kRegionsThatFitBudget * region_total_bytes;
-	// rmm::mr::pool_memory_resource requires the initial pool size to be a
-	// multiple of 256 bytes.
-	budget += (256 - budget % 256) % 256;
 
+	// gpu_unit_bytes == region_total_bytes so each Region occupies exactly
+	// one arena unit -- otherwise Pooled's coarser default unit size would
+	// silently let more than kRegionsThatFitBudget Regions fit at once,
+	// defeating the capacity pressure this test depends on.
 	Controller controller(index, routing_cache, arachne::SchedulingConfig{}, nullptr, budget,
-												arachne::gpu::kDefaultMetadataPoolBytes);
+												arachne::gpu::kDefaultMetadataPoolBytes, /*gpu_unit_bytes=*/region_total_bytes);
 	index.registerAllRegions(controller);
 
 	std::mt19937 rng(2024);
@@ -95,21 +92,15 @@ TEST(StressIndexStage2Test, EvictionCyclingPreservesCorrectnessUnderTinyGpuBudge
 	EXPECT_GT(stats.anchor_evictions_total, 0u);
 	// Never exceeded the self-imposed budget, even under this much churn.
 	EXPECT_LE(stats.gpu_bytes_allocated, budget);
-	// compactions_total is deliberately not asserted > 0 here: every Region
-	// in this test is the same fixed size, so a freed Region's hole is
-	// always exactly the right size for the next one needing it -- genuine
-	// fragmentation (a request no single free hole is big enough for,
-	// despite enough aggregate free bytes) doesn't arise from a uniform-size
-	// access pattern. allocateWithCompaction()'s fallback path exists for
-	// adapters with variable-sized Regions; StressIndex isn't one, so 0 here
-	// is the expected, correct outcome, not a sign the wiring is unused.
+	// compactions_total isn't asserted > 0 here: every Region is the same
+	// fixed size, so a freed Region's hole always exactly fits the next one
+	// needing it -- genuine fragmentation doesn't arise from a uniform-size
+	// access pattern. 0 is the expected outcome, not unused wiring.
 
-	// Correctness: sample-check search results -- including for vectors
-	// whose Region was almost certainly evicted long before this loop ends
-	// -- against ground truth computed independently from StressIndex's own
-	// storage (see BruteForceGroundTruth()'s doc comment). Host data stays
-	// authoritative regardless of current GPU residency (write-back keeps it
-	// that way), so this must hold exactly the same as it did in stage 1.
+	// Sample-check search results -- including for vectors whose Region was
+	// almost certainly evicted long before this loop ends -- against ground
+	// truth computed independently from StressIndex's own storage. Host data
+	// stays authoritative regardless of GPU residency, so this must match stage 1.
 	constexpr std::size_t kNumQueries = 100;
 	constexpr std::uint32_t kTopK = 5;
 	std::uniform_int_distribution<std::size_t> pick(0, kCapacity - 1);
@@ -130,11 +121,10 @@ TEST(StressIndexStage2Test, EvictionCyclingPreservesCorrectnessUnderTinyGpuBudge
 		EXPECT_FLOAT_EQ(searched.neighbors.front().distance, 0.0f) << "query " << q;
 	}
 
-	// Every Region should have ended up either currently resident or
-	// properly evicted -- never left in a torn state (e.g. device.valid()
-	// true but not actually reachable). Spot-check via acquireRegion() over
-	// every Region id: this must not throw (all were registered) and must
-	// agree with whatever residency Controller itself believes.
+	// Every Region should have ended up either resident or properly evicted
+	// -- never left torn (e.g. device.valid() true but unreachable).
+	// Spot-check via acquireRegion() over every Region id: must not throw and
+	// must agree with whatever residency Controller believes.
 	for (RegionId id = 1; id <= (kCapacity + kVectorsPerRegion - 1) / kVectorsPerRegion; ++id) {
 		EXPECT_NO_THROW({
 			auto access = controller.acquireRegion(id);

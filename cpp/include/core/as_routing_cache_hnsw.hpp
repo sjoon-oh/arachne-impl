@@ -36,13 +36,10 @@ namespace arachne {
 /// path.
 class ASRoutingCacheHnsw : public ASRoutingCache {
  public:
-	/// `max_tombstone_ratio` is the deleted/live fraction that triggers a
-	/// compaction swap (see ASRoutingCache). `M`/`ef_construction` are
-	/// hnswlib's own HNSW graph hyperparameters -- untuned placeholders,
-	/// like the rest of the defaults here. `metric` and `dtype` are both
-	/// fixed for the lifetime of the cache -- every vector passed to
-	/// ensure()/nearest() is expected to carry this same VectorView::dtype
-	/// (checked; mismatches throw).
+	/// `max_tombstone_ratio` triggers a compaction swap (see ASRoutingCache).
+	/// `M`/`ef_construction` are hnswlib's own HNSW hyperparameters -- untuned
+	/// placeholders, like the rest of the defaults here. `metric`/`dtype` are
+	/// fixed for the cache's lifetime and checked against every VectorView passed in.
 	explicit ASRoutingCacheHnsw(std::uint32_t dim, std::size_t initial_capacity = 1024,
 														 double max_tombstone_ratio = 0.2, std::size_t M = 16,
 														 std::size_t ef_construction = 200,

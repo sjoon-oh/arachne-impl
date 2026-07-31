@@ -17,8 +17,8 @@ namespace arachne::stress::testsupport {
 /// Generates `count` random, dtype-encoded vectors (each `dim` elements),
 /// returned as raw byte buffers the caller keeps alive -- StressIndex/
 /// RoutingCache only ever borrow a pointer into these, exactly like a real
-/// caller's own vector storage would be borrowed (see HostRegionView's doc
-/// comment on Arachne never owning host memory).
+/// caller's vector storage would be borrowed (HostRegionView: Arachne never
+/// owns host memory).
 inline std::vector<std::vector<std::byte>> GenerateVectors(VectorDType dtype, std::uint32_t dim, std::size_t count,
 																														std::mt19937& rng) {
 	std::vector<std::vector<std::byte>> vectors(count);

@@ -20,13 +20,9 @@ struct TraverseTask {
 	std::chrono::steady_clock::time_point enqueued_at;
 	TraverseRequest request;
 	std::promise<TraverseResult> promise;
-	// Invoked on the execution worker thread, with the freshly computed
-	// result, right before the promise is fulfilled -- see
-	// OpScheduler::schedule(TraverseRequest, ...)'s own doc comment for why:
-	// this lets a caller (Controller) do result-dependent bookkeeping on the
-	// bounded set of worker threads instead of on whichever (unboundedly
-	// many, concurrent) thread happens to call future.get(). OpScheduler
-	// itself never interprets this -- same shape as start()'s
+	// Invoked on the execution worker thread, right before the promise is
+	// fulfilled -- see OpScheduler::schedule(TraverseRequest, ...)'s doc
+	// comment. OpScheduler never interprets this itself, same as start()'s
 	// on_worker_start callback.
 	std::function<void(const TraverseResult&)> on_complete;
 };
@@ -42,7 +38,21 @@ using ScheduledOperation = std::variant<TraverseTask, ModifyTask>;
 using ScheduledOperationQueue = std::deque<ScheduledOperation>;
 using ScheduledOperationBatch = std::vector<ScheduledOperation>;
 
-/// Pluggable dispatch/reorder policy for scheduling.
+/// Pluggable dispatch/reorder policy consulted by OpScheduler's planner
+/// thread (see op_scheduler.hpp) each time it needs to build a new batch out
+/// of the pending ScheduledOperationQueue: chooseBatchKind() picks Traverse
+/// vs. Modify, then selectCandidateIndex()/canAppendToBatch() are polled
+/// repeatedly to grow the batch one op at a time until it's full or no
+/// eligible candidate remains.
+///
+/// Every implementation must enforce one invariant regardless of its own
+/// ordering strategy: a batch must be mode-homogeneous, not just
+/// kind-homogeneous. OpScheduler dispatches a whole batch to exactly one of
+/// IAdapter's Host/Device entry points (adapter/index_adapter.hpp), so a
+/// candidate whose ExecutionMode (TraverseRequest::mode/ModifyRequest::mode)
+/// doesn't match the batch-in-progress's must be rejected by
+/// canAppendToBatch() -- there would be no single call correct for a mixed
+/// batch otherwise.
 class SchedulingPolicy {
  public:
 	virtual ~SchedulingPolicy() = default;
@@ -56,14 +66,9 @@ class SchedulingPolicy {
 			const ScheduledOperationQueue& queue, ScheduledKind batch_kind,
 			const ScheduledOperationBatch& current_batch) const = 0;
 
-	/// Additional per-candidate validation before appending. Implementations
-	/// must, at minimum, reject a candidate whose ExecutionMode
-	/// (TraverseRequest::mode/ModifyRequest::mode) doesn't match
-	/// `current_batch`'s (once non-empty) -- OpScheduler dispatches a whole
-	/// batch to exactly one of IAdapter's Host/Device entry points (see
-	/// adapter/index_adapter.hpp), so a batch must be mode-homogeneous, not
-	/// just kind-homogeneous, or there'd be no single call that's correct
-	/// for the whole thing.
+	/// Additional per-candidate validation before appending -- see class doc
+	/// comment for the mode-homogeneity invariant every implementation must
+	/// enforce here at minimum.
 	virtual bool canAppendToBatch(ScheduledKind batch_kind, const ScheduledOperation& candidate,
 																const ScheduledOperationBatch& current_batch) const = 0;
 };

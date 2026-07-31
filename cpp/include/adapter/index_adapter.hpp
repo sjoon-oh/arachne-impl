@@ -73,6 +73,43 @@ struct ModifyResult {
 /// *how*. Implementing this (plus IRegion) is the integration point for a
 /// concrete index -- left for a future, separate piece of work.
 ///
+/// Two parallel entry points per operation -- Host and Device -- because an
+/// index's own algorithm shape dictates which is worth implementing:
+///
+///        Controller's routing decision
+///     (ExecutionMode, Region GPU-residency)
+///                    |
+///     +--------------+---------------+
+///     | Hybrid, or GPU unavailable   | GpuOnly, region reported
+///     |                              | GPU-resident
+///     v                              v
+///   traverseHost() / modifyHost()   traverseDevice() / modifyDevice()
+///
+/// traverseHost()/modifyHost() are Host-orchestrated: the index may still
+/// reach GPU-resident data incrementally per step (ExecutionMode::Hybrid).
+/// This is the natural shape for a sequential, data-dependent walk (HNSW's
+/// greedy graph walk); every adapter must implement it as the baseline path.
+///
+/// traverseDevice()/modifyDevice() are Device-native: the whole batch runs
+/// together on GPU (e.g. one kernel launch, RAFT/CAGRA-style). Only worth
+/// overriding when the index's algorithm is hop-synchronized across the
+/// batch -- a loop calling host logic internally gets no benefit. Default
+/// throws std::logic_error rather than silently falling back to Host:
+/// reaching it means an adapter promoted a Region it can't actually serve
+/// from GPU, or forgot to override -- both bugs that should fail loudly
+/// rather than silently degrade to a host run, defeating the point of
+/// promoting the Region.
+///
+/// Batching (the `std::vector<...Request>` signature) is not GPU-specific:
+/// even host-only work can batch its own CPU-side work (e.g. SIMD distance
+/// computation across several queries at once). A caller wanting one
+/// request handled alone just passes a vector of size 1.
+///
+/// Every traverse*/modify* must return exactly one result per request, in
+/// the same order as `requests` -- OpScheduler (see executeTraverseBatch())
+/// matches results back to callers positionally and treats a mismatched
+/// count as every request in the batch having failed.
+///
 /// Thread-safety: OpScheduler (core/op_scheduler.hpp) may call
 /// traverseHost()/modifyHost()/traverseDevice()/modifyDevice() concurrently
 /// from as many worker threads as SchedulingConfig::max_execution_threads
@@ -86,50 +123,15 @@ class IAdapter {
  public:
 	virtual ~IAdapter() = default;
 
-	/// Host-orchestrated entry point: the index is free to do its own walk
-	/// here, touching GPU-resident data incrementally (e.g. per graph hop,
-	/// "offloading" a sub-computation -- see ExecutionMode::Hybrid) via
-	/// whatever handle Core hands it to reach promoted Regions. This is the
-	/// natural shape for an index whose own traversal is inherently
-	/// sequential/data-dependent (each step's target depends on the previous
-	/// step's result, as in HNSW's greedy graph walk) -- see
-	/// traverseDevice()'s doc comment for the alternative shape.
-	///
-	/// Takes a *vector* of requests -- not framed as "the single-request
-	/// case" -- because even a host-only index can often batch its own
-	/// CPU-side work (e.g. SIMD distance computation across several queries
-	/// at once); this isn't only for GPU-native batching. A caller wanting
-	/// one request handled in isolation just passes a vector of size 1.
-	/// Every adapter must implement this: it's the baseline, GPU-independent
-	/// path.
-	///
-	/// Must return exactly one result per request, in the same order as
-	/// `requests` -- OpScheduler (see executeTraverseBatch()) matches
-	/// results back to callers positionally and treats a mismatched count as
-	/// every request in the batch having failed.
+	/// Host-orchestrated baseline every adapter must implement -- see the
+	/// class doc above for the Host/Device split, batching rationale, and the
+	/// result-count/order contract.
 	virtual std::vector<TraverseResult> traverseHost(const std::vector<TraverseRequest>& requests) = 0;
 	virtual std::vector<ModifyResult> modifyHost(const std::vector<ModifyRequest>& requests) = 0;
 
-	/// Device-native entry point: every request in `requests` is handed to
-	/// the index together, to run natively on GPU -- e.g. a single kernel
-	/// launch (or a handful of them) spanning the whole batch, in the style
-	/// of RAFT's own CAGRA. This only pays off when the index's own
-	/// algorithm processes the batch hop-synchronized (every request's step
-	/// k computed together, then every request's step k+1, ...); an
-	/// override that just loops calling its own host logic internally gets
-	/// no benefit over traverseHost()/modifyHost() and shouldn't bother
-	/// overriding this at all.
-	///
-	/// Default implementation throws std::logic_error. Deliberately *not* a
-	/// silent fallback to traverseHost()/modifyHost(): Controller only ever
-	/// routes a request here when RegionManager reports the region is
-	/// genuinely GPU-promoted (see ExecutionMode::GpuOnly), so reaching this
-	/// default means either an adapter promoted a Region it can't actually
-	/// serve from GPU, or forgot to override this -- both are bugs that
-	/// should fail loudly during development, not silently degrade into
-	/// running on the host every time (which would defeat the entire point
-	/// of having promoted the Region, and is exactly the kind of silent
-	/// GpuOnly -> host fallback Controller itself was changed *not* to do).
+	/// Device-native path; see class doc above for when overriding this pays
+	/// off. Default throws std::logic_error rather than silently falling back
+	/// to Host -- deliberate, see class doc.
 	virtual std::vector<TraverseResult> traverseDevice(const std::vector<TraverseRequest>& requests);
 	virtual std::vector<ModifyResult> modifyDevice(const std::vector<ModifyRequest>& requests);
 

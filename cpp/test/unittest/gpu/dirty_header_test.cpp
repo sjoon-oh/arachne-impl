@@ -11,6 +11,11 @@ using arachne::gpu::kDirtyBitsPerWord;
 using arachne::gpu::kDirtyWordBytes;
 using arachne::gpu::LocateDirtyBit;
 
+// Validates the dirty-bitmap header sizing/indexing math in dirty_header.hpp
+// -- how many 64-bit words a header needs for a given region/subregion size,
+// and which {word_index, bit_index} a byte offset maps to. Pure arithmetic;
+// no GPU/device state involved.
+
 TEST(DirtyHeaderTest, ZeroSubregionBytesDisablesTracking) {
 	EXPECT_EQ(DirtyHeaderWords(4096, 0), 0u);
 	EXPECT_EQ(DirtyHeaderBytes(4096, 0), 0u);

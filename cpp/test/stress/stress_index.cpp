@@ -7,20 +7,22 @@
 
 #include "core/controller.hpp"
 
+// Implementation of StressRegion/StressIndex/BruteForceGroundTruth -- see
+// stress_index.hpp's file-level overview for the adapter's role and its
+// host buffer/Region layout. This file adds the mechanics: dtype-to-float
+// decoding for distance math (ElementToFloat below), the per-request
+// scan/insert/delete helpers, and the Region-registration/liveCount
+// bookkeeping used by the gtest stress stages and full_suite_app.cpp.
+
 namespace arachne::stress {
 
 namespace {
 
 // Decodes one dtype-encoded element as a float, purely for distance math --
-// the storage format itself is untouched (StressIndex never re-encodes a
-// vector; it just memcpy's whatever bytes the caller already provided in
-// `dtype`'s format). Deliberately a local, minimal implementation rather
-// than reaching into hnswlib's half_utils.h: hnswlib is meant to stay a
-// .cpp-only dependency of arachne_core itself, not something test code
-// reaches into directly (see routing_cache_hnsw_dtype_test.cpp's own local
-// ToHalfBits() for the same reasoning, mirrored here for the decode
-// direction). Subnormal half inputs are flushed to zero -- adequate for
-// distance-ordering purposes, not a general-purpose codec.
+// storage itself is untouched (StressIndex just memcpy's whatever bytes the
+// caller provided in `dtype`'s format). Local/minimal rather than reaching
+// into hnswlib's half_utils.h, since hnswlib stays a .cpp-only dependency of
+// arachne_core (mirrors routing_cache_hnsw_dtype_test.cpp's ToHalfBits()).
 float ElementToFloat(const void* base, std::uint32_t index, VectorDType dtype) {
 	switch (dtype) {
 		case VectorDType::Int8:

@@ -1,7 +1,9 @@
 #include "gpu/device_region_pool.hpp"
 
 #include <cuda_runtime.h>
+#include <rmm/aligned.hpp>
 
+#include <algorithm>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -19,6 +21,10 @@ void CheckCuda(cudaError_t status, const char* what) {
 	if (status != cudaSuccess) {
 		throw std::runtime_error(std::string(what) + ": " + cudaGetErrorString(status));
 	}
+}
+
+std::uint64_t RequiredUnits(std::size_t bytes, std::size_t unit_bytes) {
+	return (static_cast<std::uint64_t>(bytes) + unit_bytes - 1) / unit_bytes;
 }
 
 }  // namespace
@@ -54,21 +60,30 @@ DeviceRegionPool::Lease::~Lease() {
 // DeviceRegionPool
 // ---------------------------------------------------------------------------
 
-DeviceRegionPool::DeviceRegionPool(DeviceContext& device) : device_(device) {}
+DeviceRegionPool::DeviceRegionPool(DeviceContext& device, std::unique_ptr<CompactionPolicy> compaction_policy)
+		: device_(device),
+			compaction_policy_(compaction_policy != nullptr ? std::move(compaction_policy)
+																												: std::make_unique<TargetedCompactionPolicy>()) {}
 
+// Safety net, not the expected path: every Region should already have had
+// its device residency reclaimed via RegionManager::forget()/
+// removeDependency() before the pool backing it goes away. Reclaims
+// whatever is still outstanding rather than leaking it: event objects
+// always, and -- only under Normal, where each allocation owns its own
+// cudaMalloc'd block -- the device memory itself. Under Pooled there is
+// nothing more to do per-allocation: the arena's one big buffer is reclaimed
+// later, wholesale, by DeviceContext's own UnitPoolArena destructor.
 DeviceRegionPool::~DeviceRegionPool() {
-	// Safety net, not the expected path: every Region should have had its
-	// device residency reclaimed via RegionManager::forget()/removeDependency()
-	// (see core/region_manager.hpp) before the pool backing it goes away.
-	// Reclaim whatever is still outstanding (memory and any leftover Lease
-	// events) rather than leak.
+	bool pooled = device_.allocationPolicy() == AllocationPolicy::Pooled;
 	for (auto& [id, allocation] : allocations_) {
 		for (auto& [stream, event] : allocation.last_used_events) {
 			cudaEventDestroy(event);
 		}
-		resourceFor(allocation.kind)
-				.deallocate(device_.resources().get_stream(), allocation.device_ptr, allocation.bytes,
-										rmm::CUDA_ALLOCATION_ALIGNMENT);
+		if (!pooled) {
+			resourceFor(allocation.kind)
+					.deallocate(device_.resources().get_stream(), allocation.device_ptr, allocation.bytes,
+											rmm::CUDA_ALLOCATION_ALIGNMENT);
+		}
 	}
 }
 
@@ -80,6 +95,14 @@ cuda::mr::any_resource<cuda::mr::device_accessible>& DeviceRegionPool::resourceF
 		default:
 			return device_.dataResource();
 	}
+}
+
+UnitPoolArena& DeviceRegionPool::arenaFor(MemoryKind kind) {
+	// Always non-null here: every call site is already gated on
+	// device_.allocationPolicy() == Pooled, which is exactly when
+	// DeviceContext constructs both arenas.
+	UnitPoolArena* arena = (kind == MemoryKind::Metadata) ? device_.metadataArena() : device_.dataArena();
+	return *arena;
 }
 
 DeviceRegionPool::Allocation DeviceRegionPool::allocationFor(DeviceRegionHandle handle) {
@@ -100,13 +123,9 @@ void DeviceRegionPool::awaitQuiescentLocked(std::uint64_t id, std::unique_lock<s
 	auto it = allocations_.find(id);
 	if (it == allocations_.end()) return;  // freed by someone else while we waited
 
-	// Every recorded event already happened in the past (its stream reached
-	// that point) or will happen without anything further needed from us --
-	// enqueueing a wait for each one on our own canonical stream makes
-	// whatever we enqueue on that stream next (a deallocate or a
-	// cudaMemcpyAsync) correctly ordered after all of them, without
-	// host-blocking. Once enqueued, the dependency is permanent, so the
-	// event objects themselves are no longer needed.
+	// Enqueue a wait for each recorded event on our own canonical stream so
+	// whatever we enqueue next (deallocate/relocation copy/memcpy) is ordered
+	// after all of them, without host-blocking -- the events are then unneeded.
 	for (auto& [stream, event] : it->second.last_used_events) {
 		cudaStreamWaitEvent(device_.resources().get_stream().value(), event, 0);
 		cudaEventDestroy(event);
@@ -138,12 +157,49 @@ void DeviceRegionPool::release(DeviceRegionHandle handle, cudaStream_t stream) {
 }
 
 DeviceRegionHandle DeviceRegionPool::allocate(std::size_t bytes, MemoryKind kind) {
+	if (device_.allocationPolicy() == AllocationPolicy::Pooled) return allocatePooled(bytes, kind);
+	return allocateNormal(bytes, kind);
+}
+
+DeviceRegionHandle DeviceRegionPool::allocateNormal(std::size_t bytes, MemoryKind kind) {
 	void* ptr = resourceFor(kind).allocate(device_.resources().get_stream(), bytes,
 																					rmm::CUDA_ALLOCATION_ALIGNMENT);
 
 	std::lock_guard<std::mutex> lock(mutex_);
 	std::uint64_t id = next_id_++;
-	allocations_.emplace(id, Allocation{ptr, bytes, kind});
+	Allocation allocation;
+	allocation.device_ptr = ptr;
+	allocation.bytes = bytes;
+	allocation.kind = kind;
+	allocations_.emplace(id, std::move(allocation));
+	return DeviceRegionHandle{id};
+}
+
+DeviceRegionHandle DeviceRegionPool::allocatePooled(std::size_t bytes, MemoryKind kind) {
+	std::unique_lock<std::mutex> lock(mutex_);
+	UnitPoolArena& arena = arenaFor(kind);
+	std::uint64_t units = RequiredUnits(bytes, arena.unitBytes());
+
+	std::optional<UnitPoolArena::UnitRange> range = arena.allocateBestFit(units);
+	if (!range.has_value()) {
+		// One self-heal attempt to open exactly enough contiguous space for
+		// *this* request (see tryOpenContiguousExtentLocked() below). Return
+		// value ignored -- only whether the retry below now succeeds matters.
+		tryOpenContiguousExtentLocked(kind, units, lock);
+		range = arena.allocateBestFit(units);
+	}
+	if (!range.has_value()) {
+		throw std::runtime_error("DeviceRegionPool::allocate: insufficient contiguous space for " +
+															std::to_string(bytes) + " bytes under AllocationPolicy::Pooled");
+	}
+
+	std::uint64_t id = next_id_++;
+	Allocation allocation;
+	allocation.device_ptr = arena.pointerFor(*range);
+	allocation.bytes = bytes;
+	allocation.kind = kind;
+	allocation.unit_range = *range;
+	allocations_.emplace(id, std::move(allocation));
 	return DeviceRegionHandle{id};
 }
 
@@ -167,6 +223,25 @@ std::optional<DeviceRegionHandle> DeviceRegionPool::tryAllocate(std::size_t byte
 	}
 }
 
+// Cross-stream hand-off: a Lease's release() on one stream only records an
+// event, it doesn't wait for the GPU to catch up (see Lease's doc comment)
+// -- so before handing out a Lease on `stream`, acquire() must make
+// `stream`'s upcoming work wait on every *other* stream's still-pending
+// release event first, via a GPU-side cudaStreamWaitEvent (never a host
+// block):
+//
+//   stream A: ...kernel...--release()-->[event A]
+//   stream B: acquire() --cudaStreamWaitEvent(B,eventA)--> ...kernel...
+//                          (event A now consumed: destroyed + erased)
+//
+// This is what lets independent streams (per-worker compute streams, the
+// management stream) safely interleave access to the same allocation --
+// without it they'd share no ordering at all, since they no longer share
+// one canonical stream's implicit FIFO order. Consuming each waited-on event
+// is safe because `stream`'s own future release() event will already be
+// ordered-after everything that entry represented, so a later acquire() on
+// some third stream only needs to wait on `stream`'s eventual release, not
+// re-wait on this one too.
 DeviceRegionPool::Lease DeviceRegionPool::acquire(DeviceRegionHandle handle, cudaStream_t stream) {
 	ARACHNE_TRACE_SCOPE("DeviceRegionPool", "acquire");
 	std::lock_guard<std::mutex> lock(mutex_);
@@ -175,23 +250,9 @@ DeviceRegionPool::Lease DeviceRegionPool::acquire(DeviceRegionHandle handle, cud
 		throw std::invalid_argument("DeviceRegionPool::acquire: handle is not a live allocation");
 	}
 
-	// Cross-stream safety: if some other stream's now-released Lease on this
-	// allocation might still have work in flight, make `stream`'s upcoming
-	// work wait for it -- via a GPU-side cudaStreamWaitEvent, not a host
-	// block -- before handing out a Lease on `stream`. This is what lets
-	// multiple streams (per-worker compute streams, the management stream --
-	// see DeviceContext::workerStream()/managementStream()) safely interleave
-	// access to the same Region: without it, a kernel on one stream and a
-	// promotion/eviction/write-back copy on another could touch the same
-	// device memory with no ordering between them at all, since they no
-	// longer share one canonical stream's implicit FIFO ordering. Consumes
-	// (destroys and erases) every event it waits on: `stream`'s own future
-	// work -- and the event it will eventually record at its own release()
-	// -- is now guaranteed ordered-after everything those events
-	// represented, so a later acquire() on yet another stream only needs to
-	// wait on `stream`'s own eventual release() event, not re-wait on these.
-	// Entries already on `stream` itself are left alone -- same-stream
-	// ordering is already implicit in CUDA's own enqueue order.
+	// Wait on every *other* stream's pending event (see overview above);
+	// entries already on `stream` are left alone -- same-stream ordering is
+	// already implicit in CUDA's own enqueue order.
 	for (auto event_it = it->second.last_used_events.begin(); event_it != it->second.last_used_events.end();) {
 		if (event_it->first == stream) {
 			++event_it;
@@ -212,6 +273,11 @@ DeviceRegionPool::Lease DeviceRegionPool::acquire(DeviceRegionHandle handle) {
 
 void DeviceRegionPool::free(DeviceRegionHandle handle) {
 	ARACHNE_TRACE_SCOPE("DeviceRegionPool", "free");
+	if (device_.allocationPolicy() == AllocationPolicy::Pooled) return freePooled(handle);
+	return freeNormal(handle);
+}
+
+void DeviceRegionPool::freeNormal(DeviceRegionHandle handle) {
 	Allocation allocation;
 	{
 		std::unique_lock<std::mutex> lock(mutex_);
@@ -230,6 +296,23 @@ void DeviceRegionPool::free(DeviceRegionHandle handle) {
 	resourceFor(allocation.kind)
 			.deallocate(device_.resources().get_stream(), allocation.device_ptr, allocation.bytes,
 									rmm::CUDA_ALLOCATION_ALIGNMENT);
+}
+
+void DeviceRegionPool::freePooled(DeviceRegionHandle handle) {
+	std::unique_lock<std::mutex> lock(mutex_);
+	auto it = allocations_.find(handle.id);
+	if (it == allocations_.end()) return;
+
+	awaitQuiescentLocked(handle.id, lock);  // may block until every Lease is released
+
+	it = allocations_.find(handle.id);
+	if (it == allocations_.end()) return;  // freed by someone else while we waited
+
+	// Unlike freeNormal(), this is pure host-side bookkeeping (arenaFor()'s
+	// buffer was preallocated once, not touched per-Region) -- safe to do
+	// while still holding mutex_.
+	arenaFor(it->second.kind).free(it->second.unit_range);
+	allocations_.erase(it);
 }
 
 void DeviceRegionPool::copyFromHost(DeviceRegionHandle handle, const void* host_src, std::size_t bytes,
@@ -295,88 +378,93 @@ std::size_t DeviceRegionPool::bytesAllocated(MemoryKind kind) const {
 	return total;
 }
 
-DeviceRegionPool::CompactionResult DeviceRegionPool::compact(MemoryKind kind) {
+DeviceRegionPool::CompactionResult DeviceRegionPool::compact(MemoryKind kind, std::size_t required_bytes) {
 	ARACHNE_TRACE_SCOPE("DeviceRegionPool", "compact");
-	if (device_.allocationPolicy() == AllocationPolicy::Naive) {
-		// No shared arena under Naive -- see the declaration's doc comment.
+	if (device_.allocationPolicy() != AllocationPolicy::Pooled) {
+		// No shared arena under Normal -- see the declaration's doc comment.
 		return {};
 	}
 
 	std::unique_lock<std::mutex> lock(mutex_);
+	UnitPoolArena& arena = arenaFor(kind);
+	std::uint64_t required_units = RequiredUnits(required_bytes, arena.unitBytes());
+	return tryOpenContiguousExtentLocked(kind, required_units, lock);
+}
 
-	std::size_t live_bytes = 0;
+// The shared snapshot -> plan -> execute pipeline both allocatePooled()'s
+// internal self-heal retry and the public compact() are built on -- the
+// only difference between those two callers is *when* they invoke this
+// (allocatePooled(): reactively, only after its own best-fit already
+// failed; compact(): proactively, on explicit caller request):
+//
+//   allocations_ (kind, in_use_count==0)      arena.freeExtentsByAddress()
+//              |                                         |
+//              `------------> compaction_policy_->plan() <'
+//                                    |
+//                              Plan{moves[], feasible}
+//                                    |
+//              for each move, in order (mutex_ held throughout):
+//                re-validate block still present & unpinned  (cheap
+//                  insurance -- can't actually fail, nothing has changed
+//                  since the snapshot above)
+//                awaitQuiescentLocked()  (non-blocking: already unpinned)
+//                arena.claim(to) -> arena.relocate(from, to)  (D2D copy)
+//                update device_ptr/unit_range -> arena.free(from)
+//
+// Requires mutex_ already held via `lock`. Returns {} without ever
+// consulting compaction_policy_ if `kind`'s largest free extent already
+// satisfies required_units (nothing to do) or its totalFreeUnits() doesn't
+// (genuine shortfall -- no plan can help).
+DeviceRegionPool::CompactionResult DeviceRegionPool::tryOpenContiguousExtentLocked(
+		MemoryKind kind, std::uint64_t required_units, std::unique_lock<std::mutex>& lock) {
+	// Own trace scope, distinct from "compact"'s parent scope, since this also
+	// runs from allocatePooled()'s self-heal retry -- otherwise that path's
+	// relocation cost was silently folded into "tryAllocate"'s own duration.
+	ARACHNE_TRACE_SCOPE("DeviceRegionPool", "tryOpenContiguousExtentLocked");
+	UnitPoolArena& arena = arenaFor(kind);
+
+	if (arena.largestFreeExtent() >= required_units) return {};  // nothing to do
+	if (arena.totalFreeUnits() < required_units) return {};      // genuine shortfall -- no plan can help
+
+	std::vector<MovableBlock> movable;
 	for (const auto& [id, allocation] : allocations_) {
-		if (allocation.kind == kind) live_bytes += allocation.bytes;
+		if (allocation.kind != kind) continue;
+		if (allocation.in_use_count != 0) continue;  // pinned -- never offered, never waited on
+		movable.push_back(MovableBlock{id, allocation.unit_range});
 	}
-	if (live_bytes == 0) return {};
+	std::sort(movable.begin(), movable.end(), [](const MovableBlock& a, const MovableBlock& b) {
+		return a.range.start_unit < b.range.start_unit;
+	});
 
-	struct Move {
-		std::uint64_t id;
-		void* new_ptr;
-		void* old_ptr;
-		std::size_t bytes;
-	};
-	std::vector<Move> moves;
-	moves.reserve(allocations_.size());
+	CompactionPolicy::Plan plan = compaction_policy_->plan(arena, movable, required_units);
+	if (!plan.feasible) return {};
 
-	// Phase 1: for every live allocation of `kind`, wait out any outstanding
-	// Lease on it (awaitQuiescentLocked -- the same mechanism free() uses),
-	// then allocate a fresh block and enqueue a device-to-device copy on
-	// DeviceContext's stream. All copies (and the waits enqueued ahead of
-	// them) share that one stream, so they execute in enqueue order and a
-	// single sync below is enough to know every one of them has landed.
-	try {
-		// Snapshot ids first: awaitQuiescentLocked can release/reacquire
-		// `lock` while waiting, so iterating allocations_ directly while
-		// calling it would risk iterator invalidation if anything else
-		// mutates the map in that window.
-		std::vector<std::uint64_t> candidates;
-		for (const auto& [id, allocation] : allocations_) {
-			if (allocation.kind == kind) candidates.push_back(id);
+	std::size_t relocated_count = 0;
+	std::size_t bytes_relocated = 0;
+	cudaStream_t stream = device_.managementStream();
+
+	for (const CompactionPolicy::Move& move : plan.moves) {
+		auto it = allocations_.find(move.block_id);
+		if (it == allocations_.end() || it->second.in_use_count != 0) {
+			// Can't actually happen (mutex_ has been held continuously since the
+			// `movable` snapshot above) -- cheap insurance against ever acting
+			// on a stale plan entry.
+			continue;
 		}
 
-		for (std::uint64_t id : candidates) {
-			awaitQuiescentLocked(id, lock);
+		awaitQuiescentLocked(move.block_id, lock);  // non-blocking here: in_use_count is already 0
 
-			auto it = allocations_.find(id);
-			if (it == allocations_.end()) continue;  // freed while we waited -- nothing to move
+		arena.claim(move.to);
+		arena.relocate(move.from, move.to, stream);
+		it->second.device_ptr = arena.pointerFor(move.to);
+		it->second.unit_range = move.to;
+		arena.free(move.from);
 
-			Allocation& allocation = it->second;
-			void* new_ptr = resourceFor(kind).allocate(device_.resources().get_stream(), allocation.bytes,
-																									 rmm::CUDA_ALLOCATION_ALIGNMENT);
-			CheckCuda(cudaMemcpyAsync(new_ptr, allocation.device_ptr, allocation.bytes,
-																 cudaMemcpyDeviceToDevice, device_.resources().get_stream().value()),
-								"DeviceRegionPool::compact: cudaMemcpyAsync");
-			moves.push_back(Move{id, new_ptr, allocation.device_ptr, allocation.bytes});
-		}
-	} catch (...) {
-		// Unwind whatever we already allocated for this attempt before
-		// propagating -- the original allocations are all still intact and
-		// untouched (we haven't reached Phase 2 yet), so this is safe to bail
-		// out of cleanly.
-		for (const Move& move : moves) {
-			resourceFor(kind).deallocate(device_.resources().get_stream(), move.new_ptr, move.bytes,
-																		rmm::CUDA_ALLOCATION_ALIGNMENT);
-		}
-		throw;
+		++relocated_count;
+		bytes_relocated += it->second.bytes;
 	}
 
-	device_.resources().sync_stream();
-
-	// Phase 2: every copy has landed -- swap in the new pointers, then free
-	// the old blocks.
-	for (const Move& move : moves) {
-		auto it = allocations_.find(move.id);
-		if (it != allocations_.end()) it->second.device_ptr = move.new_ptr;
-	}
-	for (const Move& move : moves) {
-		resourceFor(kind).deallocate(device_.resources().get_stream(), move.old_ptr, move.bytes,
-																	rmm::CUDA_ALLOCATION_ALIGNMENT);
-	}
-
-	ARACHNE_LOG_DEBUG("DeviceRegionPool::compact: relocated {} allocation(s), {} bytes", moves.size(),
-										 live_bytes);
-	return CompactionResult{moves.size(), live_bytes};
+	return CompactionResult{relocated_count, bytes_relocated};
 }
 
 }  // namespace arachne::gpu

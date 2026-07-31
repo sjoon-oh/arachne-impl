@@ -6,10 +6,10 @@ namespace arachne::util {
 
 /// SIMD-accelerated vector math (Google Highway underneath, dispatched at
 /// runtime to the best available target -- AVX-512/AVX2/SSE4/NEON/scalar --
-/// for the CPU actually running, not just the one this was compiled on).
-/// Highway is an impl-only dependency: this header declares plain float*
-/// signatures, so nothing that only includes it needs Highway on its
-/// include path (see distance.cpp).
+/// for the CPU actually running, not just the one this was compiled on; see
+/// distance.cpp for the dispatch mechanics). Highway is an impl-only
+/// dependency: this header declares plain float* signatures, so nothing
+/// that only includes it needs Highway on its include path.
 ///
 /// These are generic vector-math building blocks for Arachne's own
 /// control-plane code (currently ASRoutingCacheHnsw's Cosine-metric

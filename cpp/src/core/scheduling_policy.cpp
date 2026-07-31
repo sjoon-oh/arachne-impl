@@ -43,9 +43,7 @@ bool FifoSchedulingPolicy::canAppendToBatch(ScheduledKind batch_kind, const Sche
 													 : std::holds_alternative<ModifyTask>(candidate);
 	if (!kind_matches) return false;
 
-	// A batch is dispatched to exactly one IAdapter Host/Device entry
-	// point, so every member must share the same ExecutionMode -- see
-	// canAppendToBatch()'s doc comment.
+	// Mode-homogeneity invariant -- see SchedulingPolicy's class doc comment.
 	return current_batch.empty() || ModeOf(candidate) == ModeOf(current_batch.front());
 }
 

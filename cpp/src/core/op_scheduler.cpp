@@ -186,12 +186,10 @@ ScheduledKind OpScheduler::kindOf(const ScheduledOperation& op) const {
 }
 
 std::size_t OpScheduler::targetBatchSizeFor(ScheduledKind kind) const {
-	// Reads traverse_batch_size_/modify_batch_size_ directly rather than going
-	// through the locking batchSizeValue() -- this is only ever called from
-	// plannerLoop(), which already holds mutex_ (via the unique_lock it took
-	// for cv_incoming_.wait()) for the entire loop body; going through
-	// batchSizeValue()'s std::scoped_lock here would try to re-lock the same
-	// non-recursive mutex_ and deadlock.
+	// Reads the fields directly rather than through the locking
+	// batchSizeValue() -- only called from plannerLoop(), which already holds
+	// mutex_ for the whole loop body; re-locking the non-recursive mutex_
+	// would deadlock.
 	return kind == ScheduledKind::Traverse ? traverse_batch_size_ : modify_batch_size_;
 }
 

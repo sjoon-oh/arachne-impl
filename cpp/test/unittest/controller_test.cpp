@@ -19,10 +19,34 @@ namespace {
 
 using namespace arachne;
 
-// ---------------------------------------------------------------------------
-// Test doubles: a minimal IRegion/IAdapter/RoutingCache good enough to
-// drive Controller's promotion/eviction machinery without a real index.
-// ---------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
+// Tests for Controller's GPU-residency machinery: promotion, eviction, and
+// dirty-region write-back, driven purely through insert()/acquireRegion()/
+// remove() against minimal test doubles (no real index, no real GPU adapter
+// logic).
+//
+// Test doubles:
+//  - FakeRegion / FakeAdapter: a minimal IRegion/IAdapter pair. FakeAdapter's
+//    traverseHost() reports whatever RegionFootprint the test sets on
+//    next_touched just before each insert(), standing in for a real index's
+//    locality decision; modifyHost() always succeeds and echoes back the
+//    request's scope.
+//  - FakeRoutingCache: always reports "no match", keeping every insert on
+//    the Hybrid path so tests exercise promoteAnchor()'s capacity/eviction
+//    logic via commitInsert(), not query routing.
+//  - MakeRecord(): builds a single-float Record for insert().
+//  - PokeDevice(): writes bytes directly into a region's device allocation
+//    via acquireRegion(), simulating "a kernel just wrote here" (payload) or
+//    "a kernel just atomicOr'd a dirty bit" (header), so eviction's
+//    writeBackDirtyRegions() dirty-vs-clean behavior can be tested.
+//
+// ControllerGpuResidencyTest covers: promotion allocates GPU memory and
+// copies host data; eviction reclaims exactly as many victims as needed
+// (including multi-victim evictions); eviction writes back only dirty
+// regions (or always, when no dirty header exists); eviction batches
+// multiple regions belonging to one anchor into a single evictAnchor() call;
+// and insert() rejects duplicate ids without disturbing existing state.
+// -----------------------------------------------------------------------------
 
 class FakeRegion : public IRegion {
  public:
@@ -43,14 +67,9 @@ class FakeRegion : public IRegion {
 	std::uint64_t epoch_ = 0;
 };
 
-// IAdapter double. traverseHost() reports `next_touched` as every returned
-// TraverseResult::touched -- Promotion is driven by this (see
-// Controller::commitInsert()'s doc comment), so the test sets this before
-// each Controller::insert() call, standing in for whatever a real index's
-// lookup-traversal logic would decide is this Anchor's locality.
-// modifyHost() always succeeds and echoes the request's own scope back as
-// ModifyResult::touched -- ModifyResult::modified is left at its default
-// (empty): nothing in Controller reads it anymore.
+// traverseHost() reports next_touched as every TraverseResult::touched,
+// driving promotion (see Controller::commitInsert()); modifyHost() always
+// succeeds and echoes the request's scope back as ModifyResult::touched.
 class FakeAdapter : public IAdapter {
  public:
 	std::vector<TraverseResult> traverseHost(const std::vector<TraverseRequest>& requests) override {
@@ -113,12 +132,10 @@ Record MakeRecord(VectorId id, const float& value) {
 	return record;
 }
 
-// Writes `bytes` into the device allocation backing `region` at `offset`,
-// synchronously, via the same public acquireRegion() seam a real adapter's
-// write kernel would use -- standing in for "a kernel just wrote here" (for
-// the payload) or "a kernel just atomicOr'd a dirty bit" (for the header).
-// The acquired Lease is released (falls out of scope) before returning, so
-// a subsequent eviction's free() doesn't block on it.
+// Writes `bytes` directly into `region`'s device allocation via
+// acquireRegion(), simulating "a kernel wrote here" (payload) or "a kernel
+// atomicOr'd a dirty bit" (header). The Lease releases before returning so
+// a later eviction's free() doesn't block on it.
 void PokeDevice(Controller& controller, RegionId region, std::size_t offset, const std::vector<std::byte>& bytes) {
 	RegionAccess access = controller.acquireRegion(region);
 	ASSERT_TRUE(access.on_device);
@@ -167,16 +184,16 @@ TEST(ControllerGpuResidencyTest, PromoteAllocatesGpuMemoryAndCopiesHostData) {
 TEST(ControllerGpuResidencyTest, PromoteEvictsMultipleVictimsWhenOneIsNotEnoughCapacity) {
 	FakeAdapter adapter;
 	FakeRoutingCache routing_cache;
-	// Budget holds exactly 3 "small" (256-byte) regions. Promoting a 4th,
-	// "big" (512-byte) region can't be satisfied by reclaiming just one of
-	// them (freeing 256 still leaves only 256 of the 512 needed) -- it must
-	// evict two, proving promoteAnchor()'s eviction loop doesn't stop after
-	// a single victim. Sizes are multiples of 256 -- rmm::mr::pool_memory_resource
-	// requires the initial pool size to be 256-byte aligned.
+	// Budget holds exactly 3 small (256B) regions; promoting a 4th, big
+	// (512B) region can't be satisfied by evicting just one (256 < 512), so
+	// this proves promoteAnchor()'s eviction loop keeps going past a single
+	// victim. gpu_unit_bytes == kSmallBytes avoids unit-rounding slack.
 	constexpr std::size_t kSmallBytes = 256;
 	constexpr std::size_t kBigBytes = 512;
 	Controller controller(adapter, routing_cache, SchedulingConfig{}, nullptr,
-												 /*gpu_data_budget_bytes=*/3 * kSmallBytes, gpu::kDefaultMetadataPoolBytes);
+												 /*gpu_data_budget_bytes=*/3 * kSmallBytes, gpu::kDefaultMetadataPoolBytes,
+												 /*gpu_unit_bytes=*/kSmallBytes, /*compaction_policy=*/nullptr, /*coordinator_config=*/{},
+												 gpu::AllocationPolicy::Pooled);
 
 	std::vector<std::byte> data_a(kSmallBytes, std::byte{0xA});
 	std::vector<std::byte> data_b(kSmallBytes, std::byte{0xB});
@@ -217,12 +234,9 @@ TEST(ControllerGpuResidencyTest, PromoteEvictsMultipleVictimsWhenOneIsNotEnoughC
 TEST(ControllerGpuResidencyTest, EvictionWritesBackOnlyWhenDirty) {
 	FakeAdapter adapter;
 	FakeRoutingCache routing_cache;
-	// Two regions with subregion tracking enabled (a real header exists):
-	// 248-byte payload, 124-byte subregions -> 2 subregions -> one 8-byte
-	// header word -> 256 bytes total per region. Sized so the budget below
-	// (region_bytes * 2) is a multiple of 256, since
-	// rmm::mr::pool_memory_resource requires the initial pool size to be
-	// 256-byte aligned.
+	// Two regions with subregion tracking enabled (a real dirty header
+	// exists): 248B payload + 124B subregions -> one 8B header word -> 256B
+	// per region. Budget holds exactly 2 (gpu_unit_bytes == region_bytes).
 	constexpr std::size_t kPayloadBytes = 248;
 	constexpr std::size_t kSubregionBytes = 124;
 	const std::size_t header_bytes = gpu::DirtyHeaderBytes(kPayloadBytes, kSubregionBytes);
@@ -231,7 +245,9 @@ TEST(ControllerGpuResidencyTest, EvictionWritesBackOnlyWhenDirty) {
 	ASSERT_EQ(region_bytes, 256u);
 
 	Controller controller(adapter, routing_cache, SchedulingConfig{}, nullptr,
-												 /*gpu_data_budget_bytes=*/2 * region_bytes, gpu::kDefaultMetadataPoolBytes);
+												 /*gpu_data_budget_bytes=*/2 * region_bytes, gpu::kDefaultMetadataPoolBytes,
+												 /*gpu_unit_bytes=*/region_bytes, /*compaction_policy=*/nullptr, /*coordinator_config=*/{},
+												 gpu::AllocationPolicy::Pooled);
 
 	std::vector<std::byte> data_dirty(kPayloadBytes, std::byte{0x11});
 	std::vector<std::byte> data_clean(kPayloadBytes, std::byte{0x22});
@@ -299,12 +315,12 @@ TEST(ControllerGpuResidencyTest, EvictionAlwaysWritesBackWhenNoHeaderExists) {
 	// back (see writeBackDirtyRegions()'s doc comment).
 	FakeAdapter adapter;
 	FakeRoutingCache routing_cache;
-	// 256-byte regions, budget for exactly one at a time -- rmm::mr::
-	// pool_memory_resource requires the initial pool size to be a multiple
-	// of 256 bytes.
+	// 256-byte regions, budget for exactly one at a time -- gpu_unit_bytes
+	// below is set to kBytes, so each region occupies exactly one arena unit.
 	constexpr std::size_t kBytes = 256;
 	Controller controller(adapter, routing_cache, SchedulingConfig{}, nullptr, /*gpu_data_budget_bytes=*/kBytes,
-												 gpu::kDefaultMetadataPoolBytes);
+												 gpu::kDefaultMetadataPoolBytes, /*gpu_unit_bytes=*/kBytes, /*compaction_policy=*/nullptr,
+												 /*coordinator_config=*/{}, gpu::AllocationPolicy::Pooled);
 
 	std::vector<std::byte> data_a(kBytes, std::byte{0x11});
 	std::vector<std::byte> data_b(kBytes, std::byte{0x22});
@@ -332,12 +348,10 @@ TEST(ControllerGpuResidencyTest, EvictionAlwaysWritesBackWhenNoHeaderExists) {
 }
 
 TEST(ControllerGpuResidencyTest, EvictionBatchesMultipleRegionsFromOneAnchorInOneCall) {
-	// One anchor depending on two Regions at once -- evicting it reclaims
-	// both in a single evictAnchor() call, exercising
-	// writeBackDirtyRegions()'s n > 1 batched-gather path (as opposed to the
-	// other tests here, which only ever evict one Region-per-anchor at a
-	// time). Region 1 is dirty, Region 2 is clean; both should still be
-	// correctly distinguished despite going through the same batch.
+	// One anchor depends on two regions at once; evicting it reclaims both
+	// in a single evictAnchor() call, exercising writeBackDirtyRegions()'s
+	// n > 1 batched-gather path. Region 1 is dirty, region 2 is clean --
+	// both must still be correctly distinguished within the same batch.
 	FakeAdapter adapter;
 	FakeRoutingCache routing_cache;
 	constexpr std::size_t kPayloadBytes = 248;
@@ -350,7 +364,9 @@ TEST(ControllerGpuResidencyTest, EvictionBatchesMultipleRegionsFromOneAnchorInOn
 	// region 3 needs its own room too -- forces evicting anchor 401
 	// entirely (both its regions) before region 3 fits.
 	Controller controller(adapter, routing_cache, SchedulingConfig{}, nullptr,
-												 /*gpu_data_budget_bytes=*/2 * region_bytes, gpu::kDefaultMetadataPoolBytes);
+												 /*gpu_data_budget_bytes=*/2 * region_bytes, gpu::kDefaultMetadataPoolBytes,
+												 /*gpu_unit_bytes=*/region_bytes, /*compaction_policy=*/nullptr, /*coordinator_config=*/{},
+												 gpu::AllocationPolicy::Pooled);
 
 	std::vector<std::byte> data_dirty(kPayloadBytes, std::byte{0x11});
 	std::vector<std::byte> data_clean(kPayloadBytes, std::byte{0x22});
@@ -400,7 +416,8 @@ TEST(ControllerGpuResidencyTest, InsertRejectsDuplicateIdWithoutTouchingExisting
 	FakeRoutingCache routing_cache;
 	constexpr std::size_t kBytes = 256;
 	Controller controller(adapter, routing_cache, SchedulingConfig{}, nullptr, /*gpu_data_budget_bytes=*/kBytes,
-												 gpu::kDefaultMetadataPoolBytes);
+												 gpu::kDefaultMetadataPoolBytes, /*gpu_unit_bytes=*/kBytes, /*compaction_policy=*/nullptr,
+												 /*coordinator_config=*/{}, gpu::AllocationPolicy::Pooled);
 
 	std::vector<std::byte> host_data(kBytes, std::byte{0x42});
 	HostRegionView host{host_data.data(), kBytes, 0};

@@ -23,6 +23,26 @@ using arachne::RegionManager;
 using arachne::ReplacementPolicy;
 using arachne::VectorId;
 
+// -----------------------------------------------------------------------------
+// Tests for RegionManager: registration, the anchor<->region dependency
+// graph (addDependency/removeDependency/forget), lease/device residency
+// bookkeeping (setLease/setDevice/clearResidency), the recordTraversal()
+// hotness-fan-out signal, and requestPromotion()'s enqueue-only contract on
+// the calling thread. No Coordinator/adapter/GPU is involved anywhere in
+// this file -- see region_manager_coordinator_test.cpp for that.
+//
+// Fixtures:
+//  - RecordedPolicyEvents / RecordingReplacementPolicy: a ReplacementPolicy
+//    double that records every enqueueCandidate()/onAnchorEvicted()/
+//    onAnchorTouched() call verbatim and never returns a candidate,
+//    isolating exactly which hooks RegionManager calls and when.
+//
+// RegionManagerStressTest covers many-thread concurrent churn: proving the
+// mutex-guarded bookkeeping doesn't deadlock/corrupt, and one specific
+// correctness property -- exactly one "last dependent" event fires per
+// Region even under heavy racing add/remove/forget traffic.
+// -----------------------------------------------------------------------------
+
 // Everything a RecordingReplacementPolicy has observed, kept outside the
 // policy object itself (which RegionManager takes ownership of via
 // unique_ptr) so a test can still inspect it after construction.
@@ -32,13 +52,10 @@ struct RecordedPolicyEvents {
 	std::vector<VectorId> touched;
 };
 
-// Records every notification it receives verbatim (no dedup/filtering of its
-// own), and never offers a candidate back out (onRelocationTrigger()/
-// selectNextPromotionCandidate()/selectNextEvictionCandidate() all report
-// "nothing to do") -- purpose-built to observe exactly which
-// ReplacementPolicy hooks RegionManager calls, when, and how many times, in
-// isolation from replacement_policy_test.cpp's own FifoReplacementPolicy
-// coverage of a real policy's *reaction* to the same hooks.
+// Records every RegionManager -> ReplacementPolicy notification verbatim,
+// and never offers a candidate back out -- isolates which hooks
+// RegionManager calls, when, and how often, separately from
+// replacement_policy_test.cpp's coverage of a real policy's reactions.
 class RecordingReplacementPolicy : public ReplacementPolicy {
  public:
 	explicit RecordingReplacementPolicy(RecordedPolicyEvents* events) : events_(events) {}
@@ -231,11 +248,9 @@ TEST(RegionManagerTest, SharedRegionExposesTheSameLeaseToEveryDependent) {
 }
 
 // ---------------------------------------------------------------------------
-// recordTraversal(): the traverse-level hotness signal (see
-// core/replacement_policy.hpp's onAnchorTouched() doc comment) -- exercised
-// directly against RegionManager's dependency graph, with no Coordinator/
-// adapter/GPU involved, since fan-out from touched Regions to dependent
-// Anchors is pure bookkeeping.
+// recordTraversal(): the traverse-level hotness signal (onAnchorTouched(),
+// see replacement_policy.hpp) exercised directly against the dependency
+// graph -- no Coordinator/adapter/GPU involved; fan-out is pure bookkeeping.
 // ---------------------------------------------------------------------------
 
 TEST(RegionManagerTest, RecordTraversalNotifiesEveryDependentAnchorOfEachTouchedRegion) {
@@ -296,14 +311,10 @@ TEST(RegionManagerTest, RecordTraversalOfEmptyFootprintIsANoop) {
 }
 
 // ---------------------------------------------------------------------------
-// requestPromotion(): a pure enqueue onto RegionManager's own MPSC intake
-// queue (pending_promotions_) -- must *not* touch replacement_policy_ at all
-// on the calling thread. Only the Coordinator thread (started via start())
-// ever drains that queue and hands candidates to the policy via
-// enqueueCandidate() -- see the class doc comment (region_manager.hpp) and
-// ReplacementPolicy::enqueueCandidate()'s own doc comment for why. This test
-// never calls start(), so if requestPromotion() ever touched the policy
-// directly, events.enqueued would already be non-empty here.
+// requestPromotion() only enqueues onto RegionManager's own MPSC intake
+// queue -- it must not touch replacement_policy_ on the calling thread.
+// Only the Coordinator (start()) drains it and calls enqueueCandidate(),
+// so a direct touch here would already show up in events.enqueued.
 // ---------------------------------------------------------------------------
 
 TEST(RegionManagerTest, RequestPromotionDoesNotTouchReplacementPolicyDirectly) {
@@ -319,12 +330,10 @@ TEST(RegionManagerTest, RequestPromotionDoesNotTouchReplacementPolicyDirectly) {
 }
 
 // ---------------------------------------------------------------------------
-// Stress tests: many threads hammering the same RegionManager concurrently.
-// The primary thing these prove is that the mutex-guarded bookkeeping
-// doesn't deadlock or corrupt itself under heavy concurrent load; the first
-// test additionally proves a specific correctness property (refcounting):
-// exactly one of many racing "last dependent leaves" events may ever fire
-// for a given Region.
+// Stress tests: many threads hammering RegionManager concurrently, mainly to
+// prove the mutex-guarded bookkeeping doesn't deadlock/corrupt under load.
+// The first test also proves a correctness property: exactly one racing
+// "last dependent leaves" event may ever fire for a given Region.
 // ---------------------------------------------------------------------------
 
 TEST(RegionManagerStressTest, ConcurrentDependencyChurnReportsExactlyOneLastDependentEvent) {
@@ -335,13 +344,11 @@ TEST(RegionManagerStressTest, ConcurrentDependencyChurnReportsExactlyOneLastDepe
 	constexpr int kThreads = 64;
 	constexpr int kChurnRoundsPerThread = 500;
 
-	// Phase 1: each thread repeatedly adds/removes its own (distinct) Anchor
-	// as a dependent of the same shared Region, purely to stress the lock --
-	// the return values here are not asserted on, since with many other
-	// threads concurrently doing the same thing, whether *this* thread's
-	// removeDependency() happens to be the last one at that instant is
-	// nondeterministic. Ends with every thread depending on kRegion exactly
-	// once (guaranteed by joining before phase 2 starts).
+	// Phase 1: each thread repeatedly adds/removes its own distinct Anchor as
+	// a dependent of kRegion, purely to stress the lock. Return values aren't
+	// asserted -- with many threads racing, whether this one's
+	// removeDependency() is "the last" is nondeterministic. Ends with every
+	// thread depending once (guaranteed by joining before phase 2 starts).
 	std::vector<std::thread> threads;
 	threads.reserve(kThreads);
 	for (int t = 0; t < kThreads; ++t) {
@@ -357,11 +364,9 @@ TEST(RegionManagerStressTest, ConcurrentDependencyChurnReportsExactlyOneLastDepe
 	for (std::thread& th : threads) th.join();
 	threads.clear();
 
-	// Phase 2: all kThreads Anchors now depend on kRegion. Drop them all
-	// concurrently via forget() -- exactly one of these T racing calls must
-	// observe "I was the last dependent" (RegionManager's own mutex
-	// serializes the actual transition, however unpredictable the thread
-	// scheduling is).
+	// Phase 2: drop all kThreads Anchors' dependency on kRegion concurrently
+	// via forget() -- exactly one racing call must observe "I was the last
+	// dependent" (RegionManager's mutex serializes the actual transition).
 	std::atomic<int> last_dependent_events{0};
 	for (int t = 0; t < kThreads; ++t) {
 		threads.emplace_back([&, t] {

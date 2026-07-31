@@ -1,5 +1,43 @@
 #pragma once
 
+// StressIndex: a brute-force, full-scan IAdapter implementation standing in
+// for a real ANNS index (HNSW/IVF/...) in the gtest stress stages
+// (unittest/stress/stress_index_test.cpp and its stage2/stage3 siblings) and
+// in test/bin/full_suite_app.cpp's standalone workload runner. Its job isn't
+// to be a good index -- Arachne drives any adapter purely through
+// IAdapter/IRegion and never looks inside it, so a correct-but-naive full
+// scan exercises exactly the same Controller machinery (routing,
+// promotion/eviction, scheduling, write-back) a real graph/cluster index
+// would, without this project needing a real index's own search-quality
+// correctness first.
+//
+// Host buffer / Region layout:
+// One contiguous std::vector<std::byte> buffer_ holds up to `capacity`
+// vectors of `dim` elements of `dtype`, as a flat array of fixed-size vector
+// slots. buffer_ is partitioned into equal-sized slices of
+// `vectors_per_region` vectors each; one StressRegion (an IRegion) covers
+// each slice:
+//
+//   buffer_: [ v0 | v1 | ... | v(vpr-1) || v(vpr) | ... | v(2*vpr-1) || ... ]
+//             \________ Region 1 ________/\_________ Region 2 ________/
+//
+// This is StressIndex's answer to "how does an index partition its state
+// into Regions" -- the simplest possible scheme, chosen because a flat
+// brute-force scan has no locality structure to respect in the first place.
+// Each Region's HostRegionView::subregion_bytes is set to exactly one
+// vector's byte size, so Arachne's per-Region dirty-bitmap header
+// (gpu/dirty_header.hpp) tracks dirtiness at single-vector granularity.
+// id_to_slot_ maps a live VectorId to its slot in buffer_; next_free_slot_
+// only ever grows -- a deleted slot is marked in deleted_ but never
+// recycled -- so bookkeeping stays simple at the cost of eventually
+// exhausting `capacity` under heavy delete/reinsert churn (the stage 3
+// tests size `capacity` with this in mind).
+//
+// BruteForceGroundTruth() (bottom of this file) is an independent
+// reimplementation of the same scan, reading StressIndex's private state
+// directly instead of calling any of its own methods -- see its own doc
+// comment for why.
+
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -17,9 +55,8 @@ class Controller;
 
 namespace arachne::stress {
 
-/// One contiguous slice of StressIndex's single big buffer -- see
-/// StressIndex's own class comment for why a flat slice-per-Region scheme
-/// is enough here. Adapter-internal bookkeeping only (the lease epoch): the
+/// One slice of StressIndex's buffer_ -- see the file-level overview above
+/// for the layout. Adapter-internal bookkeeping only (the lease epoch): the
 /// actual GPU allocation/copy/free and residency decision is entirely
 /// Arachne's job (Controller::make()/evictAnchor()), never this class's, per
 /// IRegion's contract.
@@ -41,34 +78,15 @@ class StressRegion final : public IRegion {
 	std::uint64_t epoch_ = 0;
 };
 
-/// A brute-force, full-scan "index" standing in for a real ANNS index
-/// (HNSW/IVF/...), built to validate Arachne's own orchestration rather
-/// than to be a good index: Arachne drives any adapter purely through
-/// IAdapter/IRegion and never looks inside it, so a correct-but-naive
-/// full scan exercises the exact same Controller machinery (routing,
-/// promotion/eviction, scheduling, write-back) a real graph/cluster index
-/// would, without this project needing to also get a real index's own
-/// correctness right first.
-///
-/// One contiguous host buffer holds up to `capacity` vectors of `dim`
-/// elements of `dtype`, partitioned into equal-sized slices of
-/// `vectors_per_region` vectors each -- one StressRegion per slice. This is
-/// StressIndex's own answer to "how does an index partition its state into
-/// Regions" (still an open question for a real graph index, see todo [2]):
-/// the simplest possible scheme, chosen because a flat brute-force scan
-/// has no locality structure to respect in the first place. Each Region's
-/// HostRegionView::subregion_bytes is set to exactly one vector's byte
-/// size, so Arachne's per-Region dirty-bitmap header (gpu/dirty_header.hpp)
-/// tracks dirtiness at single-vector granularity -- the natural write unit
-/// once a real write kernel (stress test stage 4) starts mutating vectors
-/// in place on GPU.
+/// See the file-level overview above for StressIndex's role and its host
+/// buffer/Region layout (still an open question for a real graph index --
+/// see todo [2]).
 ///
 /// Thread-safety: traverseHost()/modifyHost() guard all mutable state
 /// (buffer_ writes, id_to_slot_, deleted_) with mutex_, since OpScheduler
 /// may run them on a worker thread concurrently with other batches (stage
-/// 3's many-caller-threads stress exercises this for real; a single-caller
-/// stage-1 test only ever has one batch in flight at a time, but the lock
-/// costs nothing extra either way).
+/// 3's many-caller-threads stress exercises this for real; the lock costs
+/// nothing extra in the single-caller stages).
 class StressIndex final : public IAdapter {
  public:
 	StressIndex(std::uint32_t dim, VectorDType dtype, std::size_t capacity, std::size_t vectors_per_region);
@@ -81,20 +99,17 @@ class StressIndex final : public IAdapter {
 	std::vector<ModifyResult> modifyHost(const std::vector<ModifyRequest>& requests) override;
 
 	/// Stage 1-3 stand-in: reads the same host-mirrored buffer traverseHost()
-	/// does. Safe as long as nothing writes to the *device* copy
-	/// independently of Arachne's own promotion-time copyFromHost() (see
-	/// Controller::make()) -- true until stage 4 adds a real write kernel,
-	/// since host and device stay byte-identical otherwise. Lets a
-	/// GpuOnly-routed lookup (see Controller::route()/routeSearch()) succeed
-	/// instead of hitting IAdapter::traverseDevice()'s default throw.
+	/// does. Safe because nothing writes the *device* copy independently of
+	/// Controller::make()'s promotion-time copyFromHost() until stage 4 adds
+	/// a real write kernel. Lets a GpuOnly-routed lookup succeed instead of
+	/// hitting IAdapter::traverseDevice()'s default throw.
 	std::vector<TraverseResult> traverseDevice(const std::vector<TraverseRequest>& requests) override;
 
-	/// Same reasoning as traverseDevice() above, for the Modify side: a
-	/// GpuOnly insert can now legitimately reach here whenever its own
-	/// lookup traversal's promotion request (see Controller::insert()'s doc
-	/// comment) has already been granted a Region by the time routeInsert()
-	/// checks -- delegating to modifyHost() lets that succeed instead of
-	/// hitting IAdapter::modifyDevice()'s default throw.
+	/// Same reasoning as traverseDevice() above, for Modify: a GpuOnly insert
+	/// can legitimately reach here once its lookup traversal's promotion
+	/// request has already been granted a Region by the time routeInsert()
+	/// checks. Delegates to modifyHost() so it succeeds instead of hitting
+	/// IAdapter::modifyDevice()'s default throw.
 	std::vector<ModifyResult> modifyDevice(const std::vector<ModifyRequest>& requests) override;
 
 	IRegion* resolveRegion(RegionId id) override;
@@ -145,15 +160,12 @@ class StressIndex final : public IAdapter {
 };
 
 /// Independent (of ScanOne()/traverseHost()) re-implementation of the same
-/// brute-force scan, reading StressIndex's private buffer_/id_to_slot_/
-/// deleted_ directly rather than calling any of its own methods. The point
-/// isn't to catch a bug in StressIndex's own distance math (both
-/// implementations would share that bug) -- it's to catch a bug in
-/// Arachne's *orchestration* (routing a query GpuOnly vs. Hybrid, batching
-/// it through OpScheduler, marshalling the TraverseResult back) by
-/// comparing what Controller::search() actually returns against what's
-/// verifiably in StressIndex's storage, computed without going through
-/// Controller/OpScheduler/dispatch at all.
+/// brute-force scan, reading StressIndex's private state directly rather
+/// than calling any of its own methods. Not meant to catch a bug in
+/// StressIndex's own distance math (both would share that) -- it's meant to
+/// catch a bug in Arachne's *orchestration* by comparing what
+/// Controller::search() returns against storage ground truth computed
+/// without going through Controller/OpScheduler/dispatch at all.
 std::vector<Neighbor> BruteForceGroundTruth(const StressIndex& index, const VectorView& query, std::uint32_t top_k);
 
 }  // namespace arachne::stress

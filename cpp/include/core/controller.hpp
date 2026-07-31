@@ -61,63 +61,94 @@ struct ControllerStats {
 	std::uint64_t compactions_total = 0;            // RegionManager falling back to gpu::DeviceRegionPool::compact()
 };
 
-/// Arachne's core management controller: the index-agnostic control plane that
-/// decides where SEARCH/INSERT/DELETE run, per the Quick Summary. This is
-/// the class meant to carry Arachne's actual design as it gets built out;
-/// everything here is implemented against IAdapter/IRegion and RoutingCache
-/// only, never against a concrete index or a concrete Anchor storage
-/// structure.
+/// Arachne's index-agnostic control plane: decides where SEARCH/INSERT/DELETE
+/// actually run and drives them through IAdapter/IRegion, without ever
+/// depending on a concrete index or a concrete Anchor storage structure.
 ///
-/// Splits "is this query close to something we've seen" (RoutingCache,
-/// injected -- pure identity/routing signal, pluggable) from "which Regions
-/// has that Anchor promoted, and what does each Region's own
-/// host/device/lease state look like, and when does GPU residency actually
-/// change" (RegionManager, owned directly -- see its own doc comment for why
-/// it now owns the whole GPU-residency policy, not just bookkeeping).
-/// Controller routes and schedules; RegionManager's own Coordinator decides
-/// and performs promotion/eviction. Controller is the only thing that talks
-/// to both RoutingCache and RegionManager.
+/// Two concerns are kept deliberately separate:
+///  - RoutingCache (injected, pluggable): "is this query close to something
+///    we've seen" -- a pure identity/routing signal.
+///  - RegionManager (owned directly): which Regions an Anchor has promoted,
+///    each Region's host/device/lease state, and when GPU residency actually
+///    changes (see its own doc comment for why it owns the whole
+///    GPU-residency policy, not just bookkeeping). Its own Coordinator
+///    thread decides and performs promotion/eviction; Controller only
+///    routes, schedules, and reports traversals/promotion requests into it.
+///    Controller is the only class that talks to both RoutingCache and
+///    RegionManager.
+///
+/// Dispatch flow (search() shown; insert()/remove() follow the same
+/// route -> dispatch -> commit shape):
+///
+///   search(query)
+///        |
+///        v
+///     route()  --- RoutingCache hit w/ promoted Regions? --> GpuOnly plan
+///        |                                                   (falls back to
+///        v                                                    Hybrid if it
+///     dispatch(TraverseRequest)                                doesn't cover
+///        |                                                      the query)
+///        v
+///     OpScheduler::schedule() -- batches with other same-mode requests,
+///        |                       runs on an execution worker thread
+///        v
+///     on_complete (worker thread): RegionManager::recordTraversal() +
+///        |                         requestPromotion()
+///        v
+///     commitSearch() -- shapes the public SearchResult
+///
+/// insert()/remove() additionally track which VectorIds are currently live
+/// (live_ids_) so a duplicate/unknown id is rejected before it ever reaches
+/// the adapter or RegionManager.
+///
+/// GPU access: acquireRegion() is the only sanctioned way to read a Region's
+/// data; it returns a RegionAccess telling the caller whether the data is on
+/// device (with a Lease pinning it) or host-only. Each OpScheduler execution
+/// worker thread binds thread_local g_worker_stream (controller.cpp) to its
+/// own dedicated CUDA stream once, at thread start (via scheduler_.start()'s
+/// on_worker_start hook); acquireRegion() picks up that stream when called
+/// from a worker thread, or DeviceContext's management stream otherwise --
+/// see gpu::DeviceContext::workerStream()/managementStream()'s own doc
+/// comments for why the two are kept physically separate.
+///
+/// Member destruction order matters and is enforced by declaration order
+/// below: scheduler_ (whose worker threads read g_worker_stream and may
+/// call back into acquireRegion()) must stop before region_manager_'s
+/// Coordinator thread stops, which must stop before device_region_pool_/
+/// device_ tear down.
 class Controller {
  public:
-	// `replacement_policy` is forwarded to region_manager_ (which owns it --
-	// see RegionManager's own doc comment), defaulting to
-	// FifoReplacementPolicy when left null, mirroring OpScheduler's own
-	// SchedulingPolicy default. `gpu_data_budget_bytes`/
-	// `gpu_metadata_budget_bytes` become the DeviceContext this Controller
-	// owns' budgetBytes() for each MemoryKind -- the ceiling
-	// RegionManager::make()'s gpu::DeviceRegionPool::tryAllocate() calls
-	// enforce (see its own doc comment). Defaulted to the same
-	// kDefaultDataPoolBytes/kDefaultMetadataPoolBytes DeviceContext itself
-	// defaults to; overriding them is mainly useful for tests that want to
-	// exercise capacity-exhaustion/eviction without allocating gigabytes of
-	// real Region data first.
+	// GPU/threading knobs (gpu_*_budget_bytes, gpu_unit_bytes, compaction_policy,
+	// allocation_policy) are forwarded to the DeviceContext/DeviceRegionPool this
+	// Controller owns and default to those classes' own defaults; overriding
+	// them is mainly useful for tests exercising capacity-exhaustion/eviction/
+	// fragmentation without allocating gigabytes of real Region data first.
+	// `allocation_policy` is appended last, after coordinator_config, so it
+	// doesn't shift any existing positional call site.
 	Controller(IAdapter& adapter, RoutingCache& routing_cache,
 			 SchedulingConfig scheduling_config = {},
 			 std::unique_ptr<ReplacementPolicy> replacement_policy = nullptr,
 			 std::size_t gpu_data_budget_bytes = gpu::kDefaultDataPoolBytes,
 			 std::size_t gpu_metadata_budget_bytes = gpu::kDefaultMetadataPoolBytes,
-			 CoordinatorConfig coordinator_config = {});
+			 std::size_t gpu_unit_bytes = gpu::kDefaultUnitBytes,
+			 std::unique_ptr<gpu::CompactionPolicy> compaction_policy = nullptr,
+			 CoordinatorConfig coordinator_config = {},
+			 gpu::AllocationPolicy allocation_policy = gpu::AllocationPolicy::Normal);
 
 	SearchResult search(const Query& query);
 
-	/// Fails (InsertResult::ok = false, no adapter/RoutingCache/RegionManager
-	/// call made at all) if record.id is already live -- either a prior
-	/// insert() for the same id already succeeded and it hasn't been
-	/// remove()'d since, or another thread's insert() for the same id is
-	/// concurrently in flight right now. An index's own id space assumes
-	/// uniqueness (e.g. StressIndex's id_to_slot_ map, or hnswlib's
-	/// label_lookup_); Arachne enforces that at this boundary rather than
-	/// letting a duplicate reach the adapter and silently corrupt whatever
-	/// id->data mapping it keeps. remove()'ing an id frees it for reuse.
+	/// Fails (ok=false, nothing touched) if record.id is already live -- a
+	/// prior unremoved insert(), or a concurrent insert() for the same id.
+	/// Enforced here since an index's own id space assumes uniqueness (e.g.
+	/// StressIndex's id_to_slot_, hnswlib's label_lookup_); remove() frees
+	/// the id for reuse.
 	InsertResult insert(const Record& record);
 	DeleteResult remove(VectorId id);
 
 	/// Adapter opt-in (see RegionManager::registerRegion()'s doc comment):
-	/// declares `id` promotion/eviction-eligible and records where its data
-	/// lives in host memory. An index calls this once it decides a piece of
-	/// its own state should be a candidate for GPU residency -- before that
-	/// call, Arachne has no knowledge of `id` at all, and RegionManager will
-	/// refuse to promote any Anchor onto it.
+	/// declares `id` promotion/eviction-eligible and records where its host
+	/// data lives. Before this call Arachne has no knowledge of `id`, and
+	/// RegionManager refuses to promote any Anchor onto it.
 	void registerRegion(RegionId id, HostRegionView host);
 
 	/// Resolves where `region`'s data currently lives -- see RegionAccess's
@@ -125,21 +156,16 @@ class Controller {
 	/// std::invalid_argument if `region` was never registered.
 	RegionAccess acquireRegion(RegionId region);
 
-	/// See ControllerStats' own doc comment. Cheap: the four counters are
-	/// independent atomics read with relaxed ordering (nothing here needs to
-	/// be seen-together-atomically with anything else -- each is just a
-	/// running total), and gpu_bytes_allocated delegates to
+	/// See ControllerStats' own doc comment. Cheap: the counters are
+	/// independent relaxed atomics, and gpu_bytes_allocated delegates to
 	/// gpu::DeviceRegionPool::bytesAllocated(), which takes its own lock.
 	ControllerStats stats() const;
 
-	/// Blocks until RegionManager's Coordinator has fully caught up with
-	/// every insert()/remove() call made so far -- see
-	/// RegionManager::waitIdle()'s own doc comment. Not needed on the normal
-	/// async path (promotion/eviction happen off of insert()/remove()'s own
-	/// critical path by design); exists for callers that need a synchronous
-	/// checkpoint -- e.g. a test asserting on GPU residency right after a
-	/// batch of inserts, or an operator wanting a clean point before
-	/// shutdown.
+	/// Blocks until RegionManager's Coordinator has caught up with every
+	/// insert()/remove() so far -- not needed on the normal async path
+	/// (promotion/eviction run off insert()/remove()'s critical path by
+	/// design); for callers needing a synchronous checkpoint, e.g. a test
+	/// asserting on GPU residency, or a clean point before shutdown.
 	void waitIdle();
 
  private:
@@ -163,46 +189,25 @@ class Controller {
 	};
 		RoutingDecision route(const Query& query);
 		SearchPlan routeSearch(const Query& query);
-		// `candidates` is the result of the lookup traversal insert() runs
-		// first (see its doc comment) -- routeInsert() folds `candidates.touched`
-		// into the resulting ModifyRequest::scope (which may later be narrowed
-		// to a single already-promoted Region -- see the loop below), and moves
-		// (not copies) `candidates.hint` into ModifyRequest::hint, since
-		// `candidates` isn't needed for anything else afterward. Promotion
-		// itself is already requested by the time this runs -- see dispatch()'s
-		// own doc comment.
+		// `candidates` is the lookup traversal's result (see insert()'s doc
+		// comment): its `touched` folds into the resulting ModifyRequest::scope
+		// (narrowed further below if a Region is already promoted), and `hint`
+		// is moved rather than copied since `candidates` isn't used afterward.
 		InsertPlan routeInsert(const Record& record, TraverseResult candidates);
 		RemovePlan routeRemove(VectorId id);
 
-	// `promotion_anchor_id`, when nonzero, requests replacement_policy_
-	// consider `promotion_anchor_id` a promotion candidate for whatever
-	// Regions this traversal touches -- see RegionManager::requestPromotion().
-	// Both this and the recordTraversal() hotness signal run on the
-	// OpScheduler execution worker thread that actually computed the result
-	// (via OpScheduler::schedule()'s on_complete hook), not on whichever
-	// thread calls this and blocks on the future -- see that hook's own doc
-	// comment for why: it keeps contention on RegionManager's lock bounded by
-	// the (small, fixed) worker pool instead of by however many
-	// search()/insert() callers happen to be concurrently in flight. The same
-	// callback also passes `request.query.vector` through to
-	// requestPromotion() -- safe to capture here (before the worker thread
-	// even runs) because the original caller is still blocked on this call's
-	// own future.get() below, keeping the caller-owned buffer alive for the
-	// callback's duration; see PromotionCandidate's own doc comment
-	// (replacement_policy.hpp) for why RegionManager needs its own copy
-	// beyond that point. Defaults to 0 (no promotion request) -- e.g.
-	// verify()'s traversal.
+	// `promotion_anchor_id`, when nonzero, is offered to RegionManager::
+	// requestPromotion() as a promotion candidate for whatever Regions this
+	// traversal touches; that call and recordTraversal() both run on the
+	// worker thread via on_complete (see class doc comment), not here.
+	// Defaults to 0 (no promotion request) -- e.g. verify()'s traversal.
 	TraverseResult dispatch(const TraverseRequest& request, VectorId promotion_anchor_id = 0);
 	ModifyResult dispatch(const ModifyRequest& request);
 
-	// RegionManager now owns RoutingCache registration/erasure itself, at
-	// actual promotion-grant/eviction time (see its own class doc comment) --
-	// commitSearch()/commitInsert()/commitRemove() no longer touch
-	// routing_cache_ at all. What's left of the "commit" step is just
-	// shaping each primitive's final public Result type from what dispatch()
-	// returned (plus, for commitRemove(), the release of `anchor_id`'s own
-	// Region dependencies, which stays here since it's keyed off the Modify
-	// primitive's own success, not the lookup traversal's).
+	// RegionManager owns RoutingCache registration/erasure itself now, at
+	// actual promotion-grant/eviction time -- these just shape each
+	// primitive's public Result from dispatch()'s output, plus (commitRemove
+	// only) releasing `anchor_id`'s Region dependencies on success.
 	SearchResult commitSearch(const TraverseResult& result, bool final_was_hybrid);
 	InsertResult commitInsert(const ModifyResult& result);
 	DeleteResult commitRemove(const RemovePlan& plan, const ModifyResult& result);
@@ -215,43 +220,29 @@ class Controller {
 
 	IAdapter& adapter_;
 	RoutingCache& routing_cache_;
-	// GPU residency accounting (design point 4): Arachne-owned, not the
-	// adapter's -- see gpu/device_context.hpp and gpu/device_region_pool.hpp.
-	// region_manager_'s Coordinator allocates/frees through
-	// device_region_pool_ -- see RegionManager's own doc comment for why it,
-	// not Controller, now owns that whole policy.
+	// GPU residency accounting is Arachne-owned, not the adapter's; region_manager_'s
+	// Coordinator allocates/frees through device_region_pool_.
 	gpu::DeviceContext device_;
 	gpu::DeviceRegionPool device_region_pool_;
-	// Declared after device_region_pool_ deliberately: RegionManager's
-	// Coordinator thread (started in the constructor body, stopped in
-	// RegionManager's own destructor) touches device_region_pool_ up until
-	// shutdown() joins it, so it must be destroyed -- reverse declaration
-	// order -- *before* device_region_pool_/device_ are torn down.
+	// Declared after device_region_pool_: RegionManager's Coordinator thread
+	// touches device_region_pool_ up until shutdown() joins it, so it must
+	// destroy first -- reverse declaration order -- before device_region_pool_/
+	// device_ tear down.
 	RegionManager region_manager_;
-	// Declared last of the threading members deliberately: members destroy
-	// in reverse declaration order, so scheduler_ -- and the execution
-	// worker threads it owns -- must stop *before* device_/device_region_pool_
-	// tear down (a worker thread's thread_local g_worker_stream, set from
-	// gpu::DeviceContext::workerStream(), would otherwise dangle for
-	// however long the worker takes to notice shutdown() and stop, and any
-	// adapter that calls Controller::acquireRegion() from within
-	// traverseDevice()/modifyDevice() -- unlike the adapters in this
-	// codebase's own tests today -- would be touching already-destroyed GPU
-	// state).
+	// Declared last: scheduler_'s worker threads must stop before device_/
+	// device_region_pool_ tear down (see class doc comment for why); an
+	// adapter calling acquireRegion() from traverseDevice()/modifyDevice()
+	// would otherwise touch already-destroyed GPU state.
 	OpScheduler scheduler_;
-	// Minted from search()'s own calling thread whenever a query needs a
-	// Hybrid traversal (see search()'s doc comment) -- atomic because
-	// multiple concurrent search() calls mint from this independently, with
-	// no other lock protecting it.
+	// Minted from search()'s calling thread whenever a query needs a Hybrid
+	// traversal -- atomic since multiple concurrent search() calls mint from
+	// this independently, with no other lock protecting it.
 	std::atomic<VectorId> next_anchor_id_{1};
 
-	// Which VectorIds insert() currently considers live -- see insert()'s
-	// own doc comment. A plain mutex-guarded set, independent of
-	// region_manager_: an id can be live (successfully handed to the
-	// adapter's modifyHost()/modifyDevice()) without ever having a promoted
-	// Region (promotion can fail or simply not be attempted), so
-	// region_manager_.regionsOf(id) being empty is not a reliable "was this
-	// id ever inserted" signal.
+	// Which VectorIds insert() currently considers live (see its doc
+	// comment) -- independent of region_manager_, since an id can be live
+	// without ever having a promoted Region, so regionsOf(id) being empty
+	// isn't a reliable "was this id ever inserted" signal.
 	std::mutex live_ids_mutex_;
 	std::unordered_set<VectorId> live_ids_;
 };

@@ -1,32 +1,8 @@
-find_package(GTest CONFIG REQUIRED)
-
-set(ARACHNE_TEST_SOURCES
-	routing_cache_hnsw_test.cpp
-	routing_cache_hnsw_dtype_test.cpp
-	region_manager_test.cpp
-	region_manager_coordinator_test.cpp
-	op_scheduler_policy_test.cpp
-	op_scheduler_worker_start_test.cpp
-	replacement_policy_test.cpp
-	gpu/dirty_header_test.cpp
-	util/distance_test.cpp
-	gpu/device_region_pool_test.cpp
-	controller_test.cpp
-	stress/stress_index.cpp
-	stress/stress_index_test.cpp
-	stress/stress_index_stage2_test.cpp
-	stress/stress_index_stage3_test.cpp
-)
-
-add_executable(arachne_tests ${ARACHNE_TEST_SOURCES})
-
-target_include_directories(arachne_tests PRIVATE stress)
-
-target_link_libraries(arachne_tests PRIVATE
-	arachne::core
-	GTest::gtest
-	GTest::gtest_main
-)
-
-include(GoogleTest)
-gtest_discover_tests(arachne_tests)
+# Two consumers of test/stress's shared StressIndex adapter (see its own
+# class doc comment): unittest/ (gtest-driven, run via ctest) and bin/ (a
+# plain main()-having executable you run directly, for eyeballing a full
+# insert/search/remove workload against a real Controller without going
+# through gtest at all). StressIndex itself lives once, here, under
+# test/stress -- neither subdirectory owns it.
+add_subdirectory(unittest)
+add_subdirectory(bin)

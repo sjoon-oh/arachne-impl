@@ -27,6 +27,11 @@ namespace {
 
 }  // namespace
 
+// Validates FifoSchedulingPolicy's queue-inspection helpers in isolation
+// (chooseBatchKind/selectCandidateIndex/canAppendToBatch) against a plain
+// ScheduledOperationQueue/Batch, without a running OpScheduler -- i.e. the
+// policy decisions themselves, not their effect on live scheduling.
+
 TEST(FifoSchedulingPolicyTest, ChooseBatchKindUsesFrontTypeOrDefaultsToTraverse) {
 	FifoSchedulingPolicy policy;
 	ScheduledOperationQueue queue;

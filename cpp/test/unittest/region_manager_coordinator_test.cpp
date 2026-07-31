@@ -80,13 +80,10 @@ class FakeAdapter : public IAdapter {
 	std::unordered_map<RegionId, FakeRegion> regions_;
 };
 
-// Records every ensure()/erase() call verbatim -- lets tests assert exactly
-// when RegionManager registers/removes an Anchor in RoutingCache (see
-// region_manager.hpp's class doc comment: this now happens at actual
-// promotion-grant/eviction time, not unconditionally on every query the way
-// Controller's old commitSearch()/commitInsert() did it). "No match" for
-// nearest() is enough here -- these tests never exercise Controller's own
-// routing decision.
+// Records every ensure()/erase() call verbatim so tests can assert exactly
+// when RegionManager registers/removes an Anchor -- now tied to actual
+// promotion-grant/eviction time (see region_manager.hpp), not to every
+// query. nearest() always misses; these tests never exercise routing itself.
 class FakeRoutingCache : public RoutingCache {
  public:
 	FakeRoutingCache() : RoutingCache(/*dim=*/1, DistanceMetric::L2, VectorDType::Float32) {}
@@ -138,7 +135,8 @@ TEST(RegionManagerCoordinatorTest, RequestPromotionIsLazyUntilWaitIdle) {
 	FakeAdapter adapter;
 	FakeRoutingCache routing_cache;
 	constexpr std::size_t kBytes = 256;
-	gpu::DeviceContext device(/*device_id=*/0, gpu::AllocationPolicy::Pooled, kBytes, gpu::kDefaultMetadataPoolBytes);
+	gpu::DeviceContext device(/*device_id=*/0, gpu::AllocationPolicy::Pooled, kBytes, gpu::kDefaultMetadataPoolBytes,
+														 /*worker_stream_count=*/1, /*unit_bytes=*/kBytes);
 	gpu::DeviceRegionPool pool(device);
 	RegionManager manager;
 	manager.start(adapter, pool, routing_cache, CoordinatorConfig{kLongInterval});
@@ -166,7 +164,8 @@ TEST(RegionManagerCoordinatorTest, ReleaseAnchorBookkeepingIsImmediateButReclaim
 	FakeAdapter adapter;
 	FakeRoutingCache routing_cache;
 	constexpr std::size_t kBytes = 256;
-	gpu::DeviceContext device(/*device_id=*/0, gpu::AllocationPolicy::Pooled, kBytes, gpu::kDefaultMetadataPoolBytes);
+	gpu::DeviceContext device(/*device_id=*/0, gpu::AllocationPolicy::Pooled, kBytes, gpu::kDefaultMetadataPoolBytes,
+														 /*worker_stream_count=*/1, /*unit_bytes=*/kBytes);
 	gpu::DeviceRegionPool pool(device);
 	RegionManager manager;
 	manager.start(adapter, pool, routing_cache, CoordinatorConfig{kLongInterval});
@@ -182,11 +181,10 @@ TEST(RegionManagerCoordinatorTest, ReleaseAnchorBookkeepingIsImmediateButReclaim
 	ASSERT_EQ(manager.regionsOf(100).size(), 1u);
 
 	manager.releaseAnchor(100);
-	// Dependency-graph bookkeeping and residency clearing are synchronous --
-	// see releaseAnchor()'s own doc comment for why this matters (so a
-	// concurrent requestPromotion() for a different Anchor onto the same
-	// Region re-promotes fresh rather than seeing a stale "already
-	// promoted" lease). RoutingCache erasure is synchronous too.
+	// Dependency-graph bookkeeping, residency clearing, and RoutingCache
+	// erasure are all synchronous -- so a concurrent requestPromotion() for
+	// a different Anchor onto the same Region re-promotes fresh instead of
+	// seeing a stale "already promoted" lease (see releaseAnchor()'s doc comment).
 	EXPECT_TRUE(manager.regionsOf(100).empty());
 	EXPECT_FALSE(manager.regionOf(1).device.valid());
 	EXPECT_EQ(routing_cache.erased, std::vector<VectorId>{100});
@@ -205,7 +203,8 @@ TEST(RegionManagerCoordinatorTest, TimelyTriggerProcessesWithoutExplicitWaitIdle
 	FakeAdapter adapter;
 	FakeRoutingCache routing_cache;
 	constexpr std::size_t kBytes = 256;
-	gpu::DeviceContext device(/*device_id=*/0, gpu::AllocationPolicy::Pooled, kBytes, gpu::kDefaultMetadataPoolBytes);
+	gpu::DeviceContext device(/*device_id=*/0, gpu::AllocationPolicy::Pooled, kBytes, gpu::kDefaultMetadataPoolBytes,
+														 /*worker_stream_count=*/1, /*unit_bytes=*/kBytes);
 	gpu::DeviceRegionPool pool(device);
 	RegionManager manager;
 	manager.start(adapter, pool, routing_cache, CoordinatorConfig{kShortInterval});
@@ -251,7 +250,7 @@ TEST(RegionManagerCoordinatorTest, CapacityPressureEvictsOldestViaReplacementPol
 	FakeRoutingCache routing_cache;
 	constexpr std::size_t kBytes = 256;
 	gpu::DeviceContext device(/*device_id=*/0, gpu::AllocationPolicy::Pooled, 2 * kBytes,
-														 gpu::kDefaultMetadataPoolBytes);
+														 gpu::kDefaultMetadataPoolBytes, /*worker_stream_count=*/1, /*unit_bytes=*/kBytes);
 	gpu::DeviceRegionPool pool(device);
 	RegionManager manager;
 	manager.start(adapter, pool, routing_cache, CoordinatorConfig{kShortInterval});
@@ -295,7 +294,8 @@ TEST(RegionManagerCoordinatorTest, PromotionRegistersAnchorInRoutingCacheWithAnO
 	FakeAdapter adapter;
 	FakeRoutingCache routing_cache;
 	constexpr std::size_t kBytes = 256;
-	gpu::DeviceContext device(/*device_id=*/0, gpu::AllocationPolicy::Pooled, kBytes, gpu::kDefaultMetadataPoolBytes);
+	gpu::DeviceContext device(/*device_id=*/0, gpu::AllocationPolicy::Pooled, kBytes, gpu::kDefaultMetadataPoolBytes,
+														 /*worker_stream_count=*/1, /*unit_bytes=*/kBytes);
 	gpu::DeviceRegionPool pool(device);
 	RegionManager manager;
 	manager.start(adapter, pool, routing_cache, CoordinatorConfig{kLongInterval});
@@ -306,13 +306,10 @@ TEST(RegionManagerCoordinatorTest, PromotionRegistersAnchorInRoutingCacheWithAnO
 	manager.registerRegion(1, host);
 
 	{
-		// This buffer goes out of scope immediately after requestPromotion()
-		// returns -- exactly like a real caller's stack-local Query/Record
-		// vector would (VectorView is explicitly non-owning, see types.hpp).
-		// requestPromotion() must copy the bytes out, not just borrow the
-		// pointer, or this Coordinator-thread grant (kLongInterval, forced by
-		// waitIdle() below, well after this scope ends) would read freed
-		// memory.
+		// This buffer goes out of scope right after requestPromotion()
+		// returns, like a real caller's stack-local Query/Record (VectorView
+		// is non-owning, see types.hpp). requestPromotion() must copy the
+		// bytes, not just borrow the pointer, or the deferred grant below would read freed memory.
 		std::vector<float> vec{1.0f, 2.0f, 3.0f};
 		manager.requestPromotion(100, RegionFootprint{{1}}, VectorView{vec.data(), 3, VectorDType::Float32});
 	}
@@ -331,7 +328,8 @@ TEST(RegionManagerCoordinatorTest, StaleEpochCandidateIsDiscardedAfterReleaseAnc
 	FakeAdapter adapter;
 	FakeRoutingCache routing_cache;
 	constexpr std::size_t kBytes = 256;
-	gpu::DeviceContext device(/*device_id=*/0, gpu::AllocationPolicy::Pooled, kBytes, gpu::kDefaultMetadataPoolBytes);
+	gpu::DeviceContext device(/*device_id=*/0, gpu::AllocationPolicy::Pooled, kBytes, gpu::kDefaultMetadataPoolBytes,
+														 /*worker_stream_count=*/1, /*unit_bytes=*/kBytes);
 	gpu::DeviceRegionPool pool(device);
 	RegionManager manager;
 	manager.start(adapter, pool, routing_cache, CoordinatorConfig{kLongInterval});
@@ -341,11 +339,10 @@ TEST(RegionManagerCoordinatorTest, StaleEpochCandidateIsDiscardedAfterReleaseAnc
 	adapter.addRegion(1, host);
 	manager.registerRegion(1, host);
 
-	// Simulates Controller::insert()'s own race: a promotion candidate is
-	// enqueued (e.g. by dispatch()'s on_complete callback right after the
-	// lookup traversal), but the same anchor is released (e.g. remove())
-	// before the Coordinator (kLongInterval, no waitIdle() yet) ever drains
-	// pending_promotions_ into the policy.
+	// Simulates Controller::insert()'s race: a promotion candidate gets
+	// enqueued (e.g. dispatch()'s on_complete callback), then the same
+	// anchor is released (e.g. remove()) before the Coordinator ever
+	// drains pending_promotions_ into the policy.
 	manager.requestPromotion(100, RegionFootprint{{1}});
 	manager.releaseAnchor(100);  // bumps anchor 100's epoch -- the stamped candidate is now stale
 
@@ -367,7 +364,8 @@ TEST(RegionManagerCoordinatorTest, ReAdmittingAnAnchorAfterReleaseIsNotTreatedAs
 	FakeAdapter adapter;
 	FakeRoutingCache routing_cache;
 	constexpr std::size_t kBytes = 256;
-	gpu::DeviceContext device(/*device_id=*/0, gpu::AllocationPolicy::Pooled, kBytes, gpu::kDefaultMetadataPoolBytes);
+	gpu::DeviceContext device(/*device_id=*/0, gpu::AllocationPolicy::Pooled, kBytes, gpu::kDefaultMetadataPoolBytes,
+														 /*worker_stream_count=*/1, /*unit_bytes=*/kBytes);
 	gpu::DeviceRegionPool pool(device);
 	RegionManager manager;
 	manager.start(adapter, pool, routing_cache, CoordinatorConfig{kLongInterval});

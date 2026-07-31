@@ -51,6 +51,18 @@ namespace arachne {
 /// Eviction policy -- which ids get erase()'d in the first place -- is
 /// entirely the caller's (Core's) call; this class only ever reclaims
 /// space already marked dead.
+///
+/// Lifecycle: every subclass MUST call waitForCompaction() as the first
+/// statement in its own destructor, before any subclass members are
+/// destroyed. The background compaction thread calls makeRefreshManager(),
+/// a pure virtual only the subclass implements; C++ resets an object's
+/// dynamic type for virtual dispatch as each destructor runs, so once the
+/// subclass's own destructor has started (or finished, if it doesn't
+/// declare one) the override is no longer reachable, and a still-running
+/// compaction thread calling makeRefreshManager() crashes with "pure
+/// virtual method called". ~ASRoutingCache() also joins the thread, but by
+/// then it's too late for this reason -- that's defense in depth for the
+/// case it already finished on its own, not a substitute.
 class ASRoutingCache : public RoutingCache {
  public:
 	/// Index-agnostic callback surface one Active or Shadow RefreshManager exposes
@@ -106,54 +118,35 @@ class ASRoutingCache : public RoutingCache {
 	void erase(VectorId id) override;
 
 	/// Blocks until any in-flight compaction finishes. Not part of the
-	/// RoutingCache interface -- normal operation never needs this; it exists
-	/// for tests that want to observe post-compaction state deterministically
-	/// and for a graceful-shutdown synchronization point.
-	///
-	/// REQUIRED of every subclass's own destructor, as its first statement,
-	/// before any subclass members are destroyed: the background compaction
-	/// thread calls makeRefreshManager(), a virtual function only the subclass
-	/// implements. Once the subclass part of the object starts tearing down
-	/// (its destructor body begins running, or -- if it doesn't define one
-	/// -- as soon as ~ASRoutingCache() does, since that's next), a still-
-	/// running compaction thread calling makeRefreshManager() hits a "pure
-	/// virtual method called" crash: C++ resets the object's dynamic type
-	/// for virtual dispatch as each destructor runs, so the override is no
-	/// longer reachable once the subclass's own destructor has started (or
-	/// finished, if it didn't declare one). ~ASRoutingCache() below also
-	/// joins the thread, but by then it is too late for this reason --
-	/// that's defense in depth for the case where it already finished on
-	/// its own, not a substitute for the subclass doing this itself.
+	/// RoutingCache interface -- normal operation never needs this. Exists for
+	/// tests that want to observe post-compaction state deterministically, and
+	/// as the subclass-destructor synchronization point the class doc above
+	/// requires.
 	void waitForCompaction();
 
  protected:
-	/// `initial_active` is the very first Active RefreshManager, already built by
-	/// the concrete subclass -- via its own, ordinary (non-virtual)
-	/// construction-time call to whatever makeRefreshManager() will later
-	/// delegate to -- rather than by this constructor calling makeRefreshManager()
-	/// itself, since a virtual call made from a base class constructor can't
-	/// reach a derived override anyway (the derived part of the object
-	/// doesn't exist yet at that point). `max_tombstone_ratio` is the
-	/// deleted/live fraction that triggers a compaction swap.
+	/// `initial_active` is built by the subclass itself (via an ordinary,
+	/// non-virtual call to whatever makeRefreshManager() will later delegate
+	/// to), not by this constructor calling makeRefreshManager() -- a virtual
+	/// call from a base constructor can't reach a derived override anyway,
+	/// since the derived part of the object doesn't exist yet.
 	ASRoutingCache(std::uint32_t dim, DistanceMetric metric, VectorDType dtype,
 								 std::size_t initial_capacity, double max_tombstone_ratio,
 								 std::unique_ptr<RefreshManager> initial_active);
 
-	/// Builds one fresh, empty RefreshManager with room for `capacity` entries --
-	/// the one ANN-index-specific operation this class needs and can't
-	/// implement itself. Called only from compactImpl(), to build the
-	/// shadow; never from ASRoutingCache's own constructor (see
-	/// `initial_active` above for why).
+	/// Builds one fresh, empty RefreshManager with room for `capacity` entries
+	/// -- the one ANN-index-specific operation this class can't implement
+	/// itself. Called only from compactImpl() to build the shadow, never from
+	/// the constructor (see `initial_active` above for why).
 	virtual std::unique_ptr<RefreshManager> makeRefreshManager(std::size_t capacity) const = 0;
 
  private:
 	std::optional<VectorId> nearestImpl(const VectorView& query) override;
 
 	/// Launches compactImpl() on a background thread if one isn't already
-	/// running. Reaps (joins) the previous compaction thread first; by the
-	/// time a new one is triggered, the old one has necessarily already
-	/// finished its work (compacting_ only clears at the very end of
-	/// compactImpl(), so a fresh compare_exchange success implies that).
+	/// running. Reaps (joins) the previous thread first; a fresh
+	/// compare_exchange success implies it already finished (compacting_ only
+	/// clears at the very end of compactImpl()).
 	void triggerCompaction();
 
 	/// Runs on a background thread. Snapshots active_'s live

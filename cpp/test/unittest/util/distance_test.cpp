@@ -12,6 +12,12 @@ using arachne::util::DotProduct;
 using arachne::util::Normalize;
 using arachne::util::SquaredL2Distance;
 
+// Validates the Highway-SIMD distance kernels (SquaredL2Distance,
+// DotProduct, Normalize) against straightforward scalar reference
+// implementations. SimdDimTest sweeps dims chosen to hit SIMD tail-handling
+// edges (see Iota's comment below); SimdTest covers fixed-dim edge cases
+// (zero vector, identical vectors) that don't need the dim sweep.
+
 // Deliberately not a multiple of any SIMD lane width, on both sides of one
 // (dim=1) and past several lane widths (dim=37) -- exercises the scalar
 // tail path after the vectorized loop regardless of which target Highway

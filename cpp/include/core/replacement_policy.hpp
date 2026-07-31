@@ -17,35 +17,72 @@
 
 namespace arachne {
 
-/// One <anchor, regions> pair RegionManager::requestPromotion() enqueues.
-/// Shared between RegionManager and ReplacementPolicy so a policy can hold
-/// and manage its own copy of admitted candidates (see
-/// ReplacementPolicy::enqueueCandidate()) without RegionManager needing to
-/// keep a second, redundant copy of the same data once it has been handed
-/// off.
-///
-/// `vector_bytes`/`vector_dim`/`vector_dtype` are an *owned* copy of the
-/// Anchor's own vector -- RegionManager now registers the Anchor in
-/// RoutingCache itself, at actual promotion-grant time (see
-/// RegionManager::processPromotions()), which can happen an arbitrary
-/// amount of time (bounded by CoordinatorConfig::trigger_interval) after
-/// requestPromotion() was called. VectorView is explicitly non-owning and
-/// not guaranteed to outlive a single call (see its own doc comment in
-/// types.hpp), so the bytes must be copied out into this candidate at
-/// enqueue time, while the original caller-owned buffer is still guaranteed
-/// alive -- see Controller::dispatch()'s own doc comment for why that's
-/// still true even though this runs on an OpScheduler worker thread rather
-/// than the original calling thread.
-///
-/// `epoch` guards against a second, independent race the deferred-ensure()
-/// design above introduces: `anchor_id` could be deleted (Controller::remove())
-/// -- or, for an insert-derived anchor_id, deleted *and have its VectorId
-/// reused by a brand-new, unrelated insert() -- in the window between this
-/// candidate being enqueued and the Coordinator actually granting it.
-/// RegionManager stamps the Anchor's current epoch (bumped by
-/// releaseAnchor(), see its own doc comment) onto the candidate at
-/// requestPromotion() time; if that epoch no longer matches at grant time,
-/// the candidate is stale and is discarded rather than promoted/registered.
+// ReplacementPolicy is Arachne's pluggable strategy (Quick Summary design
+// point 4) for deciding, per Anchor, which Region dependencies to promote
+// into GPU residency next and which currently-resident Anchor to reclaim to
+// make room. It never touches residency itself: RegionManager is the sole
+// authority that grants a promotion or performs an eviction, and
+// independently re-verifies eligibility (RegionManager::make()) before
+// acting on anything a policy returns -- a policy only *suggests*. Every
+// policy reasons at Anchor granularity, never per-Region, matching the
+// Anchor-centric residency model: replacement is about which Anchor has
+// gone cold, not which Region looks sparse. Concrete strategies (Fifo, LRU,
+// LFU, Clock, 2Q below) share this one interface; RegionManager owns a
+// single instance via std::unique_ptr the same way OpScheduler owns a
+// SchedulingPolicy.
+//
+// Candidate lifecycle:
+//
+//   RegionManager::requestPromotion()        (any caller thread)
+//            |
+//            v
+//   RegionManager's MPSC intake queue        (pending_promotions_)
+//            |   drained only by the Coordinator thread
+//            v
+//   ReplacementPolicy::enqueueCandidate()    -- policy takes sole ownership
+//            |
+//            v
+//   pending (policy-internal storage)
+//            |   selectNextPromotionCandidate(), Coordinator thread only
+//            v
+//   granted / tracked  <----------------------------.
+//            |                                       |
+//            |-- selectNextEvictionCandidate() ------'  (reads tracked state)
+//            |
+//            |-- onAnchorEvicted()  (any thread, immediate) --> purged from
+//            |                                                  every structure
+//            '-- onAnchorTouched()  (any thread, immediate) --> hotness/recency
+//                                                                updated in place
+//
+// PromotionCandidate is the one <anchor, regions> unit flowing through this
+// pipeline. Its vector_bytes/vector_dim/vector_dtype are an *owned* copy of
+// the Anchor's vector, not a VectorView -- RegionManager only registers the
+// Anchor in RoutingCache at actual grant time (RegionManager::
+// processPromotions()), an arbitrary delay after requestPromotion() returns,
+// well past when the caller-owned buffer a VectorView would point to is
+// still guaranteed alive (see Controller::dispatch()'s doc comment).
+//
+// `epoch` closes a second race that delay opens up: anchor_id can be deleted
+// (Controller::remove()), or deleted and have its VectorId reused by an
+// unrelated insert(), in the window between enqueueing and grant.
+// RegionManager stamps the Anchor's current epoch (bumped by
+// releaseAnchor()) onto the candidate at requestPromotion() time; a mismatch
+// at grant time means the candidate is stale and must be discarded rather
+// than promoted/registered.
+//
+// Threading model: enqueueCandidate() and every "act on pending/tracked
+// state" call (onRelocationTrigger(), selectNextPromotionCandidate(),
+// selectNextEvictionCandidate()) run only on the Coordinator thread, mirroring
+// the intake queue's MPSC/single-consumer shape. onAnchorEvicted() and
+// onAnchorTouched() are the exception: both run on whichever thread the
+// underlying event happened on, never funneled through the Coordinator --
+// eviction bookkeeping must be immediate (matching RegionManager's own
+// dependency-graph updates), and touch has no ordering/membership contract to
+// protect. Every concrete policy must be thread-safe against this mix.
+
+/// One <anchor, regions> pair enqueued by RegionManager::requestPromotion();
+/// see the file overview above for why vector_bytes is an owned copy and how
+/// `epoch` guards against staleness.
 struct PromotionCandidate {
 	VectorId anchor_id = 0;
 	RegionFootprint footprint;
@@ -54,144 +91,67 @@ struct PromotionCandidate {
 	std::uint32_t vector_dim = 0;
 	VectorDType vector_dtype = VectorDType::Float32;
 
-	/// Reconstructs a VectorView over this candidate's own owned copy --
-	/// valid for as long as this PromotionCandidate itself is (unlike a
-	/// VectorView built from the original caller's buffer, which is not).
+	/// View over this candidate's own owned copy -- valid for as long as this
+	/// PromotionCandidate is, unlike a VectorView into the original caller's
+	/// buffer.
 	VectorView vectorView() const { return VectorView{vector_bytes.data(), vector_dim, vector_dtype}; }
 };
 
-/// Pluggable Anchor-level Region replacement policy (Quick Summary design
-/// point 4): decides which Anchor's Region dependencies to promote next and
-/// which to reclaim to make room. Always operates on Anchor ids, never on
-/// individual Regions -- an Anchor and every Region RegionManager currently
-/// says it depends on (see core/region_manager.hpp) are the unit of
-/// locality this policy reasons about, per the Anchor-centric residency
-/// design (replacement is about which *Anchor* has gone cold, not which
-/// Region looks sparse).
-///
-/// Mirrors SchedulingPolicy's shape (core/scheduling_policy.hpp): a pure
-/// interface here, concrete strategies (FifoReplacementPolicy today; LRU or
-/// a GPU-aware hotness/latency/transfer-cost score later) as separate
-/// classes, RegionManager only ever calling through this interface -- and
-/// RegionManager owns the concrete instance the same way OpScheduler owns a
-/// SchedulingPolicy (std::unique_ptr, defaulted to Fifo* when none is
-/// injected).
-///
-/// Threading model (this is the part that changed from the original,
-/// simpler design -- see the Coordinator doc comment in
-/// core/region_manager.hpp for the full rationale): RegionManager's own
-/// intake queue (fed by requestPromotion(), called from any number of
-/// concurrent caller threads -- search/insert workers) is a
-/// multiple-producer/single-consumer queue whose *only* consumer is the
-/// Coordinator thread. The Coordinator drains it and hands each item to
-/// this policy via enqueueCandidate() -- from that point on, the candidate
-/// exists nowhere but inside the policy's own storage, and only the
-/// Coordinator thread ever calls into this policy again (via
-/// onRelocationTrigger()/selectNextPromotionCandidate()/
-/// selectNextEvictionCandidate()) to work through it. The two exceptions,
-/// still called from whatever thread the underlying event happens on
-/// (never funneled through the Coordinator), are onAnchorEvicted() (an
-/// Anchor's dependencies were just dropped -- callers depend on this being
-/// reflected immediately, the same way RegionManager's own dependency graph
-/// bookkeeping is immediate) and onAnchorTouched() (a pure hotness signal
-/// with no ordering/membership contract to protect). A policy implementation
-/// must make every method thread-safe against this mixed calling pattern.
+/// Interface every concrete replacement policy implements; see the file
+/// overview above for the full contract, candidate lifecycle, and threading
+/// model. Mirrors SchedulingPolicy's shape (core/scheduling_policy.hpp):
+/// RegionManager owns one concrete instance via std::unique_ptr, defaulted
+/// to FifoReplacementPolicy when none is injected.
 class ReplacementPolicy {
  public:
 	virtual ~ReplacementPolicy() = default;
 
-	/// The consumer side of RegionManager's own MPSC intake queue: transfers
-	/// ownership of one promotion candidate into the policy's own storage.
-	/// Called only by the Coordinator thread, once per candidate, as it
-	/// drains RegionManager's pending_promotions_ -- see the class doc
-	/// comment above. After this call, RegionManager keeps no copy of
-	/// `candidate`; the policy is the sole owner until it returns it (or
-	/// chooses to discard it) via selectNextPromotionCandidate().
+	/// Consumer side of RegionManager's MPSC intake queue: takes ownership of
+	/// one candidate. Called only by the Coordinator thread, once per
+	/// candidate; RegionManager keeps no copy of `candidate` after this call
+	/// returns.
 	virtual void enqueueCandidate(PromotionCandidate candidate) = 0;
 
-	/// Notifies the policy that `anchor_id` no longer depends on any Region --
-	/// called immediately (never deferred to a trigger), whenever
-	/// RegionManager learns this, whether via an explicit releaseAnchor()
-	/// (delete, verification mismatch) or evictAnchorNow() (capacity-driven,
-	/// Coordinator-thread-only). Must purge `anchor_id` from *every*
-	/// structure the policy maintains: both admitted-but-not-yet-selected
-	/// candidates (in case a promotion for `anchor_id` is still sitting
-	/// unselected -- e.g. requested, then deleted, before the Coordinator got
-	/// to it) and whatever eviction-ordering structure
-	/// selectNextPromotionCandidate() populated (in case it was already
-	/// granted). No-op if the policy isn't tracking `anchor_id` at all.
+	/// `anchor_id` no longer depends on any Region (releaseAnchor() or
+	/// evictAnchorNow()); called immediately, never deferred to a trigger.
+	/// Must purge `anchor_id` from every structure the policy maintains --
+	/// pending candidates and any eviction-ordering state alike. No-op if
+	/// the policy isn't tracking `anchor_id`.
 	virtual void onAnchorEvicted(VectorId anchor_id) = 0;
 
-	/// Notifies the policy that `anchor_id` was a dependent of a Region a
-	/// traversal (search's own lookup, or insert's placement lookup -- see
-	/// core/region_manager.hpp's RegionManager::recordTraversal(), which
-	/// derives this from the RegionFootprint every dispatch() call returns)
-	/// actually accessed. This is a pure hotness/recency signal, distinct
-	/// from candidate/eviction-order membership -- a policy that only orders
-	/// by promotion order (FifoReplacementPolicy) is free to ignore it
-	/// entirely. Called synchronously from whichever thread performed the
-	/// traversal, *not* funneled through the Coordinator's single-consumer
-	/// queue, since there is no ordering/membership contract to protect
-	/// here. May fire multiple times for the same `anchor_id` within what a
-	/// caller considers one logical traversal if that traversal touched more
-	/// than one Region depended on by the same Anchor; RegionManager
-	/// deduplicates per call to recordTraversal() but not across calls, so a
-	/// policy that cares about firing frequency (not just recency) should
-	/// account for that itself.
+	/// `anchor_id` was a dependent of a Region a traversal actually accessed
+	/// (see RegionManager::recordTraversal()) -- a pure hotness signal a
+	/// policy may ignore (FifoReplacementPolicy does). Runs synchronously on
+	/// the traversing thread, not funneled through the Coordinator. May fire
+	/// more than once per logical traversal across separate calls, so a
+	/// frequency-sensitive policy must dedupe itself.
 	virtual void onAnchorTouched(VectorId anchor_id) = 0;
 
-	/// Called by the Coordinator once per wakeup, before touching any
-	/// pending/resident state, to decide whether this tick should actually
-	/// perform a relocation batch (promotion + any eviction it needs) at
-	/// all. Returning false costs nothing beyond this call -- the
-	/// Coordinator goes back to sleep untouched, GPU-work-free, until its
-	/// next wakeup. Ignored (bypassed) when the Coordinator has been
-	/// force-woken by waitIdle()/shutdown() -- those callers need a
-	/// guarantee that everything requested so far has actually happened,
-	/// which requires overriding whatever timing preference the policy would
-	/// otherwise apply.
+	/// Called once per Coordinator wakeup, before touching pending/resident
+	/// state, to decide whether to run a relocation batch this tick.
+	/// Returning false costs nothing -- the Coordinator just goes back to
+	/// sleep. Bypassed when force-woken by waitIdle()/shutdown().
 	virtual bool onRelocationTrigger() = 0;
 
-	/// True if the policy is currently holding any admitted-but-not-yet-
-	/// promoted candidate (admitted via enqueueCandidate(), not yet returned
-	/// by selectNextPromotionCandidate()). Used by RegionManager::waitIdle()
-	/// to know whether draining its own intake queue to empty actually means
-	/// "nothing left to do" -- a candidate can sit inside the policy's own
-	/// storage, unselected, across one or more Coordinator ticks if
-	/// onRelocationTrigger() keeps declining, or if the policy itself is
-	/// deliberately holding some back (see selectNextPromotionCandidate()).
+	/// True if any admitted-but-not-yet-promoted candidate is still sitting
+	/// in the policy's own storage. Used by RegionManager::waitIdle() to know
+	/// whether an empty intake queue actually means "nothing left to do" --
+	/// a candidate can sit here across ticks even with the queue drained.
 	virtual bool hasPendingCandidates() const = 0;
 
-	/// Pops the next promotion candidate the policy has decided to act on
-	/// this round, out of its own storage (populated via
-	/// enqueueCandidate()). Called repeatedly by the Coordinator -- only
-	/// after onRelocationTrigger() returned true (or the Coordinator was
-	/// force-woken) -- until it returns nullopt, which ends this round's
-	/// promotion pass however many candidates were actually returned before
-	/// that; there is no separate "how many" query, the policy simply stops
-	/// offering more once it decides to. Implementations are free to
-	/// silently discard candidates they no longer consider meaningful
-	/// without ever returning them (e.g. stale by the time they'd be
-	/// considered) -- since the policy owns its only copy, nothing else
-	/// needs to be told when that happens.
-	///
-	/// Expected (though not required) to record the returned candidate's
-	/// anchor_id into whatever ordering structure
-	/// selectNextEvictionCandidate() reads from, at the moment it decides to
-	/// return it here -- there is no separate "promotion actually
-	/// succeeded" confirmation call from RegionManager. A candidate returned
-	/// here but later found NotEligible by RegionManager::make() (for every
-	/// Region in its footprint) still counts as a tracked, selectable
-	/// eviction candidate until onAnchorEvicted() removes it -- a bounded,
-	/// self-correcting cost (evicting it reclaims nothing, but does
-	/// permanently drop it from the pool, so a capacity-retry loop still
-	/// makes monotonic progress and terminates), not a correctness bug.
+	/// Pops the next candidate to act on this round, from the policy's own
+	/// storage; called repeatedly until it returns nullopt (implementations
+	/// may silently drop stale candidates without ever returning them).
+	/// Expected to record the anchor_id into eviction-order state right here
+	/// -- there is no separate "promotion succeeded" confirmation call, so a
+	/// candidate later found NotEligible by RegionManager::make() still
+	/// counts as evictable until onAnchorEvicted() removes it (a wasted
+	/// eviction, not a correctness bug -- capacity retries still terminate).
 	virtual std::optional<PromotionCandidate> selectNextPromotionCandidate() = 0;
 
-	/// Chooses the next Anchor to reclaim to make room for a Promotion,
-	/// excluding `excluded` (the Anchor currently being promoted -- a policy
-	/// must never select the thing it's making room for). Returns nullopt if
-	/// there is nothing eligible to evict.
+	/// Chooses the next Anchor to reclaim, excluding `excluded` (the Anchor
+	/// currently being promoted -- never select the thing being promoted).
+	/// Returns nullopt if nothing is eligible to evict.
 	virtual std::optional<VectorId> selectNextEvictionCandidate(VectorId excluded) = 0;
 };
 

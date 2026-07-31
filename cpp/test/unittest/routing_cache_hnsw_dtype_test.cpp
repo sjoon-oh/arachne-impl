@@ -3,7 +3,9 @@
 // thirdparty/hnswlib.patch) -- routing_cache_hnsw_test.cpp already covers
 // the pre-existing Float32 L2/Cosine paths in depth, so this file focuses
 // on the new dtypes and the dtype/metric validation ASRoutingCacheHnsw does
-// at construction and per-call.
+// at construction and per-call. Test data for the Float16 cases is produced
+// by this file's own local ToHalfBits() encoder rather than reusing
+// hnswlib's internal half_utils.h (see that function's doc comment).
 
 #include "core/routing_cache_hnsw.hpp"
 
@@ -145,16 +147,10 @@ TEST(ASRoutingCacheHnswDTypeTest, ManyRandomVectorsPerNewDtype) {
 		}
 	}
 	{
-		// L2, not InnerProduct: distance-to-self is exactly 0 for L2
-		// regardless of dtype, which is what makes a single small fixed
-		// kSelfMaxDistance threshold correctly distinguish "this exact
-		// vector" from "any other distinct vector" here. InnerProduct's
-		// self-distance is -dot(v, v) = -||v||^2 (data-dependent, often far
-		// from 0), so the same fixed threshold doesn't carry the same
-		// meaning there -- InnerProduct's dtype coverage is exercised by the
-		// single-vector-per-cache EnsureThenNearestFindsSelf cases above
-		// instead, where that distinction can't matter (nothing else to
-		// collide with).
+		// L2, not InnerProduct: self-distance is always exactly 0 for L2, so
+		// one small fixed kSelfMaxDistance reliably distinguishes "this
+		// vector" from others. InnerProduct's self-distance is data-dependent
+		// (-||v||^2), so it's covered instead by EnsureThenNearestFindsSelf above.
 		std::uniform_int_distribution<int> dist(-128, 127);
 		ASRoutingCacheHnsw cache(kLargeDim, 128, 0.2, 16, 200, DistanceMetric::L2, VectorDType::Int8);
 		std::vector<std::vector<std::int8_t>> vectors(kNumVectors);

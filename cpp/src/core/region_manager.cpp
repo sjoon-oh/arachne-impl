@@ -9,14 +9,24 @@
 
 namespace arachne {
 
+// Implementation notes beyond region_manager.hpp's file-level overview:
+//  - releaseAnchor() snapshots each Region *before* clearResidency()
+//    overwrites the live record, then hands the snapshot (not a re-lookup)
+//    to pending_reclaims_ -- so the Coordinator's later reclaim never races
+//    a concurrent re-promotion of the same RegionId.
+//  - coordinatorLoop() distinguishes a one-shot force-wake from a sticky
+//    stop request: `forced` is consumed on the very next wakeup, but
+//    coordinator_stop_requested_ stays true across every remaining
+//    iteration, so shutdown() keeps forcing processPromotions() until the
+//    policy's backlog is genuinely drained, not just once.
+//  - processPromotions() flushes any Lease still pinned from earlier in the
+//    same pass before every eviction attempt, since evictAnchorNow()'s
+//    free() can await a Lease this same call chain already holds open.
+
 namespace {
-// Placeholder policy value for the radius a newly registered Anchor is
-// given in RoutingCache -- relocated from Controller (see
-// commitSearch()/commitInsert()'s old doc comments) now that RegionManager
-// is the one calling RoutingCache::ensure(). RoutingCache itself is
-// radius-agnostic (each Anchor carries its own max_distance); a real
-// per-query threshold (e.g. derived from query density/confidence) is
-// future work -- this constant stands in for it.
+// Placeholder radius for a newly registered Anchor in RoutingCache
+// (RoutingCache itself is radius-agnostic; each Anchor carries its own
+// max_distance). A real per-query threshold is future work.
 constexpr float kDefaultAnchorMaxDistance = 1e-3f;
 }  // namespace
 
@@ -169,11 +179,9 @@ std::uint64_t RegionManager::currentEpochLocked(VectorId anchor_id) const {
 
 void RegionManager::requestPromotion(VectorId anchor_id, RegionFootprint footprint, VectorView vector) {
 	ARACHNE_TRACE_SCOPE("RegionManager", "requestPromotion");
-	// A pure enqueue onto RegionManager's own MPSC intake queue -- no
-	// replacement_policy_ interaction here at all. Only the Coordinator
-	// thread (the queue's single consumer) ever hands candidates to the
-	// policy -- see the class doc comment (region_manager.hpp) and
-	// ReplacementPolicy::enqueueCandidate()'s own doc comment for why.
+	// Pure enqueue -- no replacement_policy_ interaction here; only the
+	// Coordinator thread hands candidates to the policy (see the header's
+	// file-level overview).
 	PromotionCandidate candidate;
 	candidate.anchor_id = anchor_id;
 	candidate.footprint = std::move(footprint);
@@ -191,27 +199,21 @@ void RegionManager::requestPromotion(VectorId anchor_id, RegionFootprint footpri
 
 void RegionManager::releaseAnchor(VectorId anchor_id) {
 	ARACHNE_TRACE_SCOPE("RegionManager", "releaseAnchor");
-	// Immediate: dependency-graph bookkeeping, write-lease release, and
-	// clearResidency() all happen synchronously here -- so a Region orphaned
-	// by `anchor_id` is instantly eligible to be re-promoted fresh for a
-	// different Anchor (make() will correctly see an invalid lease and start
-	// over) without that new promotion racing or colliding with this
-	// Region's still-pending GPU reclaim below, which is captured into an
-	// independent snapshot and never looked up live again.
+	// Synchronous: dependency bookkeeping, lease release, and clearResidency()
+	// all happen here so an orphaned Region is instantly re-promotable for a
+	// different Anchor, without racing this Region's still-pending reclaim
+	// below (captured into an independent snapshot, never looked up live again).
 	std::vector<RegionId> orphaned = forget(anchor_id);
 
-	// replacement_policy_ must stop tracking anchor_id here regardless of
-	// whether forget() actually freed a Region -- see the historical bug this
-	// guards against: an Anchor evicted from a still-multiply-depended-on
-	// Region must still stop being FIFO-selectable, or a capacity-retry loop
-	// elsewhere could re-select it forever without making progress.
+	// Must stop tracking anchor_id regardless of whether forget() freed a
+	// Region: an Anchor evicted from a still-multiply-depended-on Region must
+	// still stop being FIFO-selectable, or a capacity-retry loop elsewhere
+	// could re-select it forever without making progress.
 	replacement_policy_->onAnchorEvicted(anchor_id);
 
-	// Bump the epoch (see PromotionCandidate's own doc comment) *before*
-	// erasing from RoutingCache below -- any PromotionCandidate for
-	// anchor_id already sitting in pending_promotions_/the policy's own
-	// storage, enqueued before this call, now carries a stale epoch and will
-	// be discarded by processPromotions() rather than acted on.
+	// Bump the epoch *before* erasing from RoutingCache -- any
+	// PromotionCandidate for anchor_id enqueued before this call now carries
+	// a stale epoch and will be discarded by processPromotions().
 	{
 		std::lock_guard<RegionManagerMutex> lock(mutex_);
 		++anchor_epoch_[anchor_id];
@@ -259,14 +261,10 @@ void RegionManager::waitIdle() {
 
 	lock.lock();
 	idle_cv_.wait(lock, [this] {
-		// pending_promotions_/pending_reclaims_ being empty only proves
-		// RegionManager's own intake queue has been drained *into* the policy
-		// -- it does not prove the policy has actually offered every admitted
-		// candidate back out via selectNextPromotionCandidate() yet (it may be
-		// holding some, or onRelocationTrigger() may have been declining before
-		// force_wake_ overrode it) -- so hasPendingCandidates() must also be
-		// checked, or waitIdle() could return before every requested promotion
-		// has actually been attempted.
+		// Empty intake queues only prove they've been drained *into* the
+		// policy, not that the policy has offered every admitted candidate
+		// back out yet -- hasPendingCandidates() must also be checked, or this
+		// could return before every requested promotion was actually attempted.
 		return !coordinator_busy_ && pending_promotions_.empty() && pending_reclaims_.empty() &&
 					 !replacement_policy_->hasPendingCandidates();
 	});
@@ -302,33 +300,22 @@ void RegionManager::coordinatorLoop() {
 		pending_reclaims_.clear();
 		lock.unlock();
 
-		// Ingestion: hand every freshly-drained candidate to the replacement
-		// policy's own storage -- see ReplacementPolicy::enqueueCandidate()'s
-		// doc comment. Happens every wakeup, independent of whether execution
-		// runs below -- this is the "background work" that keeps the policy's
-		// view current without waiting for a trigger.
+		// Ingestion happens every wakeup regardless of what runs below -- this
+		// keeps the policy's view current without waiting for a trigger.
 		for (PromotionCandidate& candidate : admitted) {
 			replacement_policy_->enqueueCandidate(std::move(candidate));
 		}
 
-		// Reclaims are unrelated to the replacement policy (already-decided
-		// cleanup work from releaseAnchor()/evictAnchorNow(), not a fresh
-		// decision) -- process them unconditionally, same as before. Frees up
-		// capacity a promotion in this same pass might otherwise have needed to
-		// evict something else for.
+		// Reclaims are already-decided cleanup (from releaseAnchor()/
+		// evictAnchorNow()), not a policy decision -- process unconditionally.
 		if (!reclaims.empty()) reclaimRegions(reclaims);
 
-		// Execution: gated by the policy's own onRelocationTrigger() -- unless
-		// force-woken or stopping, either of which must guarantee every
-		// admitted candidate has actually been offered, bypassing whatever
-		// timing preference the policy would otherwise apply. `stop` (not just
-		// `forced`) is checked here too: `forced` is a one-shot flag consumed
-		// on the very next wakeup, but coordinator_stop_requested_ stays true
-		// across every remaining iteration until this loop actually exits, so
-		// shutdown() keeps forcing execution on every iteration -- not just the
-		// first -- until the policy's own backlog is genuinely drained (see the
-		// break condition below), rather than risking the loop exiting early or
-		// spinning on a policy that keeps declining.
+		// Execution is gated by the policy's own onRelocationTrigger(), unless
+		// force-woken or stopping (both must guarantee every admitted
+		// candidate is actually offered). `stop` is checked separately from
+		// `forced` because `forced` is one-shot but stop stays true across
+		// every remaining iteration, so shutdown() keeps forcing execution
+		// until the policy's backlog is genuinely drained (see below).
 		if (forced || stop || replacement_policy_->onRelocationTrigger()) {
 			processPromotions();
 		}
@@ -358,18 +345,14 @@ std::optional<gpu::DeviceRegionHandle> RegionManager::allocateWithCompaction(
 		return std::nullopt;  // genuinely over budget -- compacting frees nothing new
 	}
 
-	// Same hazard as processPromotions()'s eviction-retry loop: compact()
-	// touches every live Data-kind allocation, including Regions already
-	// promoted earlier in this same Coordinator pass and still holding an
-	// open Lease in `pending` (make()'s caller only flushes/releases it at
-	// the very end of the whole batch) -- flush and release those first, or
-	// compact()'s own awaitQuiescentLocked() would deadlock waiting on a
-	// Lease this same call is still holding open.
+	// Flush and release any Lease already pinned earlier in this batch first:
+	// compact() only relocates unpinned allocations, so this widens its pool
+	// of movable blocks instead of excluding Regions this same batch pinned.
 	if (!pending.empty()) {
 		device_region_pool_->flush();
 		pending.clear();
 	}
-	device_region_pool_->compact(gpu::MemoryKind::Data);
+	device_region_pool_->compact(gpu::MemoryKind::Data, bytes);
 	stat_compactions_total_.fetch_add(1, std::memory_order_relaxed);
 	return device_region_pool_->tryAllocate(bytes);
 }
@@ -420,9 +403,8 @@ RegionManager::MakeResult RegionManager::make(VectorId anchor_id, RegionId regio
 	}
 
 	// No replacement_policy_ notification here -- selectNextPromotionCandidate()
-	// already recorded `anchor_id` for eviction-ordering purposes, at the
-	// moment it offered this candidate, before make() was ever called for it
-	// (see that method's own doc comment).
+	// already recorded anchor_id for eviction-ordering purposes before make()
+	// was ever called for it.
 	addDependency(anchor_id, region);
 
 	ARACHNE_LOG_DEBUG("make: anchor {} now depends on region {}", anchor_id, region);
@@ -464,17 +446,13 @@ void RegionManager::processPromotions() {
 					break;
 				}
 
-				// Flush and release every Lease accumulated so far in this pass
-				// *before* evicting -- a Region already promoted earlier in this
-				// same batch is still holding an open Lease in `pending` (it isn't
-				// released until `pending` itself is destroyed, at the very end of
-				// this function), and `victim` may turn out to depend on exactly
-				// that Region. Without this, evictAnchorNow()'s free() would
-				// awaitQuiescentLocked() on a Lease this same function is still
-				// holding open -- a real deadlock (the Coordinator thread waiting
-				// on itself), not just a missed optimization. Safe to flush before
-				// we know it's needed: flush() only proves already-enqueued copies
-				// landed, it doesn't invalidate anything `pending` still holds.
+				// Flush and release every Lease from this pass before evicting:
+				// `victim` may depend on a Region this pass already promoted and
+				// is still pinning via `pending`. Without this,
+				// evictAnchorNow()'s free() would await that same Lease -- a real
+				// deadlock (the Coordinator waiting on itself), not just a missed
+				// optimization. Safe unconditionally: flush() only proves
+				// already-enqueued copies landed, it doesn't invalidate `pending`.
 				if (!pending.empty()) {
 					device_region_pool_->flush();
 					pending.clear();
@@ -491,23 +469,18 @@ void RegionManager::processPromotions() {
 			}
 		}
 
-		// Register the Anchor in RoutingCache now that its residency actually
-		// changed -- see the class doc comment (region_manager.hpp) for why
-		// this replaces Controller's old, unconditional commitSearch()/
-		// commitInsert() calls. Only if at least one Region in this
-		// candidate's footprint actually became a dependency: a candidate that
-		// went entirely NotEligible/OutOfCapacity gained no GPU residency at
-		// all, so there is nothing here for a future query to be routed to.
+		// Register in RoutingCache only if at least one Region in this
+		// candidate's footprint actually became a dependency -- a candidate
+		// that went entirely NotEligible/OutOfCapacity gained no GPU residency
+		// for a future query to be routed to.
 		if (any_promoted && routing_cache_ != nullptr) {
 			routing_cache_->ensure(candidate->anchor_id, candidate->vectorView(), kDefaultAnchorMaxDistance);
 		}
 	}
 
-	// One batched flush for every host-to-device copy enqueued above across
-	// the *whole pass* -- not just one Anchor's footprint -- one
-	// scatter-gather round trip for everything the policy offered this
-	// trigger, mirroring reclaimRegions()/writeBackDirtyRegions()'s own
-	// batched-gather shape for the opposite (device-to-host) direction.
+	// One batched flush for the whole pass, not one per Anchor -- mirrors
+	// reclaimRegions()/writeBackDirtyRegions()'s batched-gather shape for the
+	// opposite (device-to-host) direction.
 	device_region_pool_->flush();
 }
 

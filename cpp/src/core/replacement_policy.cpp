@@ -10,11 +10,10 @@ void FifoReplacementPolicy::enqueueCandidate(PromotionCandidate candidate) {
 void FifoReplacementPolicy::onAnchorEvicted(VectorId anchor_id) {
 	std::lock_guard<std::mutex> lock(mutex_);
 
-	// Might still be sitting unselected (never reached
-	// selectNextPromotionCandidate() yet) -- e.g. requestPromotion() followed
-	// quickly by a delete/verification-mismatch before the Coordinator got to
-	// it. Drop it here too, not just from promoted_order_/promoted_tracked_
-	// below, or a stale candidate would still get offered later.
+	// May still be sitting unselected (requestPromotion() followed quickly by
+	// a delete before the Coordinator got to it) -- drop it here too, not
+	// just from promoted_order_/promoted_tracked_ below, or a stale candidate
+	// would still get offered later.
 	pending_candidates_.erase(std::remove_if(pending_candidates_.begin(), pending_candidates_.end(),
 																						[anchor_id](const PromotionCandidate& candidate) {
 																							return candidate.anchor_id == anchor_id;
@@ -112,11 +111,10 @@ std::optional<PromotionCandidate> LruReplacementPolicy::selectNextPromotionCandi
 	pending_candidates_.pop_front();
 
 	// Becoming resident counts as a "use" -- insert at the most-recently-used
-	// end now, at selection time (mirrors FifoReplacementPolicy's own
-	// admission-order recording here -- see the interface doc comment for why
-	// there is no separate grant-time confirmation). A second selection for
-	// an already-tracked Anchor (e.g. a second Region) leaves its recency
-	// alone; onAnchorTouched() is the intended signal for that.
+	// end now, at selection time (see the interface doc comment for why there
+	// is no separate grant-time confirmation). A second selection for an
+	// already-tracked Anchor leaves its recency alone; onAnchorTouched() is
+	// the intended signal for that.
 	if (lru_position_.find(candidate.anchor_id) == lru_position_.end()) {
 		lru_order_.push_back(candidate.anchor_id);
 		lru_position_.emplace(candidate.anchor_id, std::prev(lru_order_.end()));
@@ -191,11 +189,10 @@ std::optional<PromotionCandidate> LfuReplacementPolicy::selectNextPromotionCandi
 	pending_candidates_.pop_front();
 
 	// Becoming resident starts an Anchor at frequency 1 -- an implicit first
-	// "use", mirroring LRU/Clock's own treatment of grant-time (see the
-	// interface doc comment for why there is no separate grant-time
-	// confirmation). A second selection for an already-tracked Anchor (e.g. a
-	// second Region) leaves its frequency alone; onAnchorTouched() is the
-	// intended signal for that.
+	// "use" (see the interface doc comment for why there is no separate
+	// grant-time confirmation). A second selection for an already-tracked
+	// Anchor leaves its frequency alone; onAnchorTouched() is the intended
+	// signal for that.
 	if (tracked_.find(candidate.anchor_id) == tracked_.end()) {
 		std::list<VectorId>& bucket = freq_buckets_[1];
 		bucket.push_back(candidate.anchor_id);

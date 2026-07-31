@@ -36,20 +36,18 @@ struct ModificationDelta {
 /// gpu/device_region_handle.hpp) inside a Region (core/region_manager.hpp):
 /// together the two describe where one Region's data lives on each side of
 /// the host/device boundary.
+///
+/// `subregion_bytes` sets the granularity at which Core tracks which parts
+/// of this Region were written to during a GPU write lease (see
+/// gpu/dirty_header.hpp for the bitmap this drives). The adapter, not Core,
+/// picks the value, since it should match the index's own natural write
+/// unit (e.g. roughly one graph node's record for an HNSW-style adapter). 0
+/// (the default) disables fine-grained tracking and treats the whole Region
+/// as one dirty/clean unit -- the only real choice until Core's GPU
+/// allocation for Regions is wired (see Controller::make()'s doc comment).
 struct HostRegionView {
 	void* ptr = nullptr;
 	std::size_t bytes = 0;
-
-	/// Granularity, in bytes, at which Core should track which parts of this
-	/// Region were actually written to while it held a GPU write lease --
-	/// see gpu/dirty_header.hpp for the bitmap this drives and why the
-	/// adapter, not Core, is the one who should pick the value (it's tied to
-	/// the index's own natural write unit, e.g. roughly one graph node's
-	/// record for an HNSW-style adapter). 0 (the default) disables
-	/// fine-grained tracking: the whole Region is treated as a single
-	/// dirty/clean unit, which is the only real choice until Core's GPU
-	/// allocation for Regions is wired -- see Controller::make()'s doc
-	/// comment.
 	std::size_t subregion_bytes = 0;
 };
 
@@ -80,11 +78,9 @@ class IRegion {
 	virtual RegionFootprint footprint() const = 0;
 
 	/// Where this region's authoritative data currently lives in host
-	/// memory. Arachne records the returned pointer/size into the Region
-	/// record it registers for this id (see core/region_manager.hpp) purely
-	/// as a mapping -- it never dereferences, allocates, or frees it; the
-	/// adapter remains free to change its own host layout as long as this
-	/// stays accurate whenever Core calls it.
+	/// memory. Arachne records the pointer/size purely as a mapping (see
+	/// core/region_manager.hpp) -- never dereferences, allocates, or frees
+	/// it; the adapter may change its own host layout as long as this stays accurate.
 	virtual HostRegionView hostView() const = 0;
 
 	/// Invoked by Core. acquireWriteLease grants this region GPU

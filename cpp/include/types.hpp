@@ -5,6 +5,13 @@
 
 namespace arachne {
 
+/// Core data-plane vocabulary shared across every layer of Arachne (Core,
+/// adapters, RoutingCache, Index): how a vector's raw bytes are typed and
+/// laid out (VectorDType, VectorView), and the request/response shapes for
+/// SEARCH/INSERT/DELETE (Query/Record, SearchResult/InsertResult/
+/// DeleteResult). Kept dependency-free (no other arachne header) so it can
+/// sit underneath everything else.
+
 using VectorId = std::uint64_t;
 using RegionId = std::uint64_t;
 

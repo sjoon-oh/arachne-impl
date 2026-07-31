@@ -2,6 +2,43 @@
 
 #include <gtest/gtest.h>
 
+// Tests for every concrete ReplacementPolicy implementation
+// (core/replacement_policy.hpp): FifoReplacementPolicy, LruReplacementPolicy,
+// LfuReplacementPolicy, ClockReplacementPolicy, TwoQReplacementPolicy. Each
+// gets its own TEST suite (FifoReplacementPolicyTest, LruReplacementPolicyTest,
+// ...) that walks the same menu of ReplacementPolicy contract points,
+// customized to that policy's own eviction-order semantics:
+//
+//   - selectNextPromotionCandidate(): admission order (plain FIFO for every
+//     policy here -- see enqueueCandidate()'s doc comment) and footprint
+//     round-tripping through PromotionCandidate.
+//   - hasPendingCandidates() / onRelocationTrigger(): both reduce to "is
+//     there anything admitted but not yet selected".
+//   - selectNextEvictionCandidate(): the part that actually differs per
+//     policy --
+//       Fifo:  oldest-granted-first.
+//       Lru:   least-recently-touched-first; becoming resident itself
+//              counts as an initial "use".
+//       Lfu:   lowest touch-frequency-first, ties broken FIFO.
+//       Clock: reference-bit sweep with second-chance semantics (bounded
+//              two-sweep scan).
+//       TwoQ:  a1in_ (first-timers) always preferred over am_ (proven
+//              hot); the a1out_ ghost queue fast-tracks a returning id
+//              straight into am_ instead of back through a1in_.
+//     Every suite also covers the `excluded` skip and the "only the
+//     excluded id is eligible" nullopt case.
+//   - onAnchorEvicted(): must purge both the pending-candidate queue and
+//     whatever eviction-ordering structure the policy uses; a no-op for
+//     untracked ids.
+//   - onAnchorTouched(): the hotness signal each policy interprets
+//     differently (no-op for Fifo, recency bump for Lru, frequency bump
+//     for Lfu, reference-bit set for Clock, a1in_ -> am_ promotion for
+//     TwoQ); also a no-op for untracked ids.
+//
+// MakeCandidate() below is the one shared helper: a minimal
+// PromotionCandidate (empty footprint) for a given anchor id, used by any
+// test that doesn't care about footprint contents specifically.
+
 namespace {
 
 using arachne::ClockReplacementPolicy;
@@ -376,9 +413,7 @@ TEST(LruReplacementPolicyTest, SelectNextEvictionCandidateIsNulloptWhenOnlyExclu
 
 TEST(LruReplacementPolicyTest, ReSelectingTheSameAnchorDoesNotResetItsRecency) {
 	// A second Region dependency for an already-resident Anchor is not itself
-	// a "use" -- onAnchorTouched() is the intended signal for that (see
-	// SelectingAPromotionCandidateMakesItEvictionEligible and the class doc
-	// comment).
+	// a "use" -- onAnchorTouched() is the intended signal for that.
 	LruReplacementPolicy policy;
 	policy.enqueueCandidate(MakeCandidate(1));
 	policy.enqueueCandidate(MakeCandidate(2));
@@ -686,14 +721,10 @@ TEST(ClockReplacementPolicyTest, OnAnchorTouchedGivesAnAlreadyClearedEntryASecon
 	policy.selectNextPromotionCandidate();  // 1, referenced=true
 	policy.selectNextPromotionCandidate();  // 2, referenced=true
 
-	// Both start referenced=true (grant-time "use"), so a full sweep only
-	// clears bits and parks hand_ on the first cleared slot (anchor 1)
-	// without needing to evict anyone -- see
-	// FreshlyGrantedAnchorsSurviveOneSweepThenBecomeEvictable for that in
-	// isolation. excluded=999 (nonexistent) makes this a pure "probe": it
-	// still returns anchor 1 (now that its bit is cleared), but the test
-	// deliberately never acts on that -- RegionManager normally would evict
-	// whatever comes back, but nothing here requires it.
+	// Both start referenced=true, so this sweep just clears bits and parks
+	// hand_ on the first cleared slot (anchor 1) without evicting anyone.
+	// excluded=999 (nonexistent) makes this a pure probe -- the result is
+	// deliberately discarded.
 	policy.selectNextEvictionCandidate(/*excluded=*/999);
 
 	// hand_ is now parked on anchor 1's (cleared) slot. Touching it right
@@ -918,14 +949,10 @@ TEST(TwoQReplacementPolicyTest, GhostQueueIsBoundedByConfiguredCapacity) {
 	policy.enqueueCandidate(MakeCandidate(99));
 	policy.selectNextPromotionCandidate();  // a1in_ = [1, 99] if the above landed correctly
 
-	// Excluding 99 would find 1 either way (via a1in_ directly if correct,
-	// or via the am_ fallback if 1 wrongly landed there instead) -- not a
-	// distinguishing check. What actually distinguishes "1 correctly went to
-	// a1in_" from "1 wrongly skipped to am_ as if it were a ghost hit" is
-	// *which queue* 1 ended up in: with excluded=0 (nothing), the scan
-	// checks a1in_ first, so it only returns 1 if 1 is actually the front of
-	// a1in_ -- if 1 had wrongly landed in am_ instead, this would return 99
-	// (a1in_'s sole occupant) instead.
+	// excluded=0 is the distinguishing check: the scan hits a1in_ first, so
+	// this returns 1 only if 1 is genuinely a1in_'s front. If 1 had wrongly
+	// skipped to am_ (treated as a ghost hit), this would return 99 instead
+	// (a1in_'s sole occupant).
 	auto candidate = policy.selectNextEvictionCandidate(/*excluded=*/0);
 	ASSERT_TRUE(candidate.has_value());
 	EXPECT_EQ(*candidate, 1u);

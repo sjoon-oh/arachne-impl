@@ -5,10 +5,16 @@
 #include <cstddef>
 
 // Highway's multi-target machinery: this file is recompiled once per CPU
-// target it's told to support, via foreach_target.h re-including it (by the
-// path below, resolved through arachne_core's own include dirs) with
-// different HWY_TARGET values each time, then once more for the dispatch
-// wrappers below HWY_ONCE. See
+// target it's told to support (AVX-512/AVX2/SSE4/NEON/scalar), via
+// foreach_target.h re-including it (by the path below, resolved through
+// arachne_core's own include dirs) with a different HWY_TARGET value each
+// pass -- each pass emits its *Impl functions into its own HWY_NAMESPACE
+// (e.g. arachne::util::N_AVX2), so all targets coexist in the same
+// translation unit without symbol collisions. A final pass, guarded by
+// HWY_ONCE below, compiles once (not per-target) to define the public
+// dispatch wrappers: HWY_EXPORT() registers each target's *Impl under one
+// table, and HWY_DYNAMIC_DISPATCH() picks the best one for the CPU actually
+// running the process, the first time each wrapper is called. See
 // https://github.com/google/highway/blob/master/g3doc/quick_reference.md.
 #undef HWY_TARGET_INCLUDE
 #define HWY_TARGET_INCLUDE "src/util/distance.cpp"
@@ -93,8 +99,9 @@ void NormalizeImpl(const float* HWY_RESTRICT in, float* HWY_RESTRICT out, std::u
 }  // namespace arachne
 HWY_AFTER_NAMESPACE();
 
-// Dispatch wrappers -- the public arachne::util:: entry points declared in
-// simd.hpp -- are only compiled once, on the final foreach_target.h pass.
+// Dispatch wrappers (public arachne::util:: entry points declared in
+// distance.hpp) -- see the file-level overview above for why this section
+// is guarded by HWY_ONCE.
 #if HWY_ONCE
 namespace arachne {
 namespace util {

@@ -61,12 +61,14 @@ TEST_P(StressIndexStage1Test, InsertThenSearchMatchesBruteForceGroundTruth) {
 	std::size_t header_bytes = arachne::gpu::DirtyHeaderBytes(region_bytes, kDim * element_size);
 	std::size_t num_regions = (kCapacity + kVectorsPerRegion - 1) / kVectorsPerRegion;
 	std::size_t budget = (region_bytes + header_bytes) * num_regions;
-	// rmm::mr::pool_memory_resource requires the initial pool size to be a
-	// multiple of 256 bytes.
-	budget += (256 - budget % 256) % 256;
 
+	// gpu_unit_bytes == one Region's total footprint so each Region occupies
+	// exactly one arena unit -- otherwise AllocationPolicy::Pooled's coarser
+	// default unit size could cap simultaneously-resident Regions far below
+	// num_regions, forcing eviction churn this stage isn't meant to exercise.
 	Controller controller(index, routing_cache, arachne::SchedulingConfig{}, nullptr, budget,
-												 arachne::gpu::kDefaultMetadataPoolBytes);
+												 arachne::gpu::kDefaultMetadataPoolBytes,
+												 /*gpu_unit_bytes=*/region_bytes + header_bytes);
 	index.registerAllRegions(controller);
 
 	std::mt19937 rng(42);
@@ -135,16 +137,11 @@ TEST_P(StressIndexStage1Test, InsertThenSearchMatchesBruteForceGroundTruth) {
 	controller.waitIdle();
 	ControllerStats stats = controller.stats();
 	EXPECT_GT(stats.regions_promoted_total, 0u);
-	// The budget comfortably fits every registered Region, so *capacity*-
-	// driven eviction (RegionManager::evictAnchorNow(), via
-	// processPromotions()'s OutOfCapacity retry loop) should never fire here.
-	// regions_evicted_total can still be nonzero though: it also counts a
-	// Region freed because one of the kNumDeletes ids above happened to be
-	// its sole remaining dependent at the moment it was deleted (see
-	// RegionManager::releaseAnchor()) -- a legitimate, timing-dependent
-	// consequence of deleting an early-inserted (and therefore often
-	// sparsely-shared) Anchor, not eviction under pressure. Bounded by
-	// kNumDeletes since at most one Region can be orphaned per delete.
+	// The budget comfortably fits every registered Region, so capacity-driven
+	// eviction (RegionManager::evictAnchorNow()) should never fire here.
+	// regions_evicted_total can still be nonzero though: a delete above may
+	// have orphaned a Region (its sole remaining dependent) -- legitimate,
+	// and bounded by kNumDeletes since at most one Region is orphaned per delete.
 	EXPECT_LE(stats.regions_evicted_total, kNumDeletes);
 }
 

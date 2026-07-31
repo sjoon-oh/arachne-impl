@@ -1,6 +1,8 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
+#include <memory>
 #include <mutex>
 #include <condition_variable>
 #include <optional>
@@ -9,56 +11,106 @@
 #include <cuda/memory_resource>
 #include <cuda_runtime.h>
 
+#include "gpu/compaction_policy.hpp"
 #include "gpu/device_context.hpp"
 #include "gpu/device_region_handle.hpp"
+#include "gpu/unit_pool_arena.hpp"
 
 namespace arachne::gpu {
 
 /// Arachne-owned GPU memory allocator backing every Region (see
-/// core/region_manager.hpp). Per the Anchor-centric residency policy:
+/// core/region_manager.hpp). Per the Anchor-centric residency policy,
 /// promote/evict decisions are made per-Region based on the depending
 /// Anchors' observed hotness/latency/transfer-cost, not on fixed-size
 /// address-based pages -- so allocations here are variable-sized and
 /// identified by opaque handle, not laid out on any fixed slab grid.
 /// Adapters never call cudaMalloc directly for memory a Region is meant to
-/// cover; they go through the DeviceRegionPool threaded down from Controller so
-/// Arachne, not the index, accounts for (and eventually migrates)
+/// cover; they go through the DeviceRegionPool threaded down from Controller
+/// so Arachne, not the index, accounts for (and eventually migrates)
 /// residency.
 ///
-/// Backed by DeviceContext's two resources (dataResource()/
-/// metadataResource(), routed to by `kind` -- see MemoryKind), each built
-/// according to DeviceContext::allocationPolicy() (see AllocationPolicy).
-/// DeviceRegionPool itself never checks which policy is active -- both
-/// alternatives present the identical cuda::mr::any_resource
-/// allocate()/deallocate() surface, which is the whole point of that
-/// type erasure: swapping policies is a DeviceContext-construction-time
-/// choice, invisible here.
+/// Backed by DeviceContext, routed to by `kind` (see MemoryKind), one of two
+/// ways depending on DeviceContext::allocationPolicy() (see AllocationPolicy
+/// in gpu/device_context.hpp):
 ///
-/// Thread-safe: every method takes DeviceRegionPool's own lock, mirroring
-/// RegionManager's own concurrency contract (Controller is called
+///   AllocationPolicy::Normal               AllocationPolicy::Pooled
+///   allocate()/free() go straight          allocate()/free() go through
+///   through to DeviceContext's             DeviceContext's dataArena()/
+///   dataResource()/metadataResource()      metadataArena() (a UnitPoolArena:
+///   -- a real cudaMalloc/cudaFree          one big preallocated buffer,
+///   each call.                            suballocated in fixed-size units).
+///                                         Fragmentation-triggered relocation
+///                                         is handled by an injected
+///                                         CompactionPolicy (see compact()).
+///
+/// The two policies no longer share one uniform allocate()/deallocate()
+/// surface -- DeviceRegionPool itself branches on allocationPolicy() at each
+/// entry point (allocateNormal()/allocatePooled(), freeNormal()/
+/// freePooled()) precisely because Pooled needs the richer, relocation-aware
+/// UnitPoolArena surface that a generic cuda::mr resource can't provide (see
+/// UnitPoolArena's and CompactionPolicy's own doc comments for why).
+///
+/// Lease and cross-stream safety: a raw device pointer is never handed out
+/// directly. acquire() resolves a handle to a pointer only inside a Lease,
+/// which marks the allocation "in use" until released. compact() and free()
+/// both wait for every outstanding Lease on a handle to be released -- and
+/// for the GPU to actually catch up to that release point -- before
+/// relocating or reclaiming its memory. Because CUDA work is asynchronous,
+/// "released" alone doesn't mean "GPU is done": release() records a CUDA
+/// event on the Lease's stream marking everything enqueued up to that point,
+/// and a future compact()/free() call waits on that event via
+/// cudaStreamWaitEvent (not a host-blocking sync), so the common case (no
+/// pending work) costs nothing. This same event-wait discipline is what lets
+/// acquire() safely hand different callers (per-worker compute streams, the
+/// management stream -- see DeviceContext) genuinely different streams over
+/// the same allocation: before returning a Lease, acquire() inserts a
+/// GPU-side cudaStreamWaitEvent on the requested stream for every other
+/// stream's still-pending "last used" event, so work on the new stream is
+/// guaranteed ordered-after any prior use on a different stream.
+///
+/// Compaction executor (tryOpenContiguousExtentLocked(), shared by
+/// allocatePooled()'s internal retry and compact()'s explicit call): under
+/// Pooled, when `kind`'s largest free extent can't satisfy required_units
+/// but totalFreeUnits() can, this snapshots every currently-unpinned live
+/// allocation of `kind` into a MovableBlock list, asks compaction_policy_
+/// for a Plan against the arena's current free-extent state, then executes
+/// it move by move -- for each Move: re-validates the block is still
+/// present and unpinned (cheap insurance; mutex_ has been held continuously
+/// since the snapshot, so nothing can actually have changed), waits for it
+/// to go quiescent (awaitQuiescentLocked(), guaranteed non-blocking here
+/// since only already-unpinned blocks were ever offered), claims the
+/// destination range, issues the D2D copy on DeviceContext's canonical
+/// stream, updates the allocation's device_ptr/unit_range, and frees the
+/// vacated source range. Returns {} immediately, without ever consulting
+/// compaction_policy_, if the largest free extent already satisfies
+/// required_units, or if totalFreeUnits() doesn't either (a genuine
+/// capacity shortfall no relocation plan can fix).
+///
+/// allocatePooled() invokes this internally, targeted at the one request
+/// that just failed best-fit, so an ordinary fragmentation-induced
+/// allocation failure self-heals without every caller needing to know to
+/// call compact() themselves; compact() invokes the same mechanism targeted
+/// at "everything the policy is willing to merge" as its own explicit,
+/// caller-triggered entry point. Either way, only allocations with
+/// in_use_count == 0 at snapshot time are ever relocated -- a pinned
+/// allocation is simply never offered to the CompactionPolicy, never
+/// something either path blocks waiting to become unpinned the way an older
+/// unconditional-relocate-everything design did. Cost is bounded by the
+/// injected CompactionPolicy's own budget (see
+/// TargetedCompactionPolicy::Budget), never "every live allocation of
+/// `kind`".
+///
+/// Thread-safe: every method takes DeviceRegionPool's own lock (mutex_),
+/// mirroring RegionManager's own concurrency contract (Controller is called
 /// concurrently the same way RegionManager is).
 class DeviceRegionPool {
  public:
-	/// RAII marker: "the current holder is actively using `handle`'s device
-	/// memory, work against it may still be in flight on stream()". While a
-	/// Lease is alive, DeviceRegionPool guarantees the handle it covers will not be
-	/// relocated (compact()) or reclaimed (free(), including via Eviction --
-	/// see Controller) out from under it -- both wait for every outstanding
-	/// Lease on a handle to be released before touching its memory (see
-	/// acquire() and the shared internal mechanism both compact() and free()
-	/// use).
-	///
-	/// Releasing a Lease (its destructor) does not itself prove the GPU has
-	/// finished any work enqueued against stream() while the Lease was held
-	/// -- work enqueued asynchronously can still be running after the host
-	/// call that launched it returns. So release() records a CUDA event on
-	/// stream() marking "everything enqueued on this stream up to here, by
-	/// this Lease"; a future compact()/free() call waits on that event (via
-	/// cudaStreamWaitEvent, not a host-blocking sync) before reusing the
-	/// memory, so no host-side stall is imposed on the common case where
-	/// nothing needs to wait.
-	///
-	/// Move-only: ownership of "currently in use" is unique per Lease.
+	/// RAII marker: the current holder is actively using `handle`'s device
+	/// memory (work may still be in flight on stream()). While alive,
+	/// DeviceRegionPool guarantees `handle` will not be relocated or
+	/// reclaimed out from under it -- see the class overview above for how
+	/// release() and the event-wait mechanism make that safe without a host
+	/// block. Move-only: "currently in use" ownership is unique per Lease.
 	class Lease {
 	 public:
 		~Lease();
@@ -87,98 +139,72 @@ class DeviceRegionPool {
 		void* ptr_;
 	};
 
-	explicit DeviceRegionPool(DeviceContext& device);
+	/// `compaction_policy` governs compact() and allocate()'s internal
+	/// fragmentation retry under Pooled; null defaults to
+	/// TargetedCompactionPolicy with its default Budget. Safe to pass one
+	/// under Normal too -- it's simply never invoked there.
+	explicit DeviceRegionPool(DeviceContext& device, std::unique_ptr<CompactionPolicy> compaction_policy = nullptr);
 	~DeviceRegionPool();
 
 	DeviceRegionPool(const DeviceRegionPool&) = delete;
 	DeviceRegionPool& operator=(const DeviceRegionPool&) = delete;
 
-	/// Allocates `bytes` of device memory from the resource matching `kind`
-	/// (see MemoryKind) and returns a handle to it. Throws (propagated from
-	/// the underlying cuda::mr::any_resource) if the allocation actually
-	/// fails -- callers that need a non-throwing, capacity-aware attempt
-	/// (Controller's Promotion path) should use tryAllocate() below instead.
+	/// Allocates `bytes` of `kind` memory and returns a handle. Throws if the
+	/// allocation fails; callers needing a non-throwing, capacity-aware
+	/// attempt (Controller's Promotion path) should use tryAllocate() instead.
+	///
+	/// Under Pooled, a best-fit failure triggers exactly one internal
+	/// fragmentation-relocation attempt (tryOpenContiguousExtentLocked(),
+	/// targeted at this request's own size) before retrying once and, only
+	/// then, throwing std::runtime_error -- see the class overview above for
+	/// why this self-heals without callers needing to call compact()
+	/// themselves.
 	DeviceRegionHandle allocate(std::size_t bytes, MemoryKind kind = MemoryKind::Data);
 
 	/// True if allocating `bytes` more of `kind` would stay within
-	/// DeviceContext::budgetBytes(kind) -- Arachne's own self-imposed ceiling
-	/// on how much `kind` memory it is willing to have resident, checked
-	/// against what's currently outstanding (bytesAllocated(kind)). A
-	/// snapshot, not a reservation: nothing stops a concurrent
-	/// allocate()/tryAllocate() from being accepted in between a caller
-	/// checking this and acting on it (see tryAllocate()'s own doc comment
-	/// for why that race is acceptable here).
+	/// DeviceContext::budgetBytes(kind), checked against
+	/// bytesAllocated(kind). A snapshot, not a reservation -- see
+	/// tryAllocate()'s doc comment for why the resulting race is acceptable.
 	bool hasCapacity(std::size_t bytes, MemoryKind kind = MemoryKind::Data) const;
 
 	/// Capacity-aware allocate(): returns std::nullopt instead of throwing,
-	/// both when hasCapacity() already says no (the common, cheap case --
-	/// avoids an allocation attempt Arachne itself has decided not to permit)
-	/// and when the underlying resource's allocate() throws despite
-	/// hasCapacity() saying yes (e.g. actual GPU memory pressure under
-	/// AllocationPolicy::Naive, which never pre-reserves -- see
-	/// AllocationPolicy's doc comment). This is what lets Controller::make()
-	/// treat "no room right now" as an ordinary, retryable outcome (evict a
-	/// victim, try again) instead of an exception to propagate -- see its own
-	/// doc comment.
+	/// whether hasCapacity() already said no or the underlying allocate()
+	/// throws anyway (e.g. real GPU pressure under Normal, or an uncloseable
+	/// Pooled fragmentation shortfall). Lets callers (e.g.
+	/// Controller::make()) treat "no room right now" as retryable rather
+	/// than exceptional.
 	///
-	/// The race hasCapacity() alone leaves open (two concurrent callers both
-	/// observing enough headroom for their own request, then both actually
-	/// allocating and together exceeding budget by a bounded amount) is
-	/// accepted rather than closed with a reservation step: Controller only
-	/// ever calls this while holding intent to immediately use the result,
-	/// and a bounded, occasional overshoot of a self-imposed budget is far
-	/// cheaper to tolerate than serializing every allocate() behind a second
-	/// lock acquisition across this call and the real one.
+	/// The race hasCapacity() leaves open -- concurrent callers both seeing
+	/// headroom, then both allocating and together overshooting budget -- is
+	/// accepted rather than closed with a reservation step: callers act on
+	/// the result immediately, and a bounded overshoot is cheaper than
+	/// serializing every allocate() behind a second lock acquisition.
 	std::optional<DeviceRegionHandle> tryAllocate(std::size_t bytes, MemoryKind kind = MemoryKind::Data);
 
 	/// Marks `handle` in use on `stream` until the returned Lease is
-	/// destroyed -- see Lease's own doc comment for what that guarantees.
-	/// This is the *only* way to resolve a handle to its device pointer:
-	/// there used to be a bare access() that returned a raw pointer with no
-	/// such guarantee, but every caller that resolved a pointer without
-	/// holding a Lease around its actual use was exposed to compact()
-	/// relocating (or free() reclaiming) the memory out from under it --
-	/// including, subtly, this class's own copyFromHost()/copyToHost() below
-	/// before they were changed to acquire() internally. Throws
+	/// destroyed -- the only way to resolve a handle to its device pointer
+	/// (see Lease's and the class overview's own doc comments for why a bare
+	/// pointer-returning accessor doesn't exist anymore). Throws
 	/// std::invalid_argument if `handle` was never returned by allocate() on
 	/// this pool, or was already freed.
-	///
-	/// Cross-stream safety: before handing back the Lease, inserts a
-	/// GPU-side cudaStreamWaitEvent on `stream` for every other stream's
-	/// still-pending "last used" event recorded against `handle` (see
-	/// Allocation::last_used_events) -- so work enqueued against the
-	/// returned Lease is guaranteed ordered-after any prior, now-released
-	/// use of this same allocation on a *different* stream, without a host
-	/// block. This is what makes it safe for Arachne to give different
-	/// callers (per-worker compute streams, the management stream -- see
-	/// DeviceContext) genuinely different streams over the same Region:
-	/// without this, two streams touching the same allocation would have no
-	/// ordering between them at all, since they no longer share one
-	/// canonical stream's implicit FIFO order.
 	Lease acquire(DeviceRegionHandle handle, cudaStream_t stream);
 
 	/// Same as the two-argument overload, on DeviceContext's own management
 	/// stream (see DeviceContext::managementStream()).
 	Lease acquire(DeviceRegionHandle handle);
 
-	/// Releases the allocation backing `handle`. No-op if `handle` is
-	/// invalid or was already freed. Blocks until every outstanding Lease on
-	/// `handle` has been released and the GPU has actually caught up to the
-	/// point each one was released at (see Lease's doc comment) -- callers
-	/// (e.g. Controller executing an Eviction Policy decision) should expect
-	/// this to wait rather than fail or skip: an eviction target was already
-	/// chosen for a reason, so waiting for it to become safe to reclaim is
-	/// the correct behavior, not skipping it.
+	/// Releases the allocation backing `handle`. No-op if invalid or already
+	/// freed. Blocks until every outstanding Lease has been released and the
+	/// GPU has caught up (see Lease's doc comment) -- callers should expect
+	/// this to wait rather than fail or skip an already-chosen eviction
+	/// target (e.g. Controller's Eviction Policy).
 	void free(DeviceRegionHandle handle);
 
-	/// Convenience wrapper: copies `bytes` from host memory at `host_src`
-	/// into the allocation backing `handle` starting at `dst_offset` bytes
-	/// into it, synchronously (== one enqueueCopyFromHost() + an immediate
-	/// flush()) -- provided so callers don't need direct access to
-	/// DeviceContext's stream, or their own Lease, just to move bytes in.
-	/// `dst_offset` defaults to 0; Controller::make() passes a nonzero offset
-	/// to copy a Region's data past its prepended dirty-bitmap header (see
-	/// gpu/dirty_header.hpp).
+	/// Convenience wrapper (== one enqueueCopyFromHost() + an immediate
+	/// flush()): copies `bytes` from `host_src` into `handle`'s allocation at
+	/// `dst_offset`. `dst_offset` defaults to 0; Controller::make() passes a
+	/// nonzero offset to skip past a Region's prepended dirty-bitmap header
+	/// (see gpu/dirty_header.hpp).
 	void copyFromHost(DeviceRegionHandle handle, const void* host_src, std::size_t bytes,
 										 std::size_t dst_offset = 0);
 
@@ -187,56 +213,38 @@ class DeviceRegionPool {
 	/// synchronously. See copyFromHost().
 	void copyToHost(DeviceRegionHandle handle, void* host_dst, std::size_t bytes, std::size_t src_offset = 0);
 
-	/// The async, batchable building block copyToHost() is built from
-	/// (copyToHost() == one enqueueCopyToHost() + an immediate flush()):
-	/// enqueues a device-to-host copy of `bytes` starting at `src_offset`
-	/// bytes into the allocation backing `handle`, into host memory at
-	/// `host_dst`, on DeviceContext's canonical stream -- but does *not*
-	/// wait for it to land. Appends the Lease it acquires (guarding against
-	/// a concurrent compact()/free() the same way copyToHost()'s internal
-	/// one does) to `pending`, which the caller must keep alive -- and must
-	/// not read `host_dst` through, nor let any handle involved be
-	/// freed/compacted -- until flush() has been called and returned; only
-	/// then is it safe to drop `pending` (releasing its Leases) or read the
-	/// copied-into host memory.
+	/// The async, batchable building block copyToHost() is built from (==
+	/// one enqueueCopyToHost() + an immediate flush()): enqueues the D2H
+	/// copy on DeviceContext's canonical stream without waiting for it to
+	/// land. Appends the acquired Lease to `pending`, which the caller must
+	/// keep alive -- and must not read `host_dst` through, nor let any
+	/// involved handle be freed/compacted -- until flush() returns.
 	///
-	/// This is what lets a caller batch many regions' device-to-host copies
-	/// onto one stream and pay for exactly one cudaStreamSynchronize instead
-	/// of one per region -- see Controller::writeBackDirtyRegions()'s
-	/// two-phase (gather headers, then gather dirty payloads) use of this
-	/// for evictAnchor(). Same bounds check as copyToHost(): throws
-	/// std::out_of_range if `src_offset + bytes` exceeds `handle`'s
-	/// allocation.
+	/// Lets a caller batch many regions' D2H copies onto one stream and pay
+	/// for one cudaStreamSynchronize instead of one per region -- see
+	/// Controller::writeBackDirtyRegions()'s two-phase use of this for
+	/// evictAnchor(). Throws std::out_of_range if `src_offset + bytes`
+	/// exceeds `handle`'s allocation.
 	void enqueueCopyToHost(DeviceRegionHandle handle, void* host_dst, std::size_t bytes, std::size_t src_offset,
 												 std::vector<Lease>& pending);
 
-	/// Mirror image of enqueueCopyToHost(): enqueues a host-to-device copy of
-	/// `bytes` from host memory at `host_src` into the allocation backing
-	/// `handle`, starting at `dst_offset` bytes into it, without waiting for
-	/// it to land. Appends the acquired Lease to `pending`, under the exact
-	/// same lifetime contract as enqueueCopyToHost() -- `host_src` must also
-	/// stay valid until flush() returns. Lets a caller batch many regions'
-	/// host-to-device copies onto one stream and pay for exactly one
-	/// cudaStreamSynchronize instead of one per region -- see
-	/// Controller::promoteAnchor()'s use of this to copy every Region in an
-	/// Anchor's footprint in one batch rather than one make() call at a time.
-	/// Same bounds check as copyFromHost(): throws std::out_of_range if
+	/// Mirror image of enqueueCopyToHost() for host-to-device copies, under
+	/// the same `pending`/flush() lifetime contract (`host_src` must also
+	/// stay valid until flush() returns). See Controller::promoteAnchor()'s
+	/// use of this to batch an Anchor's whole footprint into one flush
+	/// rather than one make() call at a time. Throws std::out_of_range if
 	/// `dst_offset + bytes` exceeds `handle`'s allocation.
 	void enqueueCopyFromHost(DeviceRegionHandle handle, const void* host_src, std::size_t bytes,
 														std::size_t dst_offset, std::vector<Lease>& pending);
 
 	/// Blocks until every operation previously enqueued on DeviceContext's
-	/// canonical stream (via enqueueCopyToHost()/enqueueCopyFromHost() or
-	/// otherwise) has actually completed. Callers using either enqueue*()
-	/// method must call this exactly once after enqueueing everything in a
-	/// batch, before touching any of the destinations or releasing the
-	/// Leases they accumulated.
+	/// canonical stream (via either enqueue*() method or otherwise) has
+	/// actually completed. Call exactly once after enqueueing a batch,
+	/// before touching destinations or releasing the accumulated Leases.
 	void flush();
 
 	/// Total bytes currently outstanding across all live allocations of both
-	/// kinds -- the sizing signal the eventual Anchor-driven promote/evict
-	/// policy needs to reason about a GPU memory budget (that policy only
-	/// ever concerns MemoryKind::Data, hence the per-kind overload below).
+	/// kinds.
 	std::size_t bytesAllocated() const;
 
 	/// Bytes currently outstanding for just `kind`.
@@ -247,54 +255,25 @@ class DeviceRegionPool {
 		std::size_t bytes_relocated = 0;
 	};
 
-	/// Relocates every currently-live allocation of `kind` through a fresh
-	/// allocate() + cudaMemcpyDeviceToDevice() + free() cycle, giving the
-	/// underlying resource a chance to re-coalesce more tightly. Adapted
-	/// from DynaSOAr's (github.com/prg-titech/dynasoar) parallel_defrag,
-	/// which scans object *blocks* for low occupancy and only relocates
-	/// objects out of sparse ones -- we don't have DynaSOAr's block/bitmap
-	/// structure to scan (our allocations are opaque variable-sized byte
-	/// ranges, not statically-typed objects in fixed-size blocks; our
-	/// resources are further type-erased behind cuda::mr::any_resource, so
-	/// there's no free-list to inspect even if we did), so this relocates
-	/// everything of `kind` unconditionally rather than picking sparse
-	/// candidates out of a structure we can't see into.
+	/// Tries to make `kind`'s arena able to satisfy a future
+	/// allocateBestFit()-style request of `required_bytes`, by relocating
+	/// whichever unpinned live allocations the injected CompactionPolicy
+	/// decides are worth moving (see the class overview above). No-op under
+	/// Normal -- there's no shared arena to consolidate.
 	///
-	/// Deliberately has no opinion on *when* it should run -- that decision
-	/// belongs to the caller (Controller), not here. In particular this is
-	/// not a periodic/occupancy-triggered background job: Arachne's pool is
-	/// meant to run near-full most of the time (that's the point of
-	/// promoting aggressively), so an "occupancy is low" trigger would
-	/// rarely fire exactly when it's actually needed. The intended trigger
-	/// is allocation failure in the Eviction -> Compaction -> Promotion
-	/// pipeline: Controller evicts cold Regions, attempts the promotion's
-	/// allocate(), and only calls this -- then retries -- if that allocate()
-	/// fails despite there being enough aggregate free bytes (i.e.
-	/// fragmentation, not an actual out-of-memory condition).
+	/// Since allocate()/tryAllocate() already self-heal this way internally,
+	/// calling compact() directly is mainly useful for isolated
+	/// benchmarking, or for RegionManager's capacity-retry loop, which calls
+	/// this *after* flushing any Leases still open from earlier in the same
+	/// promotion batch (see RegionManager::allocateWithCompaction()) --
+	/// unpinning blocks the original tryAllocate()'s internal retry wasn't
+	/// allowed to touch yet.
 	///
-	/// A no-op under AllocationPolicy::Naive: every Region there already has
-	/// its own independent cudaMalloc'd block (no shared arena), so there is
-	/// nothing to consolidate -- see AllocationPolicy's doc comment.
-	///
-	/// Safety: for each live allocation of `kind`, waits for every
-	/// outstanding Lease on it to be released and the GPU to actually reach
-	/// each release's recorded point (the same mechanism free() uses -- see
-	/// Lease's doc comment) before copying it, so the device-to-device copy
-	/// never races an in-flight kernel/copy against the old address.
-	///
-	/// Cost: while running, both the old and new copy of everything being
-	/// relocated are live simultaneously, so `kind`'s resource needs
-	/// roughly double the current live bytes of `kind` free to complete.
-	///
-	/// Concurrency: holds DeviceRegionPool's own lock for the entire call
-	/// (including waiting out any outstanding Leases, the device-to-device
-	/// copies, and the stream sync they wait on), so other
-	/// allocate()/acquire()/free() calls on this DeviceRegionPool block
-	/// until it finishes -- simpler and safer than interleaving, at the cost
-	/// of pausing everything else while compaction runs; revisit with a
-	/// snapshot/no-lock-move/reconcile split (the same shape ASRoutingCache's
-	/// own compaction already uses) if that pause becomes a real problem.
-	CompactionResult compact(MemoryKind kind);
+	/// Holds DeviceRegionPool's own lock for the entire call, so other
+	/// allocate()/acquire()/free() calls block until it finishes -- but a
+	/// bounded, targeted relocation is typically far cheaper than an older
+	/// unconditional full-pool relocation would have been.
+	CompactionResult compact(MemoryKind kind, std::size_t required_bytes);
 
  private:
 	struct Allocation {
@@ -302,34 +281,47 @@ class DeviceRegionPool {
 		std::size_t bytes = 0;
 		MemoryKind kind = MemoryKind::Data;
 
+		// Meaningful only under Pooled -- this allocation's footprint in its
+		// arena's fixed-size units, kept in sync with device_ptr whenever
+		// relocated (see tryOpenContiguousExtentLocked()). Unused under Normal.
+		UnitPoolArena::UnitRange unit_range;
+
 		// Outstanding-Lease bookkeeping (see Lease's doc comment). One event
-		// per distinct stream a Lease has ever released on for this
-		// allocation -- re-recorded (not re-created) each time that same
-		// stream is used again, since a stream's own ordering means the
-		// latest recording already implies every earlier one on it has
-		// passed.
+		// per distinct stream a Lease has released on -- re-recorded, not
+		// re-created, each time, since a stream's own ordering means the
+		// latest recording already implies every earlier one on it has passed.
 		std::size_t in_use_count = 0;
 		std::unordered_map<cudaStream_t, cudaEvent_t> last_used_events;
 	};
 
 	cuda::mr::any_resource<cuda::mr::device_accessible>& resourceFor(MemoryKind kind);
+	UnitPoolArena& arenaFor(MemoryKind kind);
 	Allocation allocationFor(DeviceRegionHandle handle);
+
+	// The two allocate()/free() strategies AllocationPolicy branches
+	// between -- see the class overview above.
+	DeviceRegionHandle allocateNormal(std::size_t bytes, MemoryKind kind);
+	DeviceRegionHandle allocatePooled(std::size_t bytes, MemoryKind kind);
+	void freeNormal(DeviceRegionHandle handle);
+	void freePooled(DeviceRegionHandle handle);
+
+	// Requires mutex_ already held via `lock` -- see the class overview
+	// above for the full snapshot/plan/execute algorithm this implements.
+	CompactionResult tryOpenContiguousExtentLocked(MemoryKind kind, std::uint64_t required_units,
+																									std::unique_lock<std::mutex>& lock);
 
 	// Called by Lease's destructor.
 	void release(DeviceRegionHandle handle, cudaStream_t stream);
 
 	// Shared by free() and compact(): blocks (via cv_, releasing `lock`
 	// while waiting) until `id`'s in_use_count is 0, then enqueues a
-	// cudaStreamWaitEvent on DeviceContext's canonical stream for every
-	// event recorded against it and destroys/clears them -- after this
-	// returns, anything subsequently enqueued on that same stream (the
-	// actual deallocate()/cudaMemcpyAsync() call the caller makes next) is
-	// correctly ordered after every prior Lease's work. No-op if `id` is no
-	// longer present in allocations_. Requires mutex_ already held via
-	// `lock`.
+	// cudaStreamWaitEvent for every event recorded against it so whatever
+	// the caller enqueues next is ordered after every prior Lease's work.
+	// No-op if `id` is no longer present. Requires mutex_ already held.
 	void awaitQuiescentLocked(std::uint64_t id, std::unique_lock<std::mutex>& lock);
 
 	DeviceContext& device_;
+	std::unique_ptr<CompactionPolicy> compaction_policy_;
 	mutable std::mutex mutex_;
 	std::condition_variable cv_;
 	std::unordered_map<std::uint64_t, Allocation> allocations_;

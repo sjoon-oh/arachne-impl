@@ -1,3 +1,15 @@
+// Tests for ASRoutingCacheHnsw, the hnswlib-backed implementation of
+// RoutingCache's Anchor-matching contract: ensure() either creates a new
+// entry or returns the id of an existing one already within max_distance;
+// nearest() finds the closest entry that is within its own stored radius,
+// or nullopt; erase() removes an entry, eventually via a background
+// compaction once the tombstone ratio crosses max_tombstone_ratio. Coverage
+// here is Float32 with both the L2 and Cosine metrics; the full
+// (VectorDType, DistanceMetric) matrix for the other supported dtypes lives
+// in routing_cache_hnsw_dtype_test.cpp. The last two tests in this file
+// exist to exercise realistic scale/dimensionality and concurrent access
+// respectively, rather than one specific behavior.
+
 #include "core/routing_cache_hnsw.hpp"
 
 #include <gtest/gtest.h>
@@ -184,18 +196,11 @@ TEST(ASRoutingCacheHnswTest, CompactionPreservesEachSurvivorsOwnRadius) {
 	EXPECT_EQ(cache.nearest(View(near_wide)), 2u);  // inside anchor 2's wide radius
 }
 
-// Every other test in this file uses a handful of tiny, fixed, low-dim
-// (kDim=2) vectors -- fine for exercising specific code paths, but none of
-// them build an hnsw graph anywhere near realistic size/dimensionality.
-// This is that: a fixed-seed PRNG (reproducible across runs) generates many
-// random float vectors at a more realistic embedding dimension, inserted
-// past initial_capacity_ (forcing hnswlib resizeIndex growth, like
+// Unlike this file's other tiny fixed low-dim vectors, this test builds a
+// realistic-scale hnsw graph: a fixed-seed PRNG generates many random float
+// vectors at a larger dim, forcing hnswlib resizeIndex growth (like
 // EnsureGrowsBeyondInitialCapacity above but at scale), then a chunk is
 // erased to also exercise compaction at scale.
-//
-// Not int8: neither this codebase's VectorView (arachne/types.hpp, a
-// `const float*`) nor the vendored hnswlib (space_l2.h/space_ip.h, both
-// operate on `float*`) support anything but float today.
 TEST(ASRoutingCacheHnswTest, BuildsAndCompactsWithManyRandomHighDimensionalVectors) {
 	constexpr std::uint32_t kLargeDim = 100;
 	constexpr std::size_t kNumVectors = 300;
@@ -239,11 +244,10 @@ TEST(ASRoutingCacheHnswTest, BuildsAndCompactsWithManyRandomHighDimensionalVecto
 	}
 }
 
-// Not a correctness oracle by itself -- primarily meant to be run under
-// ThreadSanitizer to catch the exact hazard ASRoutingCacheHnsw's shared_mutex
-// exists to prevent: hnswlib's own locking does not protect concurrent
-// reads (searchKnn/getDataByLabel) against concurrent writes
-// (addPoint/markDelete/resizeIndex).
+// Not a correctness oracle by itself -- meant to run under ThreadSanitizer,
+// to catch the hazard ASRoutingCacheHnsw's shared_mutex exists to prevent:
+// hnswlib's own locking doesn't protect concurrent reads (searchKnn/
+// getDataByLabel) against concurrent writes (addPoint/markDelete/resizeIndex).
 TEST(ASRoutingCacheHnswTest, ConcurrentEnsureNearestEraseDoesNotRace) {
 	constexpr int kThreads = 8;
 	constexpr int kOpsPerThread = 200;

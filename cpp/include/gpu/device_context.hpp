@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <memory>
 #include <vector>
 
 #include <cuda/memory_resource>
@@ -9,82 +10,113 @@
 #include <rmm/mr/cuda_memory_resource.hpp>
 
 #include "gpu/device_region_handle.hpp"
+#include "gpu/unit_pool_arena.hpp"
 
 namespace arachne::gpu {
 
-/// Reserved up front, once, at DeviceContext construction, when `policy` is
-/// AllocationPolicy::Pooled -- see dataResource()/metadataResource() and
-/// AllocationPolicy below. Each is only the *initial* reservation; the
-/// underlying rmm::mr::pool_memory_resource still grows on demand
-/// (coalescing more from the upstream cuda_memory_resource) if a pool's
-/// allocations exceed it, so these are sizing hints to avoid early
-/// cudaMalloc round-trips, not hard caps. Ignored entirely under
-/// AllocationPolicy::Naive, which never pre-reserves anything. Placeholder
-/// values pending real budget tuning against actual GPU memory (e.g. via
-/// cudaMemGetInfo) and workload characteristics.
+/// Placeholder budget sizes pending real tuning against actual GPU memory
+/// (e.g. via cudaMemGetInfo) and workload characteristics -- see the class
+/// overview below for how AllocationPolicy uses them.
 inline constexpr std::size_t kDefaultDataPoolBytes = std::size_t{1} << 30;      // 1 GiB
 inline constexpr std::size_t kDefaultMetadataPoolBytes = std::size_t{1} << 26;  // 64 MiB
 
-/// How DeviceContext backs dataResource()/metadataResource(). Both
-/// alternatives are `cuda::mr::any_resource<cuda::mr::device_accessible>`
-/// underneath (CCCL's own type-erased memory_resource wrapper) so
-/// DeviceRegionPool -- and anything else built against DeviceContext -- calls the
-/// exact same allocate()/deallocate() surface regardless of which is
-/// active; adding a third strategy later (e.g. an async/stream-ordered
-/// pool) only touches MakeResource() in device_context.cpp.
+/// Default unit size for AllocationPolicy::Pooled's UnitPoolArena -- see its
+/// own doc comment for the granularity/fragmentation trade-off. 2 MiB
+/// matches the smallest Region size Arachne is expected to manage, so a
+/// single Region rarely spans more than a handful of units. Pass a
+/// different `unit_bytes` to DeviceContext's constructor for other Region
+/// size distributions or fine-grained test control.
+inline constexpr std::size_t kDefaultUnitBytes = std::size_t{1} << 21;  // 2 MiB
+
+/// How DeviceContext backs dataArena()/metadataArena()/dataResource()/
+/// metadataResource() -- see the class overview below. Adding a third
+/// strategy later only touches DeviceContext's constructor.
 enum class AllocationPolicy {
-	/// Reserve one big arena per pool up front (see kDefaultDataPoolBytes /
-	/// kDefaultMetadataPoolBytes) and suballocate from it
-	/// (rmm::mr::pool_memory_resource, coalescing best-fit) -- Arachne
-	/// manages the pool itself; cudaMalloc/cudaFree happen rarely, only when
-	/// a pool's current reservation is exhausted. This is the
-	/// fragmentation-manageable policy DeviceRegionPool::compact() is meant to
-	/// operate on.
 	Pooled,
-	/// No pre-reservation, no suballocation: every DeviceRegionPool::allocate()
-	/// issues its own independent cudaMalloc, and free() its own cudaFree
-	/// (rmm::mr::cuda_memory_resource directly). Simplest possible strategy,
-	/// and the natural baseline/fallback -- fragmentation here is the CUDA
-	/// driver's own allocator's problem, entirely outside Arachne's control
-	/// either way, so there is nothing for DeviceRegionPool::compact() to do under
-	/// this policy.
-	Naive,
+	Normal,
 };
 
-/// Owns Arachne's CUDA device selection, the RAFT resources handle (default
-/// stream, stream pool, and lazily-created cuBLAS/cuSOLVER/cuSPARSE handles
-/// -- see raft::device_resources), and the two device memory resources
-/// every gpu::DeviceRegionPool allocates against (see MemoryKind in
-/// gpu/device_region_handle.hpp):
+/// DeviceContext owns everything physical about one GPU: CUDA device
+/// selection, the RAFT resources handle (default stream, stream pool, and
+/// lazily-created cuBLAS/cuSOLVER/cuSPARSE handles -- see
+/// raft::device_resources), and the device memory backing every
+/// gpu::DeviceRegionPool allocation (see MemoryKind in
+/// gpu/device_region_handle.hpp).
 ///
-///  - dataResource(): Anchor-driven, promote/evict-eligible index/vector-
-///    data memory (MemoryKind::Data).
-///  - metadataResource(): a physically separate resource for state that
-///    needs CPU/GPU sync but must never be evicted the way Region data can
-///    be (MemoryKind::Metadata).
+/// One DeviceContext per physical GPU, owned by Controller (see
+/// core/controller.hpp) alongside every other piece of Arachne's own policy
+/// state (RegionManager, OpScheduler) -- GPU residency accounting is
+/// exactly that kind of state, not a pluggable dependency like
+/// IAdapter/RoutingCache. Multi-GPU sharding is future work;
+/// DeviceRegionPool's callers don't need to change for it.
 ///
-/// Both are constructed according to `policy` (see AllocationPolicy) from
-/// the same raw cudaMalloc/cudaFree upstream (memoryResource()), and stay
-/// independent of each other either way, so fragmentation/pressure in one
-/// never affects the other.
+/// Two independent memory pools, routed to by MemoryKind:
+///  - Data: Anchor-driven, promote/evict-eligible index/vector-data memory.
+///  - Metadata: a physically separate resource for state that needs
+///    CPU/GPU sync but must never be evicted the way Region data can be.
+/// Both are constructed according to `policy` from the same raw
+/// cudaMalloc/cudaFree upstream (memoryResource()), and stay independent of
+/// each other either way, so fragmentation/pressure in one never affects
+/// the other.
 ///
-/// One DeviceContext per physical GPU. Owned by Controller (see
-/// core/controller.hpp) -- Controller is already the class that owns every
-/// other piece of Arachne's own policy state (RegionManager, OpScheduler),
-/// and GPU residency accounting is exactly that kind of state, not a
-/// pluggable dependency like IAdapter/RoutingCache.
+/// AllocationPolicy selects how each pool is backed:
 ///
-/// Multi-GPU sharding is future work -- DeviceRegionPool's callers don't need to
-/// change for it.
+///   AllocationPolicy::Normal                 AllocationPolicy::Pooled
+///   -----------------------------------      ----------------------------
+///   No pre-reservation, no                   One big arena reserved up
+///   suballocation: every                     front per pool (see
+///   DeviceRegionPool::allocate() issues       kDefaultDataPoolBytes /
+///   its own independent cudaMalloc,           kDefaultMetadataPoolBytes),
+///   and free() its own cudaFree,              fixed-size-unit-managed
+///   straight through dataResource()/          (UnitPoolArena). cudaMalloc/
+///   metadataResource()                        cudaFree happen exactly once
+///   (rmm::mr::cuda_memory_resource             per pool, at construction/
+///   directly). Simplest possible               destruction, and the arena
+///   strategy, and the natural                  never grows afterward: a
+///   baseline/fallback.                         request the budget can't
+///                                              satisfy is a real capacity/
+///   Fragmentation here is the CUDA             fragmentation event, not
+///   driver's own allocator's                   something silently absorbed
+///   problem, entirely outside                  by an upstream cudaMalloc
+///   Arachne's control either way --            the way the old
+///   nothing for                                rmm::mr::pool_memory_resource
+///   DeviceRegionPool::compact() to             -backed design worked. This
+///   do, and no arena for it to even             is the fragmentation-
+///   operate against.                           manageable policy compact()
+///                                              (and its injected
+///                                              CompactionPolicy) operates
+///                                              on.
+///
+/// budgetBytes(kind) is Arachne's own self-imposed ceiling on how much
+/// `kind` memory it is willing to have resident: under Pooled, the actual
+/// unit-rounded arena capacity; under Normal, exactly the configured pool
+/// size, self-capped even though the CUDA driver could technically grant
+/// more, so promotion/eviction decisions stay deterministic and don't
+/// depend on racing actual GPU memory pressure. It is purely the number
+/// this DeviceContext was configured with, not a live query against GPU
+/// state (see cudaMemGetInfo for that).
+///
+/// Streams: managementStream() is raft::device_resources' own canonical
+/// stream, used for Arachne's own residency management (promotion,
+/// eviction/write-back, compaction -- see core/region_manager.hpp's
+/// Coordinator). workerStream(index) is a separate, dedicated stream per
+/// OpScheduler execution worker, so concurrent workers' GPU-native
+/// traverseDevice()/modifyDevice() kernel launches can genuinely overlap
+/// instead of serializing behind one shared stream. The two are kept
+/// separate so management traffic never queues behind (or in front of) a
+/// worker's own kernel launches -- see gpu::DeviceRegionPool::acquire()'s
+/// cross-stream event-wait for how they're kept safely ordered against
+/// each other despite being physically different streams.
 class DeviceContext {
  public:
-	// `worker_stream_count` sizes the workerStream() pool below -- callers
-	// (Controller) pass SchedulingConfig::max_execution_threads so there's
-	// exactly one dedicated stream per OpScheduler execution worker.
-	explicit DeviceContext(int device_id = 0, AllocationPolicy policy = AllocationPolicy::Pooled,
+	// `worker_stream_count` sizes the workerStream() pool (callers pass
+	// SchedulingConfig::max_execution_threads for one stream per worker).
+	// `unit_bytes` sizes the Pooled arena's fixed subregion unit; ignored
+	// under AllocationPolicy::Normal.
+	explicit DeviceContext(int device_id = 0, AllocationPolicy policy = AllocationPolicy::Normal,
 												 std::size_t data_pool_bytes = kDefaultDataPoolBytes,
 												 std::size_t metadata_pool_bytes = kDefaultMetadataPoolBytes,
-												 std::size_t worker_stream_count = 1);
+												 std::size_t worker_stream_count = 1, std::size_t unit_bytes = kDefaultUnitBytes);
 	~DeviceContext();
 
 	DeviceContext(const DeviceContext&) = delete;
@@ -93,67 +125,52 @@ class DeviceContext {
 	int deviceId() const { return device_id_; }
 	AllocationPolicy allocationPolicy() const { return policy_; }
 
-	/// The self-imposed ceiling gpu::DeviceRegionPool::hasCapacity()/
-	/// tryAllocate() enforce for `kind` (data_pool_bytes/metadata_pool_bytes
-	/// as passed to the constructor, or the defaults above) -- this is
-	/// Arachne's own accounting of how much `kind` memory it is willing to
-	/// have resident at once, independent of whether the allocator backing
-	/// it physically pre-reserves that much (Pooled) or not (Naive, where
-	/// nothing stops the CUDA driver from granting more; Arachne caps itself
-	/// anyway so promotion/eviction decisions are deterministic and don't
-	/// depend on racing actual GPU memory pressure). Not a query against
-	/// live GPU state (see cudaMemGetInfo for that) -- purely the number
-	/// this DeviceContext was configured with.
-	std::size_t budgetBytes(MemoryKind kind) const {
-		return kind == MemoryKind::Metadata ? metadata_pool_bytes_ : data_pool_bytes_;
-	}
+	/// Arachne's self-imposed ceiling for `kind` memory (enforced by
+	/// gpu::DeviceRegionPool::hasCapacity()/tryAllocate()) -- see the class
+	/// overview above for how this differs between Pooled (actual,
+	/// unit-rounded arena capacity) and Normal (exactly the configured pool
+	/// size).
+	std::size_t budgetBytes(MemoryKind kind) const;
 
 	raft::device_resources& resources() { return resources_; }
 	const raft::device_resources& resources() const { return resources_; }
 
-	/// The stream Arachne's own GPU-residency management (promotion,
-	/// eviction/write-back, compaction -- see core/region_manager.hpp's
-	/// Coordinator) issues its data movement on, deliberately kept separate
-	/// from workerStream() below so management traffic never queues behind
-	/// (or in front of) a worker's own kernel launches on the same stream --
-	/// see gpu::DeviceRegionPool::acquire()'s cross-stream event-wait for how
-	/// the two are kept safely ordered relative to each other despite being
-	/// physically different streams. This is raft::device_resources' own
-	/// canonical stream, exposed under this more specific name now that
-	/// workerStream() exists as its compute-side counterpart.
+	/// raft::device_resources' own canonical stream, exposed under this more
+	/// specific name now that workerStream() exists as its compute-side
+	/// counterpart -- see the class overview above for why the two are kept
+	/// separate.
 	cudaStream_t managementStream() const { return resources_.get_stream().value(); }
 
 	/// One dedicated stream per OpScheduler execution worker (see
-	/// core/op_scheduler.hpp's SchedulingConfig::max_execution_threads), so
-	/// concurrent worker threads' GPU-native traverseDevice()/modifyDevice()
-	/// kernel launches can genuinely overlap on the GPU instead of
-	/// serializing behind one shared stream the way they would if every
-	/// caller defaulted to managementStream(). `index` is 0-based and must be
-	/// < workerStreamCount() -- throws std::out_of_range otherwise.
+	/// core/op_scheduler.hpp's SchedulingConfig::max_execution_threads) --
+	/// see the class overview above. `index` is 0-based and must be <
+	/// workerStreamCount(); throws std::out_of_range otherwise.
 	cudaStream_t workerStream(std::size_t index) const;
 
 	std::size_t workerStreamCount() const { return worker_streams_.size(); }
 
-	/// The raw cudaMalloc/cudaFree resource dataResource()/metadataResource()
-	/// are themselves built from (directly, under Naive; as a
-	/// pool_memory_resource's upstream, under Pooled). Not meant for
-	/// DeviceRegionPool to allocate against directly -- see MemoryKind's doc
-	/// comment.
+	/// The raw cudaMalloc/cudaFree resource both pools are ultimately backed
+	/// by (see the class overview above). Not meant for DeviceRegionPool to
+	/// allocate against directly -- see MemoryKind's doc comment.
 	rmm::mr::cuda_memory_resource& memoryResource() { return memory_resource_; }
 
+	/// AllocationPolicy::Normal's direct allocate()/deallocate() surface.
+	/// Always constructed (harmless if unused under Pooled), so switching
+	/// `policy` never changes which accessors are valid to call.
 	cuda::mr::any_resource<cuda::mr::device_accessible>& dataResource() { return data_resource_; }
 	cuda::mr::any_resource<cuda::mr::device_accessible>& metadataResource() { return metadata_resource_; }
 
+	/// Non-null iff allocationPolicy() == Pooled -- see UnitPoolArena's own
+	/// doc comment for what these actually provide over dataResource()/
+	/// metadataResource().
+	UnitPoolArena* dataArena() { return data_arena_.get(); }
+	UnitPoolArena* metadataArena() { return metadata_arena_.get(); }
+
  private:
-	// Declaration order matters: device_id_'s initializer (see
-	// device_context.cpp) is what actually calls cudaSetDevice(), and it must
-	// run before resources_ default-constructs its stream/handles, and before
-	// data_resource_/metadata_resource_ potentially make a real, immediate
-	// cudaMalloc call (Pooled: reserving their initial arena; Naive: none at
-	// construction time) -- member initialization runs in declaration order
-	// regardless of the constructor's init-list order, so device_id_ must
-	// stay the first member declared here, and the resources must stay after
-	// memory_resource_ (their upstream).
+	// Declaration order matters: member init runs in declaration order (not
+	// constructor init-list order), and device_id_'s initializer calls
+	// cudaSetDevice(), which must happen before resources_ and the
+	// resource/arena members below construct.
 	int device_id_;
 	AllocationPolicy policy_;
 	std::size_t data_pool_bytes_;
@@ -162,6 +179,11 @@ class DeviceContext {
 	rmm::mr::cuda_memory_resource memory_resource_;
 	cuda::mr::any_resource<cuda::mr::device_accessible> data_resource_;
 	cuda::mr::any_resource<cuda::mr::device_accessible> metadata_resource_;
+	// Non-null only under AllocationPolicy::Pooled -- constructed in the
+	// constructor body (after data_resource_/metadata_resource_, which they
+	// preallocate their one big buffer from), destroyed by the destructor.
+	std::unique_ptr<UnitPoolArena> data_arena_;
+	std::unique_ptr<UnitPoolArena> metadata_arena_;
 	// Created in the constructor body (after device_id_'s cudaSetDevice()
 	// has already run), destroyed in the destructor -- see workerStream()'s
 	// doc comment.

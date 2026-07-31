@@ -51,9 +51,33 @@ struct SchedulingConfig {
 	std::chrono::microseconds batch_wait_timeout{0};
 };
 
-	/// Arachne index-agnostic traversal/modify scheduler.
-/// Stage-1 accepts index requests, stage-2 reorders/batches, and stage-3 executes
-/// batches in an execution thread pool.
+	/// Arachne's index-agnostic operation scheduler: the layer between
+/// Controller and IAdapter that turns a stream of individual Traverse/Modify
+/// requests into batches, and runs those batches against the adapter on a
+/// small pool of worker threads. It only ever sees TraverseRequest/
+/// ModifyRequest -- no index or GPU knowledge lives here.
+///
+/// Three stages, each with its own thread(s):
+///
+///   caller thread(s)              planner thread              worker threads (0..N-1)
+///   ---------------                --------------              -----------------------
+///   schedule(request)              plannerLoop():              workerLoop(i):
+///     enqueue TraverseTask/  -->     policy_->chooseBatchKind()   dequeue batch  <--
+///     ModifyTask into queue_         collectBatch() via            from
+///     (stage 1); return a            policy_->selectCandidateIndex/ dispatch_queue_
+///     future                         canAppendToBatch()             (stage 3)
+///                                    (stage 2)                     executeBatch():
+///                                    push batch onto      -->        IAdapter::traverse|modify
+///                                    dispatch_queue_                 Host|Device(batch)
+///                                                                    on_complete(result) (Traverse)
+///   future.get()  <-------------------------------------------------  promise.set_value(result)
+///
+/// Stage 2's actual ordering/grouping strategy is pluggable via
+/// SchedulingPolicy (scheduling_policy.hpp); OpScheduler itself just drives
+/// the three-stage pipeline and owns the queues/threads. traverse_batch_size_/
+/// modify_batch_size_ cap how large a batch stage 2 builds before handing it
+/// to stage 3; batch_wait_timeout_ optionally lets a non-empty batch wait a
+/// bit for more eligible ops rather than dispatching immediately.
 class OpScheduler {
  public:
   explicit OpScheduler(SchedulingConfig config = {},
@@ -64,31 +88,22 @@ class OpScheduler {
   OpScheduler& operator=(const OpScheduler&) = delete;
 
   /// Connects this scheduler to an adapter. Must be called before schedule().
-  /// `on_worker_start`, if provided, is invoked exactly once on each
-  /// execution worker thread -- before it processes any batch -- with that
-  /// worker's 0-based index (< maxExecutionThreads()). OpScheduler never
-  /// interprets the index or the callback itself; it stays index-/
-  /// GPU-agnostic on purpose. Controller uses this hook to bind each worker
-  /// thread to its own dedicated CUDA stream (see
-  /// gpu::DeviceContext::workerStream()) via thread-local state, so a
-  /// GPU-native traverseDevice()/modifyDevice() call running on that thread
-  /// can pick up the right stream without OpScheduler needing to know CUDA
-  /// exists at all.
+  /// `on_worker_start`, if provided, runs exactly once per execution worker
+  /// thread before it processes any batch, with that worker's 0-based index.
+  /// OpScheduler never interprets it -- Controller uses it to bind each
+  /// worker to its own CUDA stream without OpScheduler needing to know CUDA
+  /// exists (see class doc comment).
   void start(IAdapter& adapter, std::function<void(std::size_t)> on_worker_start = nullptr);
 
   /// Stops worker processing and drains queues before shutdown.
   void shutdown();
 
-  /// Schedules one Traverse request. Returns a future that becomes ready once
-  /// execution finishes. `on_complete`, if provided, is invoked on the
-  /// execution worker thread that actually computed the result -- right
-  /// before the returned future is made ready, so it is guaranteed to have
-  /// already run by the time a caller's future.get() unblocks -- not on
-  /// whichever thread calls future.get(). This is what lets a caller move
-  /// result-dependent bookkeeping (that would otherwise contend on a shared
-  /// lock from every calling thread) onto the bounded set of worker threads
-  /// instead. OpScheduler never interprets `on_complete` itself, same as
-  /// start()'s on_worker_start.
+  /// Schedules one Traverse request. `on_complete`, if provided, runs on the
+  /// worker thread that computed the result, right before the returned
+  /// future is made ready -- guaranteed to have already run by the time
+  /// future.get() unblocks. Lets a caller move result-dependent bookkeeping
+  /// off of whichever (unboundedly many) thread calls future.get(), onto the
+  /// bounded worker pool instead. OpScheduler never interprets this itself.
   std::future<TraverseResult> schedule(TraverseRequest request,
                                         std::function<void(const TraverseResult&)> on_complete = nullptr);
 
@@ -113,13 +128,10 @@ private:
 	std::size_t targetBatchSizeFor(ScheduledKind kind) const;
 	void collectBatch(ScheduledOperationBatch& batch, ScheduledKind batch_kind,
 									 std::size_t batch_target, std::unique_lock<OpSchedulerMutex>& lock);
-	// Dispatches a whole (kind- and mode-homogeneous, see SchedulingPolicy::
-	// canAppendToBatch()) batch to exactly one of IAdapter's
-	// traverseHost()/traverseDevice() or modifyHost()/modifyDevice() in one
-	// call, rather than looping one request at a time -- see those methods'
-	// doc comments (adapter/index_adapter.hpp) for why a genuinely
-	// batch-aware index needs this shape to get real GPU throughput out of a
-	// batch.
+	// Dispatches a whole batch (kind- and mode-homogeneous, see
+	// SchedulingPolicy::canAppendToBatch()) to exactly one IAdapter Host/Device
+	// entry point in a single call, rather than looping one request at a time
+	// -- see those methods' doc comments (adapter/index_adapter.hpp) for why.
 	void executeBatch(ScheduledOperationBatch batch);
 	void executeTraverseBatch(ScheduledOperationBatch batch);
 	void executeModifyBatch(ScheduledOperationBatch batch);

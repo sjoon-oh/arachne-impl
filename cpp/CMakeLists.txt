@@ -61,6 +61,8 @@ set(ARACHNE_CORE_SOURCES
 	# gpu/device_context.hpp and gpu/device_region_pool.hpp.
 	src/gpu/device_context.cpp
 	src/gpu/device_region_pool.cpp
+	src/gpu/unit_pool_arena.cpp
+	src/gpu/compaction_policy.cpp
 )
 
 if(ARACHNE_ENABLE_TRACING)

@@ -52,13 +52,10 @@ TraceCollector::~TraceCollector() {
 	if (file == nullptr) return;  // best-effort -- a traced program must never crash because of tracing itself
 
 	std::fputs("start_ns,duration_ns,thread_id\n", file);
-	// No lock needed here in practice (every recording thread is expected to
-	// have stopped by the time this destructor runs -- see the class doc
-	// comment on why this is always either a process-exit-time static or
-	// tied to an owner, like RegionManager, whose own destruction already
-	// implies its worker/Coordinator threads have joined), but taking
-	// registry_mutex_ anyway costs nothing on this cold, one-time path and
-	// removes any doubt.
+	// No lock strictly needed here (every recording thread is expected to
+	// have stopped by the time this destructor runs -- see trace.hpp's
+	// file-level overview on TraceCollector's lifetimes), but taking
+	// registry_mutex_ anyway costs nothing on this cold, one-time path.
 	std::lock_guard<std::mutex> lock(registry_mutex_);
 	for (const std::unique_ptr<ThreadBuffer>& buffer : buffers_) {
 		for (const TraceRecord& record : buffer->records) {
@@ -71,12 +68,10 @@ TraceCollector::~TraceCollector() {
 }
 
 TraceCollector::ThreadBuffer& TraceCollector::threadBuffer() {
-	// Keyed by id_, not `this` -- see id_'s own doc comment (trace.hpp) for
-	// the use-after-free a `this`-keyed cache would open up once a
-	// short-lived TraceCollector's address gets reused. One thread commonly
+	// Keyed by id_, not `this` -- see trace.hpp's file-level overview for the
+	// use-after-free a `this`-keyed cache would open up. One thread commonly
 	// records into several different TraceCollectors (one per
-	// ARACHNE_TRACE_SCOPE() call site it passes through), hence a map here
-	// rather than one single thread_local buffer.
+	// ARACHNE_TRACE_SCOPE() call site it passes through), hence a map here.
 	thread_local std::unordered_map<std::uint64_t, ThreadBuffer*> cache;
 
 	auto it = cache.find(id_);

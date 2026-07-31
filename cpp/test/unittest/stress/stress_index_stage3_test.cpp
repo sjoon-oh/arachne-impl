@@ -37,16 +37,11 @@ using arachne::stress::BruteForceGroundTruth;
 using arachne::stress::StressIndex;
 using arachne::stress::testsupport::GenerateVectors;
 
-// Runs `kThreads` threads, each performing a random mix of insert/search/
-// remove over a shared, overlapping id space (`kIdSpace` ids), against a
-// Controller whose GPU budget only ever holds `kRegionsThatFitBudget`
-// Regions at once -- then verifies (a) the run completes at all (no crash/
-// deadlock/hang -- reaching the post-join assertions already proves this),
-// (b) promotion/eviction were actually forced repeatedly (not just
-// capacity-checked and skipped), and (c) every id that ends up live in
-// StressIndex's own storage is still correctly reachable via
-// Controller::search() -- i.e. no stale/duplicated/misrouted Anchor
-// survived the churn.
+// Runs `kThreads` threads doing a random insert/search/remove mix over a
+// shared id space against a budget that only holds `kRegionsThatFitBudget`
+// Regions -- verifies the run completes without crash/hang, eviction/
+// promotion was actually forced, and every live id stays reachable via
+// Controller::search() (no stale/duplicated/misrouted Anchor survived).
 void RunConcurrentChurnStress(std::uint32_t dim, std::size_t vectors_per_region, std::size_t regions_that_fit_budget,
 															int threads, int ops_per_thread, std::size_t id_space, std::size_t capacity,
 															std::chrono::milliseconds trigger_interval) {
@@ -61,11 +56,13 @@ void RunConcurrentChurnStress(std::uint32_t dim, std::size_t vectors_per_region,
 	std::size_t header_bytes = gpu::DirtyHeaderBytes(region_payload_bytes, dim * element_size);
 	std::size_t region_total_bytes = header_bytes + region_payload_bytes;
 	std::size_t budget = regions_that_fit_budget * region_total_bytes;
-	// rmm::mr::pool_memory_resource requires the initial pool size to be a
-	// multiple of 256 bytes.
-	budget += (256 - budget % 256) % 256;
 
+	// gpu_unit_bytes == region_total_bytes so each Region occupies exactly
+	// one arena unit -- otherwise Pooled's coarser default unit size would
+	// silently let more than regions_that_fit_budget Regions fit at once,
+	// defeating the capacity pressure this test depends on.
 	Controller controller(index, routing_cache, SchedulingConfig{}, nullptr, budget, gpu::kDefaultMetadataPoolBytes,
+												/*gpu_unit_bytes=*/region_total_bytes, /*compaction_policy=*/nullptr,
 												CoordinatorConfig{trigger_interval});
 	index.registerAllRegions(controller);
 
@@ -131,14 +128,11 @@ void RunConcurrentChurnStress(std::uint32_t dim, std::size_t vectors_per_region,
 	// fallback essentially never triggers under a uniform-size access
 	// pattern -- 0 is an expected outcome, not a sign the wiring is unused.
 
-	// (c) Data integrity: reconstruct, from StressIndex's own storage (the
-	// authoritative host-side state, independent of Controller/RegionManager/
-	// RoutingCache entirely -- see BruteForceGroundTruth()'s own doc
-	// comment), which ids in the shared space are actually live right now,
-	// and confirm Controller::search() still finds each one exactly -- the
-	// end-to-end check that the epoch/RoutingCache machinery above never let
-	// a stale or VectorId-reused Anchor identity corrupt routing under this
-	// much concurrent insert/remove/reuse churn.
+	// (c) Data integrity: reconstruct which ids are actually live from
+	// StressIndex's own storage (independent of Controller/RegionManager/
+	// RoutingCache) and confirm search() still finds each exactly -- proving
+	// the epoch/RoutingCache machinery never let a stale/reused Anchor corrupt
+	// routing under this much concurrent churn.
 	std::size_t checked_live = 0;
 	for (std::size_t i = 0; i < id_space; ++i) {
 		VectorId id = static_cast<VectorId>(i) + 1;
@@ -178,22 +172,12 @@ TEST(StressIndexStage3Test, ManyThreadsWithExcessiveEvictionPromotionCompactionP
 }
 
 TEST(StressIndexStage3Test, ManyThreadsRacingInsertDeleteReuseOfASharedSmallIdSpaceNeverCorruptsRouting) {
-	// The adversarial counterpart: far more threads than ids, so the *same*
-	// handful of VectorIds are being concurrently inserted, deleted, and
-	// reinserted (id reuse) constantly -- maximizing how often
-	// requestPromotion()'s enqueue races releaseAnchor()'s epoch bump for the
-	// exact same anchor_id (see PromotionCandidate's own doc comment). Paired
-	// with a budget that only ever fits a single Region, guaranteeing
-	// promotion/eviction is happening essentially continuously throughout.
-	//
-	// `capacity` is sized generously above the worst-case total number of
-	// successful inserts this run could ever produce (threads * ops_per_thread,
-	// since at most one insert "wins" per op): StressIndex never recycles a
-	// deleted slot (see its own class doc comment -- next_free_slot_ only ever
-	// grows), and this test deliberately reinserts the *same* handful of ids
-	// over and over, so undersizing `capacity` here would exhaust it and make
-	// every insert fail from then on -- a test-harness artifact, not anything
-	// RegionManager/Controller under test is responsible for.
+	// The adversarial counterpart: far more threads than ids, so the same
+	// handful of VectorIds are constantly inserted/deleted/reinserted,
+	// stressing requestPromotion()/releaseAnchor()'s epoch race
+	// (PromotionCandidate's doc comment) under a budget fitting only one
+	// Region. `capacity` is sized above threads*ops_per_thread since
+	// StressIndex never recycles a slot, which would otherwise exhaust it.
 	RunConcurrentChurnStress(/*dim=*/16, /*vectors_per_region=*/16, /*regions_that_fit_budget=*/1, /*threads=*/16,
 													 /*ops_per_thread=*/300, /*id_space=*/8, /*capacity=*/4096,
 													 /*trigger_interval=*/std::chrono::milliseconds(1));
