@@ -4,6 +4,7 @@
 #include <rmm/aligned.hpp>
 
 #include <algorithm>
+#include <cstring>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -62,6 +63,7 @@ DeviceRegionPool::Lease::~Lease() {
 
 DeviceRegionPool::DeviceRegionPool(DeviceContext& device, std::unique_ptr<CompactionPolicy> compaction_policy)
 		: device_(device),
+			memory_manager_(MakeDeviceMemoryManager(device)),
 			compaction_policy_(compaction_policy != nullptr ? std::move(compaction_policy)
 																												: std::make_unique<TargetedCompactionPolicy>()) {}
 
@@ -74,34 +76,21 @@ DeviceRegionPool::DeviceRegionPool(DeviceContext& device, std::unique_ptr<Compac
 // nothing more to do per-allocation: the arena's one big buffer is reclaimed
 // later, wholesale, by DeviceContext's own UnitPoolArena destructor.
 DeviceRegionPool::~DeviceRegionPool() {
-	bool pooled = device_.allocationPolicy() == AllocationPolicy::Pooled;
 	for (auto& [id, allocation] : allocations_) {
 		for (auto& [stream, event] : allocation.last_used_events) {
 			cudaEventDestroy(event);
 		}
-		if (!pooled) {
-			resourceFor(allocation.kind)
-					.deallocate(device_.resources().get_stream(), allocation.device_ptr, allocation.bytes,
-											rmm::CUDA_ALLOCATION_ALIGNMENT);
-		}
+		memory_manager_->deallocate(allocation);
 	}
-}
-
-cuda::mr::any_resource<cuda::mr::device_accessible>& DeviceRegionPool::resourceFor(MemoryKind kind) {
-	switch (kind) {
-		case MemoryKind::Metadata:
-			return device_.metadataResource();
-		case MemoryKind::Data:
-		default:
-			return device_.dataResource();
-	}
+	device_.resources().sync_stream();
 }
 
 UnitPoolArena& DeviceRegionPool::arenaFor(MemoryKind kind) {
 	// Always non-null here: every call site is already gated on
 	// device_.allocationPolicy() == Pooled, which is exactly when
 	// DeviceContext constructs both arenas.
-	UnitPoolArena* arena = (kind == MemoryKind::Metadata) ? device_.metadataArena() : device_.dataArena();
+	UnitPoolArena* arena = memory_manager_->arena(kind);
+	if (arena == nullptr) throw std::logic_error("DeviceRegionPool: backend has no arena");
 	return *arena;
 }
 
@@ -157,48 +146,18 @@ void DeviceRegionPool::release(DeviceRegionHandle handle, cudaStream_t stream) {
 }
 
 DeviceRegionHandle DeviceRegionPool::allocate(std::size_t bytes, MemoryKind kind) {
-	if (device_.allocationPolicy() == AllocationPolicy::Pooled) return allocatePooled(bytes, kind);
-	return allocateNormal(bytes, kind);
-}
-
-DeviceRegionHandle DeviceRegionPool::allocateNormal(std::size_t bytes, MemoryKind kind) {
-	void* ptr = resourceFor(kind).allocate(device_.resources().get_stream(), bytes,
-																					rmm::CUDA_ALLOCATION_ALIGNMENT);
-
-	std::lock_guard<std::mutex> lock(mutex_);
-	std::uint64_t id = next_id_++;
-	Allocation allocation;
-	allocation.device_ptr = ptr;
-	allocation.bytes = bytes;
-	allocation.kind = kind;
-	allocations_.emplace(id, std::move(allocation));
-	return DeviceRegionHandle{id};
-}
-
-DeviceRegionHandle DeviceRegionPool::allocatePooled(std::size_t bytes, MemoryKind kind) {
 	std::unique_lock<std::mutex> lock(mutex_);
-	UnitPoolArena& arena = arenaFor(kind);
-	std::uint64_t units = RequiredUnits(bytes, arena.unitBytes());
-
-	std::optional<UnitPoolArena::UnitRange> range = arena.allocateBestFit(units);
-	if (!range.has_value()) {
-		// One self-heal attempt to open exactly enough contiguous space for
-		// *this* request (see tryOpenContiguousExtentLocked() below). Return
-		// value ignored -- only whether the retry below now succeeds matters.
-		tryOpenContiguousExtentLocked(kind, units, lock);
-		range = arena.allocateBestFit(units);
+	DeviceMemoryBlock block;
+	try {
+		block = memory_manager_->allocate(bytes, kind);
+	} catch (...) {
+		if (memory_manager_->arena(kind) == nullptr) throw;
+		tryOpenContiguousExtentLocked(kind, RequiredUnits(bytes, arenaFor(kind).unitBytes()), lock);
+		block = memory_manager_->allocate(bytes, kind);
 	}
-	if (!range.has_value()) {
-		throw std::runtime_error("DeviceRegionPool::allocate: insufficient contiguous space for " +
-															std::to_string(bytes) + " bytes under AllocationPolicy::Pooled");
-	}
-
 	std::uint64_t id = next_id_++;
 	Allocation allocation;
-	allocation.device_ptr = arena.pointerFor(*range);
-	allocation.bytes = bytes;
-	allocation.kind = kind;
-	allocation.unit_range = *range;
+	static_cast<DeviceMemoryBlock&>(allocation) = std::move(block);
 	allocations_.emplace(id, std::move(allocation));
 	return DeviceRegionHandle{id};
 }
@@ -273,11 +232,6 @@ DeviceRegionPool::Lease DeviceRegionPool::acquire(DeviceRegionHandle handle) {
 
 void DeviceRegionPool::free(DeviceRegionHandle handle) {
 	ARACHNE_TRACE_SCOPE("DeviceRegionPool", "free");
-	if (device_.allocationPolicy() == AllocationPolicy::Pooled) return freePooled(handle);
-	return freeNormal(handle);
-}
-
-void DeviceRegionPool::freeNormal(DeviceRegionHandle handle) {
 	Allocation allocation;
 	{
 		std::unique_lock<std::mutex> lock(mutex_);
@@ -290,36 +244,28 @@ void DeviceRegionPool::freeNormal(DeviceRegionHandle handle) {
 		allocation = it->second;
 		allocations_.erase(it);
 	}
-	// Deallocate outside the lock: it's a real CUDA call, and nothing about
-	// it needs allocations_ protection once this handle is already erased
-	// from the map above.
-	resourceFor(allocation.kind)
-			.deallocate(device_.resources().get_stream(), allocation.device_ptr, allocation.bytes,
-									rmm::CUDA_ALLOCATION_ALIGNMENT);
+	memory_manager_->deallocate(allocation);
 }
 
-void DeviceRegionPool::freePooled(DeviceRegionHandle handle) {
+bool DeviceRegionPool::tryReuse(DeviceRegionHandle handle, std::size_t bytes, MemoryKind kind) {
+	ARACHNE_TRACE_SCOPE("DeviceRegionPool", "tryReuse");
 	std::unique_lock<std::mutex> lock(mutex_);
 	auto it = allocations_.find(handle.id);
-	if (it == allocations_.end()) return;
+	if (it == allocations_.end() || it->second.kind != kind) return false;
+	if (memory_manager_->reservationBytes(bytes, kind) > it->second.reserved_bytes) return false;
 
-	awaitQuiescentLocked(handle.id, lock);  // may block until every Lease is released
-
+	awaitQuiescentLocked(handle.id, lock);
 	it = allocations_.find(handle.id);
-	if (it == allocations_.end()) return;  // freed by someone else while we waited
-
-	// Unlike freeNormal(), this is pure host-side bookkeeping (arenaFor()'s
-	// buffer was preallocated once, not touched per-Region) -- safe to do
-	// while still holding mutex_.
-	arenaFor(it->second.kind).free(it->second.unit_range);
-	allocations_.erase(it);
+	if (it == allocations_.end() || it->second.kind != kind) return false;
+	it->second.bytes = bytes;
+	return true;
 }
 
 void DeviceRegionPool::copyFromHost(DeviceRegionHandle handle, const void* host_src, std::size_t bytes,
 																		 std::size_t dst_offset) {
-	std::vector<Lease> pending;
+	TransferBatch pending;
 	enqueueCopyFromHost(handle, host_src, bytes, dst_offset, pending);
-	flush();
+	finishTransfers(pending);
 	// `pending`'s Lease releases here -- safe, flush() already proved the
 	// copy landed.
 }
@@ -334,6 +280,34 @@ void DeviceRegionPool::enqueueCopyFromHost(DeviceRegionHandle handle, const void
 	CheckCuda(cudaMemcpyAsync(dst, host_src, bytes, cudaMemcpyHostToDevice, lease.stream()),
 						"DeviceRegionPool::enqueueCopyFromHost: cudaMemcpyAsync");
 	pending.push_back(std::move(lease));
+}
+
+void DeviceRegionPool::enqueueCopyFromHost(DeviceRegionHandle handle, const void* host_src, std::size_t bytes,
+		std::size_t dst_offset, TransferBatch& pending) {
+	if (dst_offset + bytes > allocationFor(handle).bytes) {
+		throw std::out_of_range("DeviceRegionPool::enqueueCopyFromHost: copy exceeds allocation");
+	}
+	PinnedHostPool::Buffer staging = pinned_host_pool_.acquire(bytes);
+	if (bytes > 0) std::memcpy(staging.data(), host_src, bytes);
+	Lease lease = acquire(handle);
+	void* dst = static_cast<std::byte*>(lease.ptr()) + dst_offset;
+	CheckCuda(cudaMemcpyAsync(dst, staging.data(), bytes, cudaMemcpyHostToDevice, lease.stream()),
+					"DeviceRegionPool::enqueueCopyFromHost(pinned): cudaMemcpyAsync");
+	pending.pinned_sources.push_back(std::move(staging));
+	pending.leases.push_back(std::move(lease));
+}
+
+void DeviceRegionPool::finishTransfers(TransferBatch& pending) {
+	if (pending.leases.empty()) return;
+	cudaEvent_t ready;
+	CheckCuda(cudaEventCreateWithFlags(&ready, cudaEventDisableTiming),
+					"DeviceRegionPool::finishTransfers: cudaEventCreateWithFlags");
+	CheckCuda(cudaEventRecord(ready, device_.managementStream()),
+					"DeviceRegionPool::finishTransfers: cudaEventRecord");
+	CheckCuda(cudaEventSynchronize(ready), "DeviceRegionPool::finishTransfers: cudaEventSynchronize");
+	cudaEventDestroy(ready);
+	pending.leases.clear();
+	pending.pinned_sources.clear();
 }
 
 void DeviceRegionPool::copyToHost(DeviceRegionHandle handle, void* host_dst, std::size_t bytes,
@@ -378,9 +352,35 @@ std::size_t DeviceRegionPool::bytesAllocated(MemoryKind kind) const {
 	return total;
 }
 
+std::size_t DeviceRegionPool::bytesReserved() const {
+	std::lock_guard<std::mutex> lock(mutex_);
+	std::size_t total = 0;
+	for (const auto& [id, allocation] : allocations_) total += allocation.reserved_bytes;
+	return total;
+}
+
+std::size_t DeviceRegionPool::bytesReserved(MemoryKind kind) const {
+	std::lock_guard<std::mutex> lock(mutex_);
+	std::size_t total = 0;
+	for (const auto& [id, allocation] : allocations_) {
+		if (allocation.kind == kind) total += allocation.reserved_bytes;
+	}
+	return total;
+}
+
+std::size_t DeviceRegionPool::reservationBytes(std::size_t bytes, MemoryKind kind) const {
+	return memory_manager_->reservationBytes(bytes, kind);
+}
+
+std::size_t DeviceRegionPool::budgetBytes(MemoryKind kind) const { return memory_manager_->budgetBytes(kind); }
+
+std::size_t DeviceRegionPool::allocationUnitBytes(MemoryKind kind) const {
+	return memory_manager_->allocationUnitBytes(kind);
+}
+
 DeviceRegionPool::CompactionResult DeviceRegionPool::compact(MemoryKind kind, std::size_t required_bytes) {
 	ARACHNE_TRACE_SCOPE("DeviceRegionPool", "compact");
-	if (device_.allocationPolicy() != AllocationPolicy::Pooled) {
+	if (memory_manager_->arena(kind) == nullptr) {
 		// No shared arena under Normal -- see the declaration's doc comment.
 		return {};
 	}
@@ -461,7 +461,7 @@ DeviceRegionPool::CompactionResult DeviceRegionPool::tryOpenContiguousExtentLock
 		arena.free(move.from);
 
 		++relocated_count;
-		bytes_relocated += it->second.bytes;
+		bytes_relocated += it->second.reserved_bytes;
 	}
 
 	return CompactionResult{relocated_count, bytes_relocated};

@@ -190,7 +190,7 @@ TEST(ControllerGpuResidencyTest, PromoteEvictsMultipleVictimsWhenOneIsNotEnoughC
 	// victim. gpu_unit_bytes == kSmallBytes avoids unit-rounding slack.
 	constexpr std::size_t kSmallBytes = 256;
 	constexpr std::size_t kBigBytes = 512;
-	Controller controller(adapter, routing_cache, SchedulingConfig{}, nullptr,
+	Controller controller(adapter, routing_cache, SchedulingConfig{}, std::make_unique<FifoReplacementPolicy>(),
 												 /*gpu_data_budget_bytes=*/3 * kSmallBytes, gpu::kDefaultMetadataPoolBytes,
 												 /*gpu_unit_bytes=*/kSmallBytes, /*compaction_policy=*/nullptr, /*coordinator_config=*/{},
 												 gpu::AllocationPolicy::Pooled);

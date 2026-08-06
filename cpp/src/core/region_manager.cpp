@@ -1,5 +1,7 @@
 #include "core/region_manager.hpp"
 
+#include <algorithm>
+#include <limits>
 #include <stdexcept>
 #include <utility>
 
@@ -28,11 +30,18 @@ namespace {
 // (RoutingCache itself is radius-agnostic; each Anchor carries its own
 // max_distance). A real per-query threshold is future work.
 constexpr float kDefaultAnchorMaxDistance = 1e-3f;
+
+std::size_t MinimumUtilizedBytes(std::size_t capacity, std::uint8_t percentage) {
+	const std::size_t percent = std::min<std::size_t>(percentage, 100);
+	const std::size_t whole = (capacity / 100) * percent;
+	const std::size_t remainder = capacity % 100;
+	return whole + (remainder * percent + 99) / 100;
+}
 }  // namespace
 
 RegionManager::RegionManager(std::unique_ptr<ReplacementPolicy> replacement_policy)
 		: replacement_policy_(std::move(replacement_policy)) {
-	if (replacement_policy_ == nullptr) replacement_policy_ = std::make_unique<FifoReplacementPolicy>();
+	if (replacement_policy_ == nullptr) replacement_policy_ = std::make_unique<CostAwareReplacementPolicy>();
 }
 
 RegionManager::~RegionManager() { shutdown(); }
@@ -66,6 +75,67 @@ std::vector<RegionId> RegionManager::regionsOf(VectorId anchor_id) const {
 	auto it = dependencies_.find(anchor_id);
 	if (it == dependencies_.end()) return {};
 	return std::vector<RegionId>(it->second.begin(), it->second.end());
+}
+
+std::vector<RegionResidencyHint> RegionManager::residencyHints(VectorId anchor_id) const {
+	std::lock_guard<RegionManagerMutex> lock(mutex_);
+	auto dependency_it = dependencies_.find(anchor_id);
+	if (dependency_it == dependencies_.end() || dependency_it->second.empty()) return {};
+
+	std::vector<RegionResidencyHint> hints;
+	hints.reserve(dependency_it->second.size());
+	for (RegionId region_id : dependency_it->second) {
+		auto region_it = regions_.find(region_id);
+		if (region_it == regions_.end() ||
+				region_it->second.residency_state != RegionResidencyState::Resident ||
+				!region_it->second.device.valid()) {
+			return {};
+		}
+		hints.push_back({region_id, region_it->second.residency_generation});
+	}
+	return hints;
+}
+
+RegionManager::ResidencyPinBatch::~ResidencyPinBatch() {
+	if (owner != nullptr) owner->unpinResidency(hints);
+}
+
+std::shared_ptr<void> RegionManager::tryPinResidency(
+		const std::vector<RegionResidencyHint>& hints) {
+	if (hints.empty()) return {};
+	{
+		std::lock_guard<RegionManagerMutex> lock(mutex_);
+		for (const RegionResidencyHint& hint : hints) {
+			auto it = regions_.find(hint.region);
+			if (it == regions_.end() || it->second.residency_state != RegionResidencyState::Resident ||
+					it->second.residency_generation != hint.generation || !it->second.device.valid()) {
+				return {};
+			}
+		}
+		for (const RegionResidencyHint& hint : hints) ++regions_.at(hint.region).residency_pins;
+	}
+	auto pin = std::make_shared<ResidencyPinBatch>();
+	pin->owner = this;
+	pin->hints = hints;
+	return std::static_pointer_cast<void>(pin);
+}
+
+void RegionManager::unpinResidency(const std::vector<RegionResidencyHint>& hints) {
+	bool reclaim_ready = false;
+	{
+		std::lock_guard<RegionManagerMutex> lock(mutex_);
+		for (const RegionResidencyHint& hint : hints) {
+			auto it = regions_.find(hint.region);
+			if (it == regions_.end() || it->second.residency_pins == 0) continue;
+			--it->second.residency_pins;
+			if (it->second.residency_state == RegionResidencyState::Retiring &&
+					it->second.residency_pins == 0) {
+				reclaim_ready = true;
+			}
+		}
+		if (reclaim_ready) coordinator_reclaim_ready_ = true;
+	}
+	if (reclaim_ready) coordinator_cv_.notify_one();
 }
 
 bool RegionManager::addDependency(VectorId anchor_id, RegionId region_id) {
@@ -132,6 +202,8 @@ void RegionManager::clearResidency(RegionId id) {
 
 	it->second.lease = LeaseHandle{};
 	it->second.device = gpu::DeviceRegionHandle{};
+	it->second.residency_state = RegionResidencyState::HostOnly;
+	++it->second.residency_generation;
 }
 
 // ---------------------------------------------------------------------------
@@ -139,7 +211,7 @@ void RegionManager::clearResidency(RegionId id) {
 // ---------------------------------------------------------------------------
 
 void RegionManager::start(IAdapter& adapter, gpu::DeviceRegionPool& device_region_pool, RoutingCache& routing_cache,
-													 CoordinatorConfig config) {
+											 CoordinatorConfig config) {
 	std::lock_guard<RegionManagerMutex> lock(mutex_);
 	if (coordinator_running_) {
 		throw std::logic_error("RegionManager coordinator already started");
@@ -147,6 +219,8 @@ void RegionManager::start(IAdapter& adapter, gpu::DeviceRegionPool& device_regio
 	adapter_ = &adapter;
 	device_region_pool_ = &device_region_pool;
 	routing_cache_ = &routing_cache;
+	config.near_fit_min_utilization_percent =
+			std::min<std::uint8_t>(config.near_fit_min_utilization_percent, 100);
 	coordinator_config_ = config;
 	coordinator_stop_requested_ = false;
 	coordinator_running_ = true;
@@ -187,14 +261,21 @@ void RegionManager::requestPromotion(VectorId anchor_id, RegionFootprint footpri
 	candidate.footprint = std::move(footprint);
 	candidate.vector_dim = vector.dim;
 	candidate.vector_dtype = vector.dtype;
+	candidate.enqueued_at = PromotionCandidate::Clock::now();
+	candidate.enqueue_sequence = next_candidate_sequence_.fetch_add(1, std::memory_order_relaxed);
 	if (vector.data != nullptr && vector.dim > 0) {
 		const auto* bytes = static_cast<const std::byte*>(vector.data);
 		candidate.vector_bytes.assign(bytes, bytes + static_cast<std::size_t>(vector.dim) * VectorElementSize(vector.dtype));
 	}
 
-	std::lock_guard<RegionManagerMutex> lock(mutex_);
-	candidate.epoch = currentEpochLocked(anchor_id);
-	pending_promotions_.push_back(std::move(candidate));
+	{
+		std::lock_guard<RegionManagerMutex> lock(mutex_);
+		candidate.epoch = currentEpochLocked(anchor_id);
+		pending_promotions_.push_back(std::move(candidate));
+	}
+	// Event-driven MPSC intake: wake the single consumer immediately. The
+	// relocation itself still waits for the coalescing deadline.
+	coordinator_cv_.notify_one();
 }
 
 void RegionManager::releaseAnchor(VectorId anchor_id) {
@@ -222,21 +303,19 @@ void RegionManager::releaseAnchor(VectorId anchor_id) {
 
 	if (orphaned.empty()) return;
 
-	std::vector<Region> snapshots;
-	snapshots.reserve(orphaned.size());
-	for (RegionId region_id : orphaned) {
-		Region region = regionOf(region_id);  // snapshot BEFORE clearResidency() below overwrites the live record
-		if (adapter_ != nullptr) {
-			if (IRegion* target = adapter_->resolveRegion(region_id)) target->releaseWriteLease(region.lease);
+	{
+		std::lock_guard<RegionManagerMutex> lock(mutex_);
+		for (RegionId region_id : orphaned) {
+			auto it = regions_.find(region_id);
+			if (it == regions_.end() || it->second.residency_state != RegionResidencyState::Resident) continue;
+			it->second.residency_state = RegionResidencyState::Retiring;
+			++it->second.residency_generation;
+			pending_reclaims_.push_back(it->second);
 		}
-		clearResidency(region_id);
-		snapshots.push_back(region);
+		coordinator_reclaim_ready_ = true;
 	}
-
 	stat_anchor_evictions_.fetch_add(1, std::memory_order_relaxed);
-
-	std::lock_guard<RegionManagerMutex> lock(mutex_);
-	for (Region& region : snapshots) pending_reclaims_.push_back(std::move(region));
+	coordinator_cv_.notify_one();
 }
 
 void RegionManager::recordTraversal(const RegionFootprint& touched) {
@@ -277,18 +356,35 @@ RegionManager::Stats RegionManager::stats() const {
 	result.regions_written_back_total = stat_regions_written_back_.load(std::memory_order_relaxed);
 	result.anchor_evictions_total = stat_anchor_evictions_.load(std::memory_order_relaxed);
 	result.compactions_total = stat_compactions_total_.load(std::memory_order_relaxed);
+	result.relocation_batches_total = stat_relocation_batches_.load(std::memory_order_relaxed);
+	result.candidates_requeued_total = stat_candidates_requeued_.load(std::memory_order_relaxed);
+	result.near_fit_reuses_total = stat_near_fit_reuses_.load(std::memory_order_relaxed);
 	std::lock_guard<RegionManagerMutex> lock(mutex_);
 	if (device_region_pool_ != nullptr) result.gpu_bytes_allocated = device_region_pool_->bytesAllocated();
 	return result;
 }
 
 void RegionManager::coordinatorLoop() {
+	using Clock = std::chrono::steady_clock;
+	std::optional<Clock::time_point> relocation_deadline;
+
 	while (true) {
 		std::unique_lock<RegionManagerMutex> lock(mutex_);
-		coordinator_cv_.wait_for(lock, coordinator_config_.trigger_interval,
-															[this] { return coordinator_stop_requested_ || coordinator_force_wake_; });
+		auto wake_requested = [this] {
+			return coordinator_stop_requested_ || coordinator_force_wake_ || coordinator_reclaim_ready_ ||
+					 !pending_promotions_.empty();
+		};
+		if (relocation_deadline.has_value()) {
+			coordinator_cv_.wait_until(lock, *relocation_deadline, wake_requested);
+		} else {
+			coordinator_cv_.wait(lock, wake_requested);
+		}
+		const Clock::time_point now = Clock::now();
+		const bool deadline_reached = relocation_deadline.has_value() && now >= *relocation_deadline;
 		bool forced = coordinator_force_wake_;
 		coordinator_force_wake_ = false;
+		bool reclaim_ready = coordinator_reclaim_ready_;
+		coordinator_reclaim_ready_ = false;
 		bool stop = coordinator_stop_requested_;
 
 		coordinator_busy_ = true;
@@ -305,6 +401,9 @@ void RegionManager::coordinatorLoop() {
 		for (PromotionCandidate& candidate : admitted) {
 			replacement_policy_->enqueueCandidate(std::move(candidate));
 		}
+		if (!admitted.empty() && !relocation_deadline.has_value()) {
+			relocation_deadline = now + coordinator_config_.trigger_interval;
+		}
 
 		// Reclaims are already-decided cleanup (from releaseAnchor()/
 		// evictAnchorNow()), not a policy decision -- process unconditionally.
@@ -316,8 +415,18 @@ void RegionManager::coordinatorLoop() {
 		// `forced` because `forced` is one-shot but stop stays true across
 		// every remaining iteration, so shutdown() keeps forcing execution
 		// until the policy's backlog is genuinely drained (see below).
-		if (forced || stop || replacement_policy_->onRelocationTrigger()) {
-			processPromotions();
+		const bool execution_point = forced || stop || deadline_reached || reclaim_ready;
+		if (execution_point && replacement_policy_->hasPendingCandidates() &&
+				(forced || stop || replacement_policy_->onRelocationTrigger())) {
+			// A forced drain must terminate: transient failures are attempted once
+			// and then dropped, matching waitIdle()/shutdown()'s liveness contract.
+			do {
+				processRelocationBatch(/*retain_failed_candidates=*/!forced && !stop);
+			} while ((forced || stop) && replacement_policy_->hasPendingCandidates());
+			relocation_deadline.reset();
+		}
+		if (replacement_policy_->hasPendingCandidates() && !relocation_deadline.has_value()) {
+			relocation_deadline = Clock::now() + coordinator_config_.trigger_interval;
 		}
 
 		lock.lock();
@@ -337,7 +446,7 @@ void RegionManager::coordinatorLoop() {
 // ---------------------------------------------------------------------------
 
 std::optional<gpu::DeviceRegionHandle> RegionManager::allocateWithCompaction(
-		std::size_t bytes, std::vector<gpu::DeviceRegionPool::Lease>& pending) {
+		std::size_t bytes, gpu::DeviceRegionPool::TransferBatch& pending) {
 	std::optional<gpu::DeviceRegionHandle> handle = device_region_pool_->tryAllocate(bytes);
 	if (handle.has_value()) return handle;
 
@@ -348,18 +457,17 @@ std::optional<gpu::DeviceRegionHandle> RegionManager::allocateWithCompaction(
 	// Flush and release any Lease already pinned earlier in this batch first:
 	// compact() only relocates unpinned allocations, so this widens its pool
 	// of movable blocks instead of excluding Regions this same batch pinned.
-	if (!pending.empty()) {
-		device_region_pool_->flush();
-		pending.clear();
+	if (!pending.leases.empty()) {
+		device_region_pool_->finishTransfers(pending);
 	}
 	device_region_pool_->compact(gpu::MemoryKind::Data, bytes);
 	stat_compactions_total_.fetch_add(1, std::memory_order_relaxed);
 	return device_region_pool_->tryAllocate(bytes);
 }
 
-RegionManager::MakeResult RegionManager::make(VectorId anchor_id, RegionId region,
-																							 std::vector<gpu::DeviceRegionPool::Lease>& pending,
-																							 std::vector<std::vector<std::byte>>& zero_headers) {
+RegionManager::MakeResult RegionManager::make(VectorId anchor_id, std::uint64_t anchor_epoch, RegionId region,
+		gpu::DeviceRegionPool::TransferBatch& pending,
+		std::vector<PendingPromotionCommit>& commits, ReusableAllocations& reusable) {
 	ARACHNE_TRACE_SCOPE("RegionManager", "make");
 	for (RegionId existing : regionsOf(anchor_id)) {
 		if (existing == region) return MakeResult::Promoted;  // already a dependent
@@ -371,7 +479,7 @@ RegionManager::MakeResult RegionManager::make(VectorId anchor_id, RegionId regio
 	}
 
 	Region snapshot = regionOf(region);
-	if (!snapshot.lease.valid()) {
+	if (snapshot.residency_state == RegionResidencyState::HostOnly) {
 		IRegion* target = adapter_->resolveRegion(region);
 		if (target == nullptr) return MakeResult::NotEligible;
 
@@ -382,144 +490,510 @@ RegionManager::MakeResult RegionManager::make(VectorId anchor_id, RegionId regio
 		}
 
 		std::size_t header_bytes = gpu::DirtyHeaderBytes(snapshot.host.bytes, snapshot.host.subregion_bytes);
-		std::optional<gpu::DeviceRegionHandle> device =
-				allocateWithCompaction(header_bytes + snapshot.host.bytes, pending);
+		std::optional<gpu::DeviceRegionHandle> device;
+		auto reusable_it = reusable.find(region);
+		if (reusable_it != reusable.end()) {
+			device = reusable_it->second;
+			reusable.erase(reusable_it);
+		} else {
+			device = allocateWithCompaction(header_bytes + snapshot.host.bytes, pending);
+		}
 		if (!device.has_value()) {
 			target->releaseWriteLease(lease);
 			ARACHNE_LOG_DEBUG("make: region {} ({} bytes) out of GPU capacity for anchor {}", region,
 												 header_bytes + snapshot.host.bytes, anchor_id);
 			return MakeResult::OutOfCapacity;
 		}
+		std::uint64_t residency_generation = 0;
+		{
+			std::lock_guard<RegionManagerMutex> lock(mutex_);
+			auto live = regions_.find(region);
+			if (live == regions_.end() ||
+					live->second.residency_state != RegionResidencyState::HostOnly ||
+					currentEpochLocked(anchor_id) != anchor_epoch) {
+				target->releaseWriteLease(lease);
+				device_region_pool_->free(*device);
+				return MakeResult::NotEligible;
+			}
+			live->second.residency_state = RegionResidencyState::Promoting;
+			residency_generation = ++live->second.residency_generation;
+		}
 		if (header_bytes > 0) {
-			zero_headers.emplace_back(header_bytes, std::byte{0});
-			device_region_pool_->enqueueCopyFromHost(*device, zero_headers.back().data(), header_bytes,
+			std::vector<std::byte> zero_header(header_bytes, std::byte{0});
+			device_region_pool_->enqueueCopyFromHost(*device, zero_header.data(), header_bytes,
 																								/*dst_offset=*/0, pending);
 		}
 		device_region_pool_->enqueueCopyFromHost(*device, snapshot.host.ptr, snapshot.host.bytes, header_bytes,
 																							pending);
-		setDevice(region, *device);
-		setLease(region, lease);
-		stat_regions_promoted_.fetch_add(1, std::memory_order_relaxed);
+		commits.push_back(
+				PendingPromotionCommit{anchor_id, region, *device, lease, residency_generation, anchor_epoch});
+		return MakeResult::Promoted;
+	}
+	if (snapshot.residency_state == RegionResidencyState::Promoting ||
+			snapshot.residency_state == RegionResidencyState::Retiring) {
+		return MakeResult::Deferred;
+	}
+	if (snapshot.residency_state != RegionResidencyState::Resident || !snapshot.lease.valid()) {
+		return MakeResult::NotEligible;
 	}
 
 	// No replacement_policy_ notification here -- selectNextPromotionCandidate()
 	// already recorded anchor_id for eviction-ordering purposes before make()
 	// was ever called for it.
-	addDependency(anchor_id, region);
+	{
+		std::lock_guard<RegionManagerMutex> lock(mutex_);
+		auto live = regions_.find(region);
+		if (live == regions_.end() || live->second.residency_state != RegionResidencyState::Resident ||
+				currentEpochLocked(anchor_id) != anchor_epoch) {
+			return MakeResult::Deferred;
+		}
+		dependents_[region].insert(anchor_id);
+		dependencies_[anchor_id].insert(region);
+	}
 
 	ARACHNE_LOG_DEBUG("make: anchor {} now depends on region {}", anchor_id, region);
 	return MakeResult::Promoted;
 }
 
-void RegionManager::processPromotions() {
-	ARACHNE_TRACE_SCOPE("RegionManager", "processPromotions");
-	std::vector<gpu::DeviceRegionPool::Lease> pending;
-	std::vector<std::vector<std::byte>> zero_headers;
+std::size_t RegionManager::reservedRegionBytes(const Region& region) const {
+	std::size_t logical_bytes = gpu::DirtyHeaderBytes(region.host.bytes, region.host.subregion_bytes) +
+														region.host.bytes;
+	return device_region_pool_->reservationBytes(logical_bytes, gpu::MemoryKind::Data);
+}
+
+std::vector<EvictionCandidate> RegionManager::buildEvictionCandidates() const {
+	std::vector<EvictionCandidate> candidates;
+	std::lock_guard<RegionManagerMutex> lock(mutex_);
+	candidates.reserve(dependencies_.size());
+	for (const auto& [anchor_id, region_ids] : dependencies_) {
+		EvictionCandidate candidate;
+		candidate.anchor_id = anchor_id;
+		for (RegionId region_id : region_ids) {
+			auto region_it = regions_.find(region_id);
+			if (region_it == regions_.end() || !region_it->second.device.valid()) continue;
+			const Region& region = region_it->second;
+			std::size_t bytes = reservedRegionBytes(region);
+			candidate.resident_bytes += bytes;
+			++candidate.resident_regions;
+			auto dependents_it = dependents_.find(region_id);
+			if (dependents_it != dependents_.end() && dependents_it->second.size() == 1) {
+				candidate.reclaimable_bytes += bytes;
+				if (region.residency_state == RegionResidencyState::Resident && region.residency_pins == 0) {
+					candidate.reclaimable_now_bytes += bytes;
+				}
+				candidate.potential_writeback_bytes += region.host.bytes;
+				++candidate.reclaimable_regions;
+			}
+		}
+		if (candidate.resident_regions != 0) candidates.push_back(candidate);
+	}
+	return candidates;
+}
+
+AdmissionContext RegionManager::buildAdmissionContext(const PromotionCandidate& candidate) const {
+	AdmissionContext context;
+	context.allocation_unit_bytes = device_region_pool_->allocationUnitBytes(gpu::MemoryKind::Data);
+	std::unordered_set<RegionId> unique_regions;
+	{
+		std::lock_guard<RegionManagerMutex> lock(mutex_);
+		for (RegionId region_id : candidate.footprint.regions) {
+			if (!unique_regions.insert(region_id).second) continue;
+			auto it = regions_.find(region_id);
+			if (it == regions_.end()) continue;
+			std::size_t bytes = reservedRegionBytes(it->second);
+			context.total_footprint_bytes += bytes;
+			if (it->second.device.valid()) {
+				context.already_resident_bytes += bytes;
+			} else {
+				context.incremental_bytes += bytes;
+			}
+		}
+	}
+	context.gpu_bytes_allocated = device_region_pool_->bytesReserved(gpu::MemoryKind::Data);
+	context.gpu_budget_bytes = device_region_pool_->budgetBytes(gpu::MemoryKind::Data);
+	context.eviction_candidates = buildEvictionCandidates();
+	return context;
+}
+
+std::size_t RegionManager::promotionBytes(const std::vector<PlannedPromotion>& promotions) const {
+	std::unordered_set<RegionId> unique;
+	std::size_t bytes = 0;
+	std::lock_guard<RegionManagerMutex> lock(mutex_);
+	for (const PlannedPromotion& promotion : promotions) {
+		for (RegionId region_id : promotion.candidate.footprint.regions) {
+			if (!unique.insert(region_id).second) continue;
+			auto it = regions_.find(region_id);
+			if (it == regions_.end() || it->second.residency_state != RegionResidencyState::HostOnly) continue;
+			bytes += reservedRegionBytes(it->second);
+		}
+	}
+	return bytes;
+}
+
+std::size_t RegionManager::projectedReclaimableBytes(
+		const std::vector<VectorId>& victims, bool require_unpinned) const {
+	std::unordered_set<VectorId> selected(victims.begin(), victims.end());
+	std::size_t bytes = 0;
+	std::lock_guard<RegionManagerMutex> lock(mutex_);
+	for (const auto& [region_id, anchors] : dependents_) {
+		if (anchors.empty() || !std::all_of(anchors.begin(), anchors.end(),
+				[&selected](VectorId anchor) { return selected.contains(anchor); })) {
+			continue;
+		}
+		auto it = regions_.find(region_id);
+		if (it == regions_.end() || it->second.residency_state != RegionResidencyState::Resident ||
+				!it->second.device.valid() || (require_unpinned && it->second.residency_pins != 0)) {
+			continue;
+		}
+		bytes += reservedRegionBytes(it->second);
+	}
+	return bytes;
+}
+
+std::vector<RegionManager::PromotionStorageRequest> RegionManager::buildPromotionStorageRequests(
+		const std::vector<PlannedPromotion>& promotions) const {
+	std::vector<PromotionStorageRequest> requests;
+	std::unordered_set<RegionId> unique;
+	std::lock_guard<RegionManagerMutex> lock(mutex_);
+	for (const PlannedPromotion& promotion : promotions) {
+		for (RegionId region_id : promotion.candidate.footprint.regions) {
+			if (!unique.insert(region_id).second) continue;
+			auto it = regions_.find(region_id);
+			if (it == regions_.end() || it->second.residency_state != RegionResidencyState::HostOnly) continue;
+			std::size_t logical = gpu::DirtyHeaderBytes(it->second.host.bytes, it->second.host.subregion_bytes) +
+					it->second.host.bytes;
+			requests.push_back({region_id, logical, reservedRegionBytes(it->second)});
+		}
+	}
+	return requests;
+}
+
+void RegionManager::requeueCandidates(std::vector<PromotionCandidate> candidates) {
+	stat_candidates_requeued_.fetch_add(candidates.size(), std::memory_order_relaxed);
+	for (PromotionCandidate& candidate : candidates) {
+		replacement_policy_->requeueCandidate(std::move(candidate));
+	}
+}
+
+std::optional<RegionManager::RelocationPlan> RegionManager::buildRelocationPlan(
+		std::uint64_t batch_sequence, bool retain_failed_candidates) {
+	RelocationPlan plan;
+	plan.batch_sequence = batch_sequence;
+	std::vector<PromotionCandidate> deferred;
+	const std::size_t budget = device_region_pool_->budgetBytes(gpu::MemoryKind::Data);
+	const std::size_t reserved = device_region_pool_->bytesReserved(gpu::MemoryKind::Data);
+	const std::size_t available = budget > reserved ? budget - reserved : 0;
+	std::size_t selected_incremental = 0;
 
 	while (std::optional<PromotionCandidate> candidate = replacement_policy_->selectNextPromotionCandidate()) {
 		{
 			std::lock_guard<RegionManagerMutex> lock(mutex_);
-			if (currentEpochLocked(candidate->anchor_id) != candidate->epoch) {
-				ARACHNE_LOG_DEBUG("processPromotions: anchor {} epoch stale, discarding candidate", candidate->anchor_id);
-				continue;
-			}
+			if (currentEpochLocked(candidate->anchor_id) != candidate->epoch) continue;
+		}
+		++candidate->planning_attempts;
+		candidate->last_batch_sequence = batch_sequence;
+		if (candidate->first_batch_sequence == 0) candidate->first_batch_sequence = batch_sequence;
+
+		AdmissionContext admission = buildAdmissionContext(*candidate);
+		RelocationBatchContext batch_context{batch_sequence, plan.promotions.size(), selected_incremental,
+				available, budget, coordinator_config_.max_promotion_bytes_per_pass};
+		BatchAdmissionDecision decision =
+				replacement_policy_->evaluateBatchAdmission(*candidate, admission, batch_context);
+		if (decision == BatchAdmissionDecision::Reject) continue;
+		if (decision == BatchAdmissionDecision::Defer) {
+			if (retain_failed_candidates) deferred.push_back(std::move(*candidate));
+			break;
 		}
 
-		bool any_promoted = false;
-		for (RegionId region : candidate->footprint.regions) {
-			MakeResult result = make(candidate->anchor_id, region, pending, zero_headers);
-			if (result == MakeResult::Promoted) {
-				any_promoted = true;
-				continue;
-			}
-			if (result == MakeResult::NotEligible) {
-				ARACHNE_LOG_DEBUG("processPromotions: region {} not eligible for anchor {}, skipping", region,
-													 candidate->anchor_id);
-				continue;
-			}
-
-			while (result == MakeResult::OutOfCapacity) {
-				std::optional<VectorId> victim = replacement_policy_->selectNextEvictionCandidate(candidate->anchor_id);
-				if (!victim.has_value()) {
-					ARACHNE_LOG_DEBUG("processPromotions: no eviction candidate left, anchor {} region {} not promoted",
-														 candidate->anchor_id, region);
-					break;
-				}
-
-				// Flush and release every Lease from this pass before evicting:
-				// `victim` may depend on a Region this pass already promoted and
-				// is still pinning via `pending`. Without this,
-				// evictAnchorNow()'s free() would await that same Lease -- a real
-				// deadlock (the Coordinator waiting on itself), not just a missed
-				// optimization. Safe unconditionally: flush() only proves
-				// already-enqueued copies landed, it doesn't invalidate `pending`.
-				if (!pending.empty()) {
-					device_region_pool_->flush();
-					pending.clear();
-				}
-				evictAnchorNow(*victim);
-				result = make(candidate->anchor_id, region, pending, zero_headers);
-			}
-
-			if (result == MakeResult::Promoted) {
-				any_promoted = true;
-			} else {
-				ARACHNE_LOG_DEBUG("processPromotions: region {} still unavailable for anchor {} (result={})", region,
-													 candidate->anchor_id, static_cast<int>(result));
-			}
+		if (coordinator_config_.max_promotion_bytes_per_pass != 0 && !plan.promotions.empty() &&
+				(admission.incremental_bytes > coordinator_config_.max_promotion_bytes_per_pass ||
+				 selected_incremental > coordinator_config_.max_promotion_bytes_per_pass - admission.incremental_bytes)) {
+			if (retain_failed_candidates) deferred.push_back(std::move(*candidate));
+			break;
 		}
 
-		// Register in RoutingCache only if at least one Region in this
-		// candidate's footprint actually became a dependency -- a candidate
-		// that went entirely NotEligible/OutOfCapacity gained no GPU residency
-		// for a future query to be routed to.
-		if (any_promoted && routing_cache_ != nullptr) {
-			routing_cache_->ensure(candidate->anchor_id, candidate->vectorView(), kDefaultAnchorMaxDistance);
+		plan.promotions.push_back(PlannedPromotion{std::move(*candidate), std::move(admission)});
+		std::size_t required = promotionBytes(plan.promotions);
+		if (required > budget) {
+			PromotionCandidate over_budget = std::move(plan.promotions.back().candidate);
+			plan.promotions.pop_back();
+			if (!plan.promotions.empty() && retain_failed_candidates) deferred.push_back(std::move(over_budget));
+			// A single candidate larger than the entire budget is permanently
+			// infeasible and intentionally rejected rather than retried forever.
+			break;
+		}
+		selected_incremental += plan.promotions.back().admission.incremental_bytes;
+	}
+
+	if (!deferred.empty()) requeueCandidates(std::move(deferred));
+	if (plan.promotions.empty()) return std::nullopt;
+	plan.required_incremental_bytes = promotionBytes(plan.promotions);
+	if (available >= plan.required_incremental_bytes) return plan;
+
+	std::unordered_set<VectorId> promoted_anchors;
+	for (const PlannedPromotion& promotion : plan.promotions) {
+		promoted_anchors.insert(promotion.candidate.anchor_id);
+	}
+	std::vector<EvictionCandidate> candidates = buildEvictionCandidates();
+	candidates.erase(std::remove_if(candidates.begin(), candidates.end(),
+			[&promoted_anchors](const EvictionCandidate& candidate) {
+				return promoted_anchors.contains(candidate.anchor_id);
+			}), candidates.end());
+
+	while (available + plan.immediately_reclaimable_bytes < plan.required_incremental_bytes) {
+		std::size_t remaining = plan.required_incremental_bytes -
+				(available + plan.immediately_reclaimable_bytes);
+		std::optional<VectorId> victim =
+				replacement_policy_->selectEvictionCandidate(/*excluded=*/0, remaining, candidates);
+		if (!victim.has_value()) break;
+		auto found = std::find_if(candidates.begin(), candidates.end(),
+				[&victim](const EvictionCandidate& candidate) { return candidate.anchor_id == *victim; });
+		if (found == candidates.end()) break;
+		plan.evictions.push_back(*victim);
+		std::size_t projected = projectedReclaimableBytes(plan.evictions, /*require_unpinned=*/true);
+		if (coordinator_config_.max_eviction_bytes_per_pass != 0 && plan.evictions.size() > 1 &&
+				projected > coordinator_config_.max_eviction_bytes_per_pass) {
+			plan.evictions.pop_back();
+			break;
+		}
+		plan.immediately_reclaimable_bytes = projected;
+		candidates.erase(found);
+	}
+
+	if (available + plan.immediately_reclaimable_bytes < plan.required_incremental_bytes) {
+		if (retain_failed_candidates) {
+			std::vector<PromotionCandidate> retry;
+			for (PlannedPromotion& promotion : plan.promotions) retry.push_back(std::move(promotion.candidate));
+			requeueCandidates(std::move(retry));
+		}
+		return std::nullopt;
+	}
+	return plan;
+}
+
+void RegionManager::processRelocationBatch(bool retain_failed_candidates) {
+	ARACHNE_TRACE_SCOPE("RegionManager", "processRelocationBatch");
+	std::optional<RelocationPlan> maybe_plan =
+			buildRelocationPlan(next_batch_sequence_++, retain_failed_candidates);
+	if (!maybe_plan.has_value()) return;
+	RelocationPlan plan = std::move(*maybe_plan);
+	stat_relocation_batches_.fetch_add(1, std::memory_order_relaxed);
+
+	const std::size_t budget = device_region_pool_->budgetBytes(gpu::MemoryKind::Data);
+	const std::size_t reserved = device_region_pool_->bytesReserved(gpu::MemoryKind::Data);
+	const std::size_t available = budget > reserved ? budget - reserved : 0;
+	if (available + projectedReclaimableBytes(plan.evictions, true) < plan.required_incremental_bytes) {
+		if (retain_failed_candidates) {
+			std::vector<PromotionCandidate> retry;
+			for (PlannedPromotion& promotion : plan.promotions) retry.push_back(std::move(promotion.candidate));
+			requeueCandidates(std::move(retry));
+		}
+		return;
+	}
+
+	std::vector<Region> retired = retireAnchorsNow(plan.evictions);
+	ReusableAllocations reusable = reclaimRegionsForPlan(
+			retired, buildPromotionStorageRequests(plan.promotions));
+
+	gpu::DeviceRegionPool::TransferBatch pending;
+	std::vector<PendingPromotionCommit> commits;
+	std::vector<bool> retry(plan.promotions.size(), false);
+	for (std::size_t i = 0; i < plan.promotions.size(); ++i) {
+		PlannedPromotion& promotion = plan.promotions[i];
+		std::unordered_set<RegionId> unique;
+		for (RegionId region : promotion.candidate.footprint.regions) {
+			if (!unique.insert(region).second) continue;
+			MakeResult result = make(promotion.candidate.anchor_id, promotion.candidate.epoch,
+					region, pending, commits, reusable);
+			if (result == MakeResult::OutOfCapacity || result == MakeResult::Deferred) {
+				retry[i] = true;
+				break;
+			}
+		}
+	}
+	device_region_pool_->finishTransfers(pending);
+	for (const auto& [region, handle] : reusable) device_region_pool_->free(handle);
+
+	for (const PendingPromotionCommit& commit : commits) {
+		bool published = false;
+		{
+			std::lock_guard<RegionManagerMutex> lock(mutex_);
+			auto region_it = regions_.find(commit.region_id);
+			if (region_it != regions_.end() &&
+					region_it->second.residency_state == RegionResidencyState::Promoting &&
+					region_it->second.residency_generation == commit.residency_generation &&
+					currentEpochLocked(commit.anchor_id) == commit.anchor_epoch) {
+				region_it->second.device = commit.device;
+				region_it->second.lease = commit.lease;
+				region_it->second.residency_state = RegionResidencyState::Resident;
+				dependents_[commit.region_id].insert(commit.anchor_id);
+				dependencies_[commit.anchor_id].insert(commit.region_id);
+				published = true;
+			} else if (region_it != regions_.end() &&
+							 region_it->second.residency_state == RegionResidencyState::Promoting &&
+							 region_it->second.residency_generation == commit.residency_generation) {
+				region_it->second.residency_state = RegionResidencyState::HostOnly;
+			}
+		}
+		if (published) {
+			stat_regions_promoted_.fetch_add(1, std::memory_order_relaxed);
+		} else {
+			if (IRegion* target = adapter_->resolveRegion(commit.region_id)) target->releaseWriteLease(commit.lease);
+			device_region_pool_->free(commit.device);
 		}
 	}
 
-	// One batched flush for the whole pass, not one per Anchor -- mirrors
-	// reclaimRegions()/writeBackDirtyRegions()'s batched-gather shape for the
-	// opposite (device-to-host) direction.
-	device_region_pool_->flush();
+	std::vector<PromotionCandidate> retry_candidates;
+	for (std::size_t i = 0; i < plan.promotions.size(); ++i) {
+		PlannedPromotion& promotion = plan.promotions[i];
+		bool resident = !regionsOf(promotion.candidate.anchor_id).empty();
+		if (resident) {
+			replacement_policy_->onPromotionCommitted(promotion.candidate.anchor_id, promotion.admission);
+			if (routing_cache_ != nullptr) {
+				routing_cache_->ensure(promotion.candidate.anchor_id, promotion.candidate.vectorView(),
+						kDefaultAnchorMaxDistance);
+			}
+		}
+		if (retry[i] && retain_failed_candidates) {
+			retry_candidates.push_back(std::move(promotion.candidate));
+		}
+	}
+	if (!retry_candidates.empty()) requeueCandidates(std::move(retry_candidates));
 }
 
 void RegionManager::evictAnchorNow(VectorId anchor_id) {
 	ARACHNE_TRACE_SCOPE("RegionManager", "evictAnchorNow");
-	std::vector<RegionId> orphaned = forget(anchor_id);
-	replacement_policy_->onAnchorEvicted(anchor_id);
-	if (routing_cache_ != nullptr) routing_cache_->erase(anchor_id);
+	reclaimRegions(retireAnchorsNow({anchor_id}));
+}
 
-	if (orphaned.empty()) return;
-
+std::vector<Region> RegionManager::retireAnchorsNow(const std::vector<VectorId>& anchor_ids) {
 	std::vector<Region> snapshots;
-	snapshots.reserve(orphaned.size());
-	for (RegionId region_id : orphaned) {
-		Region region = regionOf(region_id);  // still registered; residency not yet cleared
-		if (IRegion* target = adapter_->resolveRegion(region_id)) {
-			target->releaseWriteLease(region.lease);
+	for (VectorId anchor_id : anchor_ids) {
+		std::vector<RegionId> orphaned = forget(anchor_id);
+		replacement_policy_->onAnchorEvicted(anchor_id);
+		if (routing_cache_ != nullptr) routing_cache_->erase(anchor_id);
+		{
+			std::lock_guard<RegionManagerMutex> lock(mutex_);
+			for (RegionId region_id : orphaned) {
+				auto it = regions_.find(region_id);
+				if (it == regions_.end() || it->second.residency_state != RegionResidencyState::Resident) continue;
+				it->second.residency_state = RegionResidencyState::Retiring;
+				++it->second.residency_generation;
+				snapshots.push_back(it->second);
+			}
 		}
-		snapshots.push_back(region);
+	}
+	stat_anchor_evictions_.fetch_add(anchor_ids.size(), std::memory_order_relaxed);
+	return snapshots;
+}
+
+RegionManager::ReusableAllocations RegionManager::reclaimRegionsForPlan(
+		const std::vector<Region>& snapshots,
+		const std::vector<PromotionStorageRequest>& requests) {
+	std::vector<Region> ready;
+	{
+		std::lock_guard<RegionManagerMutex> lock(mutex_);
+		for (const Region& snapshot : snapshots) {
+			auto it = regions_.find(snapshot.id);
+			if (it == regions_.end() || it->second.residency_state != RegionResidencyState::Retiring ||
+					it->second.residency_generation != snapshot.residency_generation) continue;
+			if (it->second.residency_pins != 0) {
+				pending_reclaims_.push_back(it->second);
+				continue;
+			}
+			if (it->second.device.valid()) ready.push_back(it->second);
+		}
+	}
+	ReusableAllocations reused;
+	if (ready.empty()) return reused;
+
+	writeBackDirtyRegions(ready);
+	std::unordered_set<std::uint64_t> reused_handles;
+	std::vector<PromotionStorageRequest> ordered_requests = requests;
+	std::sort(ordered_requests.begin(), ordered_requests.end(),
+			[](const PromotionStorageRequest& a, const PromotionStorageRequest& b) {
+				return a.reserved_bytes > b.reserved_bytes;
+			});
+	for (const PromotionStorageRequest& request : ordered_requests) {
+		Region* best = nullptr;
+		std::size_t best_capacity = std::numeric_limits<std::size_t>::max();
+		for (Region& slot : ready) {
+			if (reused_handles.contains(slot.device.id)) continue;
+			std::size_t capacity = reservedRegionBytes(slot);
+			const bool sufficiently_utilized =
+					request.reserved_bytes >= MinimumUtilizedBytes(
+							capacity, coordinator_config_.near_fit_min_utilization_percent);
+			if (capacity >= request.reserved_bytes && sufficiently_utilized && capacity < best_capacity) {
+				best = &slot;
+				best_capacity = capacity;
+			}
+		}
+		if (best != nullptr && device_region_pool_->tryReuse(best->device, request.logical_bytes)) {
+			reused.emplace(request.region_id, best->device);
+			reused_handles.insert(best->device.id);
+			stat_near_fit_reuses_.fetch_add(1, std::memory_order_relaxed);
+		}
 	}
 
-	reclaimRegions(snapshots);
-
-	for (RegionId region_id : orphaned) clearResidency(region_id);
-	stat_anchor_evictions_.fetch_add(1, std::memory_order_relaxed);
-
-	ARACHNE_LOG_DEBUG("evictAnchorNow: released anchor {}'s dependency on {} region(s)", anchor_id, orphaned.size());
+	for (const Region& region : ready) {
+		if (!reused_handles.contains(region.device.id)) device_region_pool_->free(region.device);
+		if (IRegion* target = adapter_->resolveRegion(region.id)) target->releaseWriteLease(region.lease);
+	}
+	{
+		std::lock_guard<RegionManagerMutex> lock(mutex_);
+		for (const Region& region : ready) {
+			auto it = regions_.find(region.id);
+			if (it == regions_.end() || it->second.residency_state != RegionResidencyState::Retiring ||
+					it->second.residency_generation != region.residency_generation) continue;
+			it->second.lease = LeaseHandle{};
+			it->second.device = gpu::DeviceRegionHandle{};
+			it->second.residency_state = RegionResidencyState::HostOnly;
+		}
+	}
+	stat_regions_evicted_.fetch_add(ready.size(), std::memory_order_relaxed);
+	return reused;
 }
 
 void RegionManager::reclaimRegions(const std::vector<Region>& snapshots) {
 	ARACHNE_TRACE_SCOPE("RegionManager", "reclaimRegions");
 	std::vector<Region> resident;
-	for (const Region& region : snapshots) {
-		if (region.device.valid()) resident.push_back(region);
+	{
+		std::lock_guard<RegionManagerMutex> lock(mutex_);
+		for (const Region& snapshot : snapshots) {
+			auto it = regions_.find(snapshot.id);
+			if (it == regions_.end() ||
+					it->second.residency_state != RegionResidencyState::Retiring ||
+					it->second.residency_generation != snapshot.residency_generation) {
+				continue;
+			}
+			if (it->second.residency_pins != 0) {
+				pending_reclaims_.push_back(it->second);
+				continue;
+			}
+			if (it->second.device.valid()) resident.push_back(it->second);
+		}
 	}
 	if (resident.empty()) return;
 
 	writeBackDirtyRegions(resident);  // one batched gather across every Region here, not one per Region
 	for (const Region& region : resident) device_region_pool_->free(region.device);
+	for (const Region& region : resident) {
+		if (IRegion* target = adapter_->resolveRegion(region.id)) target->releaseWriteLease(region.lease);
+	}
+	{
+		std::lock_guard<RegionManagerMutex> lock(mutex_);
+		for (const Region& region : resident) {
+			auto it = regions_.find(region.id);
+			if (it == regions_.end() ||
+					it->second.residency_state != RegionResidencyState::Retiring ||
+					it->second.residency_generation != region.residency_generation) {
+				continue;
+			}
+			it->second.lease = LeaseHandle{};
+			it->second.device = gpu::DeviceRegionHandle{};
+			it->second.residency_state = RegionResidencyState::HostOnly;
+		}
+	}
 	stat_regions_evicted_.fetch_add(resident.size(), std::memory_order_relaxed);
 }
 

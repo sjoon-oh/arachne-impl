@@ -11,11 +11,17 @@
 
 #include <gtest/gtest.h>
 
+#include <cuda_runtime.h>
+
 #include <chrono>
+#include <condition_variable>
 #include <cstring>
+#include <deque>
+#include <mutex>
 #include <stdexcept>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "adapter/index_adapter.hpp"
@@ -102,6 +108,39 @@ class FakeRoutingCache : public RoutingCache {
 	std::vector<std::byte> last_ensure_bytes;
 };
 
+class IntakeObservingPolicy : public ReplacementPolicy {
+ public:
+	void enqueueCandidate(PromotionCandidate candidate) override {
+		std::lock_guard<std::mutex> lock(mutex_);
+		pending_.push_back(std::move(candidate));
+		cv_.notify_all();
+	}
+	void onAnchorEvicted(VectorId) override {}
+	void onAnchorTouched(VectorId) override {}
+	bool onRelocationTrigger() override { return false; }
+	bool hasPendingCandidates() const override {
+		std::lock_guard<std::mutex> lock(mutex_);
+		return !pending_.empty();
+	}
+	std::optional<PromotionCandidate> selectNextPromotionCandidate() override {
+		std::lock_guard<std::mutex> lock(mutex_);
+		if (pending_.empty()) return std::nullopt;
+		PromotionCandidate candidate = std::move(pending_.front());
+		pending_.pop_front();
+		return candidate;
+	}
+	std::optional<VectorId> selectNextEvictionCandidate(VectorId) override { return std::nullopt; }
+	bool waitForIntake(std::chrono::milliseconds timeout) {
+		std::unique_lock<std::mutex> lock(mutex_);
+		return cv_.wait_for(lock, timeout, [this] { return !pending_.empty(); });
+	}
+
+ private:
+	mutable std::mutex mutex_;
+	std::condition_variable cv_;
+	std::deque<PromotionCandidate> pending_;
+};
+
 // A generous interval used whenever a test wants to prove something is
 // *not* processed until waitIdle() forces it -- long enough that the
 // periodic tick essentially never wins the race against the assertion that
@@ -160,6 +199,31 @@ TEST(RegionManagerCoordinatorTest, RequestPromotionIsLazyUntilWaitIdle) {
 	manager.shutdown();
 }
 
+TEST(RegionManagerCoordinatorTest, CandidateIntakeIsImmediateButExecutionWaitsForDeadline) {
+	FakeAdapter adapter;
+	FakeRoutingCache routing_cache;
+	constexpr std::size_t kBytes = 256;
+	gpu::DeviceContext device(/*device_id=*/0, gpu::AllocationPolicy::Pooled, kBytes,
+			gpu::kDefaultMetadataPoolBytes, /*worker_stream_count=*/1, /*unit_bytes=*/kBytes);
+	gpu::DeviceRegionPool pool(device);
+	auto policy = std::make_unique<IntakeObservingPolicy>();
+	IntakeObservingPolicy* observed = policy.get();
+	RegionManager manager(std::move(policy));
+	manager.start(adapter, pool, routing_cache, CoordinatorConfig{std::chrono::seconds(2)});
+
+	std::vector<std::byte> host_data(kBytes, std::byte{0x7});
+	HostRegionView host{host_data.data(), kBytes, 0};
+	adapter.addRegion(1, host);
+	manager.registerRegion(1, host);
+	manager.requestPromotion(100, RegionFootprint{{1}});
+
+	EXPECT_TRUE(observed->waitForIntake(std::chrono::milliseconds(500)));
+	EXPECT_FALSE(manager.regionOf(1).device.valid());
+	manager.waitIdle();
+	EXPECT_TRUE(manager.regionOf(1).device.valid());
+	manager.shutdown();
+}
+
 TEST(RegionManagerCoordinatorTest, ReleaseAnchorBookkeepingIsImmediateButReclaimIsLazy) {
 	FakeAdapter adapter;
 	FakeRoutingCache routing_cache;
@@ -181,17 +245,19 @@ TEST(RegionManagerCoordinatorTest, ReleaseAnchorBookkeepingIsImmediateButReclaim
 	ASSERT_EQ(manager.regionsOf(100).size(), 1u);
 
 	manager.releaseAnchor(100);
-	// Dependency-graph bookkeeping, residency clearing, and RoutingCache
-	// erasure are all synchronous -- so a concurrent requestPromotion() for
-	// a different Anchor onto the same Region re-promotes fresh instead of
-	// seeing a stale "already promoted" lease (see releaseAnchor()'s doc comment).
+	// Dependency-graph bookkeeping, the Resident -> Retiring transition, and
+	// RoutingCache erasure are synchronous. The device remains valid until
+	// the Coordinator observes zero logical pins and completes reclaim.
 	EXPECT_TRUE(manager.regionsOf(100).empty());
-	EXPECT_FALSE(manager.regionOf(1).device.valid());
+	EXPECT_EQ(manager.regionOf(1).residency_state, RegionResidencyState::Retiring);
+	EXPECT_TRUE(manager.regionOf(1).device.valid());
 	EXPECT_EQ(routing_cache.erased, std::vector<VectorId>{100});
 
 	// The actual GPU free() is deferred -- force it and check it landed.
 	manager.waitIdle();
 	EXPECT_EQ(manager.stats().anchor_evictions_total, 1u);
+	EXPECT_EQ(manager.regionOf(1).residency_state, RegionResidencyState::HostOnly);
+	EXPECT_FALSE(manager.regionOf(1).device.valid());
 	EXPECT_EQ(pool.bytesAllocated(), 0u);
 
 	manager.shutdown();
@@ -252,7 +318,7 @@ TEST(RegionManagerCoordinatorTest, CapacityPressureEvictsOldestViaReplacementPol
 	gpu::DeviceContext device(/*device_id=*/0, gpu::AllocationPolicy::Pooled, 2 * kBytes,
 														 gpu::kDefaultMetadataPoolBytes, /*worker_stream_count=*/1, /*unit_bytes=*/kBytes);
 	gpu::DeviceRegionPool pool(device);
-	RegionManager manager;
+	RegionManager manager(std::make_unique<FifoReplacementPolicy>());
 	manager.start(adapter, pool, routing_cache, CoordinatorConfig{kShortInterval});
 
 	std::vector<std::vector<std::byte>> buffers(3, std::vector<std::byte>(kBytes, std::byte{0}));
@@ -266,6 +332,7 @@ TEST(RegionManagerCoordinatorTest, CapacityPressureEvictsOldestViaReplacementPol
 	manager.waitIdle();
 	manager.requestPromotion(102, RegionFootprint{{2}});
 	manager.waitIdle();  // budget now full (2 regions of 256 bytes each)
+	const std::uint64_t oldest_handle = manager.regionOf(1).device.id;
 
 	manager.requestPromotion(103, RegionFootprint{{3}});
 	manager.waitIdle();  // needs capacity -- evicts anchor 101 (FIFO-oldest)
@@ -273,6 +340,7 @@ TEST(RegionManagerCoordinatorTest, CapacityPressureEvictsOldestViaReplacementPol
 	EXPECT_FALSE(manager.regionOf(1).device.valid());  // evicted
 	EXPECT_TRUE(manager.regionOf(2).device.valid());   // untouched
 	EXPECT_TRUE(manager.regionOf(3).device.valid());   // newly promoted
+	EXPECT_EQ(manager.regionOf(3).device.id, oldest_handle);  // near-fit allocation reuse
 	EXPECT_EQ(manager.stats().anchor_evictions_total, 1u);
 	EXPECT_LE(manager.stats().gpu_bytes_allocated, 2 * kBytes);
 	// Capacity-driven eviction (evictAnchorNow(), not releaseAnchor()) must
@@ -280,7 +348,163 @@ TEST(RegionManagerCoordinatorTest, CapacityPressureEvictsOldestViaReplacementPol
 	// GPU residency.
 	EXPECT_EQ(routing_cache.erased, std::vector<VectorId>{101});
 	EXPECT_EQ(routing_cache.ensured, (std::vector<VectorId>{101, 102, 103}));
+	EXPECT_EQ(manager.stats().near_fit_reuses_total, 1u);
 
+	manager.shutdown();
+}
+
+TEST(RegionManagerCoordinatorTest, StrictBatchEvictsEnoughVictimsBeforePromotingWholeFootprint) {
+	FakeAdapter adapter;
+	FakeRoutingCache routing_cache;
+	constexpr std::size_t kBytes = 256;
+	gpu::DeviceContext device(/*device_id=*/0, gpu::AllocationPolicy::Pooled, 2 * kBytes,
+			gpu::kDefaultMetadataPoolBytes, /*worker_stream_count=*/1, /*unit_bytes=*/kBytes);
+	gpu::DeviceRegionPool pool(device);
+	RegionManager manager(std::make_unique<FifoReplacementPolicy>());
+	manager.start(adapter, pool, routing_cache, CoordinatorConfig{kShortInterval});
+
+	std::vector<std::vector<std::byte>> buffers(4, std::vector<std::byte>(kBytes, std::byte{0}));
+	for (RegionId id = 1; id <= 4; ++id) {
+		HostRegionView host{buffers[id - 1].data(), kBytes, 0};
+		adapter.addRegion(id, host);
+		manager.registerRegion(id, host);
+	}
+	manager.requestPromotion(101, RegionFootprint{{1}});
+	manager.waitIdle();
+	manager.requestPromotion(102, RegionFootprint{{2}});
+	manager.waitIdle();
+	manager.requestPromotion(103, RegionFootprint{{3, 4}});
+	manager.waitIdle();
+
+	EXPECT_FALSE(manager.regionOf(1).device.valid());
+	EXPECT_FALSE(manager.regionOf(2).device.valid());
+	EXPECT_TRUE(manager.regionOf(3).device.valid());
+	EXPECT_TRUE(manager.regionOf(4).device.valid());
+	EXPECT_EQ(manager.stats().anchor_evictions_total, 2u);
+	EXPECT_EQ(manager.stats().near_fit_reuses_total, 2u);
+	EXPECT_LE(manager.stats().gpu_bytes_allocated, 2 * kBytes);
+	manager.shutdown();
+}
+
+TEST(RegionManagerCoordinatorTest, MoreThanHalfGpuMemoryIsReplacedAsOneLargeNearFitBatch) {
+	std::size_t free_bytes = 0;
+	std::size_t total_bytes = 0;
+	ASSERT_EQ(cudaMemGetInfo(&free_bytes, &total_bytes), cudaSuccess);
+
+	constexpr std::size_t kUnits = 4;
+	constexpr std::size_t kAlignment = 4096;
+	constexpr std::size_t kSafetyMargin = std::size_t{512} << 20;
+	std::size_t target_budget = (total_bytes / 100) * 51;
+	std::size_t unit_bytes = (target_budget / kUnits / kAlignment) * kAlignment;
+	std::size_t budget = unit_bytes * kUnits;
+	ASSERT_GT(budget, total_bytes / 2);
+	if (free_bytes <= budget + gpu::kDefaultMetadataPoolBytes + kSafetyMargin) {
+		GTEST_SKIP() << "requires more than 51% of total GPU memory to be free";
+	}
+
+	FakeAdapter adapter;
+	FakeRoutingCache routing_cache;
+	gpu::DeviceContext device(/*device_id=*/0, gpu::AllocationPolicy::Pooled, budget,
+			gpu::kDefaultMetadataPoolBytes, /*worker_stream_count=*/4, /*unit_bytes=*/unit_bytes);
+	gpu::DeviceRegionPool pool(device);
+	RegionManager manager(std::make_unique<FifoReplacementPolicy>());
+	manager.start(adapter, pool, routing_cache, CoordinatorConfig{kShortInterval});
+
+	constexpr std::size_t kLogicalRegionBytes = 4096;
+	std::vector<std::vector<std::byte>> buffers(
+			8, std::vector<std::byte>(kLogicalRegionBytes, std::byte{0x5a}));
+	for (RegionId id = 1; id <= 8; ++id) {
+		HostRegionView host{buffers[id - 1].data(), kLogicalRegionBytes, 0};
+		adapter.addRegion(id, host);
+		manager.registerRegion(id, host);
+	}
+
+	std::unordered_set<std::uint64_t> original_handles;
+	for (RegionId id = 1; id <= 4; ++id) {
+		manager.requestPromotion(100 + id, RegionFootprint{{id}});
+		manager.waitIdle();
+		Region resident = manager.regionOf(id);
+		ASSERT_TRUE(resident.device.valid());
+		original_handles.insert(resident.device.id);
+	}
+	ASSERT_EQ(original_handles.size(), kUnits);
+	EXPECT_EQ(pool.bytesReserved(gpu::MemoryKind::Data), budget);
+	EXPECT_GT(pool.bytesReserved(gpu::MemoryKind::Data), total_bytes / 2);
+
+	manager.requestPromotion(200, RegionFootprint{{5, 6, 7, 8}});
+	manager.waitIdle();
+
+	for (RegionId id = 1; id <= 4; ++id) EXPECT_FALSE(manager.regionOf(id).device.valid());
+	for (RegionId id = 5; id <= 8; ++id) {
+		Region resident = manager.regionOf(id);
+		ASSERT_TRUE(resident.device.valid());
+		EXPECT_TRUE(original_handles.contains(resident.device.id));
+	}
+	EXPECT_EQ(manager.stats().anchor_evictions_total, 4u);
+	EXPECT_EQ(manager.stats().near_fit_reuses_total, 4u);
+	EXPECT_EQ(pool.bytesReserved(gpu::MemoryKind::Data), budget);
+	manager.shutdown();
+}
+
+TEST(RegionManagerCoordinatorTest, DefaultNearFitThresholdRejectsSlotBelowNinetyPercentUtilization) {
+	FakeAdapter adapter;
+	FakeRoutingCache routing_cache;
+	constexpr std::size_t kUnitBytes = 256;
+	gpu::DeviceContext device(/*device_id=*/0, gpu::AllocationPolicy::Pooled, 2 * kUnitBytes,
+			gpu::kDefaultMetadataPoolBytes, /*worker_stream_count=*/1, /*unit_bytes=*/kUnitBytes);
+	gpu::DeviceRegionPool pool(device);
+	RegionManager manager(std::make_unique<FifoReplacementPolicy>());
+	manager.start(adapter, pool, routing_cache, CoordinatorConfig{kShortInterval});
+
+	std::vector<std::byte> large_buffer(2 * kUnitBytes, std::byte{0x1});
+	std::vector<std::byte> small_buffer(kUnitBytes, std::byte{0x2});
+	adapter.addRegion(1, HostRegionView{large_buffer.data(), large_buffer.size(), 0});
+	adapter.addRegion(2, HostRegionView{small_buffer.data(), small_buffer.size(), 0});
+	manager.registerRegion(1, HostRegionView{large_buffer.data(), large_buffer.size(), 0});
+	manager.registerRegion(2, HostRegionView{small_buffer.data(), small_buffer.size(), 0});
+
+	manager.requestPromotion(101, RegionFootprint{{1}});
+	manager.waitIdle();
+	const std::uint64_t oversized_handle = manager.regionOf(1).device.id;
+	manager.requestPromotion(102, RegionFootprint{{2}});
+	manager.waitIdle();
+
+	ASSERT_TRUE(manager.regionOf(2).device.valid());
+	EXPECT_NE(manager.regionOf(2).device.id, oversized_handle);
+	EXPECT_EQ(manager.stats().near_fit_reuses_total, 0u);
+	EXPECT_EQ(pool.bytesReserved(gpu::MemoryKind::Data), kUnitBytes);
+	manager.shutdown();
+}
+
+TEST(RegionManagerCoordinatorTest, NearFitThresholdCanBeConfiguredAtInitialization) {
+	FakeAdapter adapter;
+	FakeRoutingCache routing_cache;
+	constexpr std::size_t kUnitBytes = 256;
+	gpu::DeviceContext device(/*device_id=*/0, gpu::AllocationPolicy::Pooled, 2 * kUnitBytes,
+			gpu::kDefaultMetadataPoolBytes, /*worker_stream_count=*/1, /*unit_bytes=*/kUnitBytes);
+	gpu::DeviceRegionPool pool(device);
+	RegionManager manager(std::make_unique<FifoReplacementPolicy>());
+	CoordinatorConfig config{kShortInterval};
+	config.near_fit_min_utilization_percent = 50;
+	manager.start(adapter, pool, routing_cache, config);
+
+	std::vector<std::byte> large_buffer(2 * kUnitBytes, std::byte{0x1});
+	std::vector<std::byte> small_buffer(kUnitBytes, std::byte{0x2});
+	adapter.addRegion(1, HostRegionView{large_buffer.data(), large_buffer.size(), 0});
+	adapter.addRegion(2, HostRegionView{small_buffer.data(), small_buffer.size(), 0});
+	manager.registerRegion(1, HostRegionView{large_buffer.data(), large_buffer.size(), 0});
+	manager.registerRegion(2, HostRegionView{small_buffer.data(), small_buffer.size(), 0});
+
+	manager.requestPromotion(101, RegionFootprint{{1}});
+	manager.waitIdle();
+	const std::uint64_t reusable_handle = manager.regionOf(1).device.id;
+	manager.requestPromotion(102, RegionFootprint{{2}});
+	manager.waitIdle();
+
+	ASSERT_TRUE(manager.regionOf(2).device.valid());
+	EXPECT_EQ(manager.regionOf(2).device.id, reusable_handle);
+	EXPECT_EQ(manager.stats().near_fit_reuses_total, 1u);
+	EXPECT_EQ(pool.bytesReserved(gpu::MemoryKind::Data), 2 * kUnitBytes);
 	manager.shutdown();
 }
 

@@ -74,6 +74,32 @@ TEST(FifoReplacementPolicyTest, SelectNextPromotionCandidateReturnsInAdmissionOr
 	EXPECT_FALSE(policy.selectNextPromotionCandidate().has_value());
 }
 
+TEST(FifoReplacementPolicyTest, RequeuePreservesOriginalAgeAndBatchHistory) {
+	FifoReplacementPolicy policy;
+	PromotionCandidate old = MakeCandidate(1);
+	old.enqueue_sequence = 10;
+	PromotionCandidate newer = MakeCandidate(2);
+	newer.enqueue_sequence = 20;
+	policy.enqueueCandidate(std::move(old));
+	policy.enqueueCandidate(std::move(newer));
+
+	auto attempted = policy.selectNextPromotionCandidate();
+	ASSERT_TRUE(attempted.has_value());
+	attempted->first_batch_sequence = 7;
+	attempted->last_batch_sequence = 9;
+	attempted->planning_attempts = 3;
+	policy.requeueCandidate(std::move(*attempted));
+
+	auto retried = policy.selectNextPromotionCandidate();
+	ASSERT_TRUE(retried.has_value());
+	EXPECT_EQ(retried->anchor_id, 1u);
+	EXPECT_EQ(retried->enqueue_sequence, 10u);
+	EXPECT_EQ(retried->first_batch_sequence, 7u);
+	EXPECT_EQ(retried->last_batch_sequence, 9u);
+	EXPECT_EQ(retried->planning_attempts, 3u);
+	EXPECT_EQ(policy.selectNextPromotionCandidate()->anchor_id, 2u);
+}
+
 TEST(FifoReplacementPolicyTest, SelectNextPromotionCandidatePreservesFootprint) {
 	FifoReplacementPolicy policy;
 	policy.enqueueCandidate(PromotionCandidate{1, RegionFootprint{{10, 20}}});

@@ -61,7 +61,8 @@ void RunConcurrentChurnStress(std::uint32_t dim, std::size_t vectors_per_region,
 	// one arena unit -- otherwise Pooled's coarser default unit size would
 	// silently let more than regions_that_fit_budget Regions fit at once,
 	// defeating the capacity pressure this test depends on.
-	Controller controller(index, routing_cache, SchedulingConfig{}, nullptr, budget, gpu::kDefaultMetadataPoolBytes,
+	Controller controller(index, routing_cache, SchedulingConfig{}, std::make_unique<FifoReplacementPolicy>(), budget,
+								gpu::kDefaultMetadataPoolBytes,
 												/*gpu_unit_bytes=*/region_total_bytes, /*compaction_policy=*/nullptr,
 												CoordinatorConfig{trigger_interval});
 	index.registerAllRegions(controller);

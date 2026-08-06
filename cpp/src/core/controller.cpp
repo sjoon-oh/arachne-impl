@@ -35,8 +35,25 @@ Controller::Controller(IAdapter& adapter, RoutingCache& routing_cache, Schedulin
 						scheduling_config.max_execution_threads, gpu_unit_bytes),
 		device_region_pool_(device_, std::move(compaction_policy)),
 		region_manager_(std::move(replacement_policy)) {
-	scheduler_.start(adapter_,
-										[this](std::size_t worker_index) { g_worker_stream = device_.workerStream(worker_index); });
+	scheduler_.start(
+			adapter_, [this](std::size_t worker_index) { g_worker_stream = device_.workerStream(worker_index); },
+			[this](TraverseRequest& request) {
+				if (request.mode != ExecutionMode::GpuOnly) return;
+				request.residency_pin = region_manager_.tryPinResidency(request.residency_hints);
+				if (!request.residency_pin) {
+					request.mode = ExecutionMode::Hybrid;
+					request.scope = {};
+				}
+			},
+			[this](ModifyRequest& request) {
+				if (request.mode != ExecutionMode::GpuOnly) return;
+				request.residency_pin = region_manager_.tryPinResidency(request.residency_hints);
+				if (!request.residency_pin) {
+					request.mode = ExecutionMode::Hybrid;
+					request.scope = {};
+					request.lease = LeaseHandle{};
+				}
+			});
 	region_manager_.start(adapter_, device_region_pool_, routing_cache_, coordinator_config);
 }
 
@@ -49,7 +66,7 @@ SearchResult Controller::search(const Query& query) {
 	// usefully consider promoting.
 	VectorId anchor_id = (plan.primary.mode == ExecutionMode::Hybrid) ? next_anchor_id_.fetch_add(1) : 0;
 	TraverseResult result = dispatch(plan.primary, anchor_id);
-	bool final_was_hybrid = (plan.primary.mode == ExecutionMode::Hybrid);
+	bool final_was_hybrid = (result.execution_mode == ExecutionMode::Hybrid);
 
 	if (plan.fallback_to_hybrid && !result.completed_within_scope) {
 		TraverseRequest fallback_request{query, ExecutionMode::Hybrid, {}};
@@ -139,6 +156,7 @@ Controller::SearchPlan Controller::routeSearch(const Query& query) {
 		plan.primary.mode = ExecutionMode::GpuOnly;
 		// `decision` is never read again below except for eligibility.
 		plan.primary.scope = decision.predicted_scope;
+		plan.primary.residency_hints = decision.residency_hints;
 		plan.fallback_to_hybrid = true;
 	}
 	return plan;
@@ -156,12 +174,15 @@ Controller::InsertPlan Controller::routeInsert(const Record& record, TraverseRes
 	plan.request.scope = candidates.touched;
 	plan.request.hint = std::move(candidates.hint);
 
-	for (RegionId region_id : region_manager_.regionsOf(record.id)) {
-		Region region = region_manager_.regionOf(region_id);
+	for (const RegionResidencyHint& hint : region_manager_.residencyHints(record.id)) {
+		Region region = region_manager_.regionOf(hint.region);
 		if (!region.lease.valid()) continue;
 		plan.request.mode = ExecutionMode::GpuOnly;
-		plan.request.scope.regions = {region_id};
+		plan.request.scope.regions.clear();
+		plan.request.scope.regions.push_back(hint.region);
 		plan.request.lease = region.lease;
+		plan.request.residency_hints.clear();
+		plan.request.residency_hints.push_back(hint);
 		break;  // a single promoted Region is enough scope for now; multi-region
 				// inserts are future work.
 	}
@@ -228,10 +249,14 @@ Controller::RoutingDecision Controller::route(const Query& query) {
 	if (std::optional<VectorId> anchor_id = routing_cache_.nearest(query.vector)) {
 		// Copied out of region_manager_ rather than referenced: it's guarded by
 		// region_manager_'s own internal mutex, which can't outlive this call.
-		std::vector<RegionId> regions = region_manager_.regionsOf(*anchor_id);
-		if (!regions.empty()) {
+		std::vector<RegionResidencyHint> hints = region_manager_.residencyHints(*anchor_id);
+		if (!hints.empty()) {
 			decision.gpu_only = true;
-			decision.predicted_scope.regions = std::move(regions);
+			decision.residency_hints = hints;
+			decision.predicted_scope.regions.reserve(hints.size());
+			for (const RegionResidencyHint& hint : hints) {
+				decision.predicted_scope.regions.push_back(hint.region);
+			}
 		}
 	}
 	return decision;
@@ -264,7 +289,10 @@ RegionAccess Controller::acquireRegion(RegionId region) {
 	RegionAccess result;
 	result.region = region;
 	result.host = snapshot.host;
-	if (snapshot.device.valid()) {
+	result.residency_pin = region_manager_.tryPinResidency(
+			{{region, snapshot.residency_generation}});
+	if (result.residency_pin) {
+		snapshot = region_manager_.regionOf(region);
 		result.on_device = true;
 		cudaStream_t stream = g_worker_stream != nullptr ? g_worker_stream : device_.managementStream();
 		result.device_lease.emplace(device_region_pool_.acquire(snapshot.device, stream));

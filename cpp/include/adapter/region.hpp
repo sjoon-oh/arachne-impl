@@ -13,6 +13,14 @@ struct RegionFootprint {
 	std::vector<RegionId> regions;
 };
 
+/// A routing-time observation of one Region residency incarnation. Routing
+/// only provides this as a hint; an execution worker must validate the pair
+/// immediately before entering a device adapter path.
+struct RegionResidencyHint {
+	RegionId region = 0;
+	std::uint64_t generation = 0;
+};
+
 /// A GPU write lease grants a Region temporary modification authority, per
 /// Quick Summary design point 4 (GPU Write Lease). Opaque outside Core
 /// and the Region implementation that issued it.

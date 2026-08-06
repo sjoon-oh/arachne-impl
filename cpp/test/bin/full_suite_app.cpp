@@ -37,7 +37,7 @@ struct Args {
 	std::size_t num_deletes = 200;
 	std::uint32_t top_k = 10;
 	std::size_t gpu_data_budget_bytes = gpu::kDefaultDataPoolBytes;
-	gpu::AllocationPolicy allocation_policy = gpu::AllocationPolicy::Normal;
+	gpu::AllocationPolicy allocation_policy = gpu::AllocationPolicy::Async;
 	unsigned seed = 42;
 };
 

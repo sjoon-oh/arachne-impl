@@ -20,6 +20,7 @@ set(ARACHNE_UNITTEST_SOURCES
 	stress/stress_index_test.cpp
 	stress/stress_index_stage2_test.cpp
 	stress/stress_index_stage3_test.cpp
+	stress/region_residency_concurrency_test.cpp
 )
 
 add_executable(arachne_tests ${ARACHNE_UNITTEST_SOURCES})

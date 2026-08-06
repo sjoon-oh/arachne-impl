@@ -93,7 +93,9 @@ class OpScheduler {
   /// OpScheduler never interprets it -- Controller uses it to bind each
   /// worker to its own CUDA stream without OpScheduler needing to know CUDA
   /// exists (see class doc comment).
-  void start(IAdapter& adapter, std::function<void(std::size_t)> on_worker_start = nullptr);
+  void start(IAdapter& adapter, std::function<void(std::size_t)> on_worker_start = nullptr,
+				 std::function<void(TraverseRequest&)> prepare_traverse = nullptr,
+				 std::function<void(ModifyRequest&)> prepare_modify = nullptr);
 
   /// Stops worker processing and drains queues before shutdown.
   void shutdown();
@@ -156,6 +158,8 @@ private:
 	// read from workerLoop() without holding mutex_ (thread creation
 	// establishes a happens-before edge for everything start() did first).
 	std::function<void(std::size_t)> on_worker_start_;
+	std::function<void(TraverseRequest&)> prepare_traverse_;
+	std::function<void(ModifyRequest&)> prepare_modify_;
 
 	// Lifecycle / threading
 	mutable OpSchedulerMutex mutex_;

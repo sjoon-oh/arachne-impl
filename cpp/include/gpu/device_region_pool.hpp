@@ -13,7 +13,9 @@
 
 #include "gpu/compaction_policy.hpp"
 #include "gpu/device_context.hpp"
+#include "gpu/device_memory_manager.hpp"
 #include "gpu/device_region_handle.hpp"
+#include "gpu/pinned_host_pool.hpp"
 #include "gpu/unit_pool_arena.hpp"
 
 namespace arachne::gpu {
@@ -139,6 +141,11 @@ class DeviceRegionPool {
 		void* ptr_;
 	};
 
+	struct TransferBatch {
+		std::vector<Lease> leases;
+		std::vector<PinnedHostPool::Buffer> pinned_sources;
+	};
+
 	/// `compaction_policy` governs compact() and allocate()'s internal
 	/// fragmentation retry under Pooled; null defaults to
 	/// TargetedCompactionPolicy with its default Budget. Safe to pass one
@@ -200,6 +207,13 @@ class DeviceRegionPool {
 	/// target (e.g. Controller's Eviction Policy).
 	void free(DeviceRegionHandle handle);
 
+	/// Rebinds an existing, quiescent allocation to a new logical size without
+	/// freeing or allocating device memory. Succeeds only when the allocation's
+	/// physical reservation can contain `bytes`; the opaque handle is retained.
+	/// RegionManager uses this after an eviction write-back for near-fit reuse.
+	bool tryReuse(DeviceRegionHandle handle, std::size_t bytes,
+			MemoryKind kind = MemoryKind::Data);
+
 	/// Convenience wrapper (== one enqueueCopyFromHost() + an immediate
 	/// flush()): copies `bytes` from `host_src` into `handle`'s allocation at
 	/// `dst_offset`. `dst_offset` defaults to 0; Controller::make() passes a
@@ -236,6 +250,9 @@ class DeviceRegionPool {
 	/// `dst_offset + bytes` exceeds `handle`'s allocation.
 	void enqueueCopyFromHost(DeviceRegionHandle handle, const void* host_src, std::size_t bytes,
 														std::size_t dst_offset, std::vector<Lease>& pending);
+	void enqueueCopyFromHost(DeviceRegionHandle handle, const void* host_src, std::size_t bytes,
+														std::size_t dst_offset, TransferBatch& pending);
+	void finishTransfers(TransferBatch& pending);
 
 	/// Blocks until every operation previously enqueued on DeviceContext's
 	/// canonical stream (via either enqueue*() method or otherwise) has
@@ -249,6 +266,23 @@ class DeviceRegionPool {
 
 	/// Bytes currently outstanding for just `kind`.
 	std::size_t bytesAllocated(MemoryKind kind) const;
+
+	/// Physical bytes held by live allocations. Equal to bytesAllocated()
+	/// under Async, but includes UnitPoolArena rounding under Pooled.
+	std::size_t bytesReserved() const;
+	std::size_t bytesReserved(MemoryKind kind) const;
+
+	/// Physical bytes one logical `bytes` request reserves from `kind`'s
+	/// budget. Under Pooled this rounds up to the configured arena unit; under
+	/// Normal it is exactly `bytes`. Cost-aware residency policies use this
+	/// instead of underestimating a small Region's actual footprint.
+	std::size_t reservationBytes(std::size_t bytes, MemoryKind kind = MemoryKind::Data) const;
+
+	/// Policy-facing snapshots of this pool's configured budget and accounting
+	/// granularity. A 1-byte unit under Normal means there is no Arachne-owned
+	/// suballocation rounding in that mode.
+	std::size_t budgetBytes(MemoryKind kind = MemoryKind::Data) const;
+	std::size_t allocationUnitBytes(MemoryKind kind = MemoryKind::Data) const;
 
 	struct CompactionResult {
 		std::size_t relocated_count = 0;
@@ -276,16 +310,7 @@ class DeviceRegionPool {
 	CompactionResult compact(MemoryKind kind, std::size_t required_bytes);
 
  private:
-	struct Allocation {
-		void* device_ptr = nullptr;
-		std::size_t bytes = 0;
-		MemoryKind kind = MemoryKind::Data;
-
-		// Meaningful only under Pooled -- this allocation's footprint in its
-		// arena's fixed-size units, kept in sync with device_ptr whenever
-		// relocated (see tryOpenContiguousExtentLocked()). Unused under Normal.
-		UnitPoolArena::UnitRange unit_range;
-
+	struct Allocation : DeviceMemoryBlock {
 		// Outstanding-Lease bookkeeping (see Lease's doc comment). One event
 		// per distinct stream a Lease has released on -- re-recorded, not
 		// re-created, each time, since a stream's own ordering means the
@@ -294,16 +319,8 @@ class DeviceRegionPool {
 		std::unordered_map<cudaStream_t, cudaEvent_t> last_used_events;
 	};
 
-	cuda::mr::any_resource<cuda::mr::device_accessible>& resourceFor(MemoryKind kind);
 	UnitPoolArena& arenaFor(MemoryKind kind);
 	Allocation allocationFor(DeviceRegionHandle handle);
-
-	// The two allocate()/free() strategies AllocationPolicy branches
-	// between -- see the class overview above.
-	DeviceRegionHandle allocateNormal(std::size_t bytes, MemoryKind kind);
-	DeviceRegionHandle allocatePooled(std::size_t bytes, MemoryKind kind);
-	void freeNormal(DeviceRegionHandle handle);
-	void freePooled(DeviceRegionHandle handle);
 
 	// Requires mutex_ already held via `lock` -- see the class overview
 	// above for the full snapshot/plan/execute algorithm this implements.
@@ -321,6 +338,8 @@ class DeviceRegionPool {
 	void awaitQuiescentLocked(std::uint64_t id, std::unique_lock<std::mutex>& lock);
 
 	DeviceContext& device_;
+	std::unique_ptr<DeviceMemoryManager> memory_manager_;
+	PinnedHostPool pinned_host_pool_;
 	std::unique_ptr<CompactionPolicy> compaction_policy_;
 	mutable std::mutex mutex_;
 	std::condition_variable cv_;

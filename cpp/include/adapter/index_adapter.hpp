@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <memory>
 #include <stdexcept>
 #include <vector>
 
@@ -34,6 +35,11 @@ struct TraverseRequest {
 	Query query;
 	ExecutionMode mode = ExecutionMode::Hybrid;
 	RegionFootprint scope;  // regions the traversal is confined to when GpuOnly
+	std::vector<RegionResidencyHint> residency_hints;
+	// Opaque logical pin installed by OpScheduler's execution-time validator.
+	// Its lifetime covers the complete adapter call and prevents retirement
+	// from reclaiming any Region between routing and physical pool acquire().
+	std::shared_ptr<void> residency_pin;
 };
 
 struct TraverseResult {
@@ -41,6 +47,7 @@ struct TraverseResult {
 	RegionFootprint touched;               // footprint actually accessed
 	bool completed_within_scope = false;   // false => a GpuOnly attempt fell short
 	OpaqueData hint;  // see OpaqueData's doc comment; populated at the adapter's own discretion
+	ExecutionMode execution_mode = ExecutionMode::Hybrid;
 };
 
 enum class ModifyOp { Insert, Delete };
@@ -58,12 +65,15 @@ struct ModifyRequest {
 	/// deletion is targeted by VectorId alone, with no preceding traversal
 	/// to source a hint from (see Controller::remove()'s doc comment).
 	OpaqueData hint;
+	std::vector<RegionResidencyHint> residency_hints;
+	std::shared_ptr<void> residency_pin;
 };
 
 struct ModifyResult {
 	bool ok = false;
 	RegionFootprint touched;   // regions the candidate search/traversal read
 	RegionFootprint modified;  // regions actually mutated
+	ExecutionMode execution_mode = ExecutionMode::Hybrid;
 };
 
 /// The only surface an underlying ANNS index must implement to be driven by

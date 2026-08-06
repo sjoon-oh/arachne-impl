@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -10,6 +11,7 @@
 #include <optional>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include "adapter/region.hpp"
@@ -84,9 +86,25 @@ namespace arachne {
 /// see the file overview above for why vector_bytes is an owned copy and how
 /// `epoch` guards against staleness.
 struct PromotionCandidate {
+	using Clock = std::chrono::steady_clock;
+
 	VectorId anchor_id = 0;
 	RegionFootprint footprint;
+	/// Number of requests merged into this candidate by a policy. Legacy
+	/// policies leave it at one; admission-aware policies can use repeated
+	/// observations as a doorkeeper without changing RegionManager's queue.
+	std::uint64_t observations = 1;
 	std::uint64_t epoch = 0;
+	/// Stable queue age. RegionManager assigns enqueue_sequence exactly once;
+	/// requeue never changes either field, so a failed plan cannot silently
+	/// turn an old request into a new, low-priority request.
+	Clock::time_point enqueued_at{};
+	std::uint64_t enqueue_sequence = 0;
+	/// Planning history, also preserved across requeue. A policy can use these
+	/// fields for aging, retry penalties, or starvation prevention.
+	std::uint64_t first_batch_sequence = 0;
+	std::uint64_t last_batch_sequence = 0;
+	std::uint64_t planning_attempts = 0;
 	std::vector<std::byte> vector_bytes;
 	std::uint32_t vector_dim = 0;
 	VectorDType vector_dtype = VectorDType::Float32;
@@ -96,6 +114,55 @@ struct PromotionCandidate {
 	/// buffer.
 	VectorView vectorView() const { return VectorView{vector_bytes.data(), vector_dim, vector_dtype}; }
 };
+
+/// RegionManager's conservative estimate of what evicting one Anchor would
+/// actually accomplish. `resident_bytes` is all resident storage the Anchor
+/// references; `reclaimable_bytes` includes only Regions for which it is the
+/// last dependent. The latter, not the former, is the capacity an eviction
+/// can really return. Dirty state currently lives on the GPU, so
+/// `potential_writeback_bytes` deliberately uses a conservative upper bound.
+struct EvictionCandidate {
+	VectorId anchor_id = 0;
+	std::size_t resident_bytes = 0;
+	std::size_t reclaimable_bytes = 0;
+	/// Subset of reclaimable_bytes whose Regions have no logical execution
+	/// pins at the planning snapshot. The remainder is valid capacity, but not
+	/// capacity a strict batch may assume is immediately reusable.
+	std::size_t reclaimable_now_bytes = 0;
+	std::size_t potential_writeback_bytes = 0;
+	std::size_t resident_regions = 0;
+	std::size_t reclaimable_regions = 0;
+};
+
+/// Cost snapshot supplied immediately before RegionManager attempts a
+/// promotion. All byte counts are physical reservation bytes after pooled-
+/// unit rounding. This keeps semantic Region policy independent from the
+/// allocator's configurable mechanical unit (4 KiB by default).
+struct AdmissionContext {
+	std::size_t total_footprint_bytes = 0;
+	std::size_t incremental_bytes = 0;
+	std::size_t already_resident_bytes = 0;
+	std::size_t allocation_unit_bytes = 1;
+	std::size_t gpu_bytes_allocated = 0;
+	std::size_t gpu_budget_bytes = 0;
+	std::vector<EvictionCandidate> eviction_candidates;
+};
+
+enum class AdmissionDecision { Admit, Reject };
+
+struct RelocationBatchContext {
+	std::uint64_t batch_sequence = 0;
+	std::size_t selected_promotions = 0;
+	std::size_t selected_incremental_bytes = 0;
+	std::size_t available_bytes = 0;
+	std::size_t gpu_budget_bytes = 0;
+	std::size_t max_promotion_bytes = 0;
+};
+
+/// Admit includes the candidate in this batch, Defer keeps its original age
+/// in the policy queue for a later batch, and Reject permanently drops it as
+/// a policy decision (distinct from a transient Coordinator validation fail).
+enum class BatchAdmissionDecision { Admit, Defer, Reject };
 
 /// Interface every concrete replacement policy implements; see the file
 /// overview above for the full contract, candidate lifecycle, and threading
@@ -111,6 +178,13 @@ class ReplacementPolicy {
 	/// candidate; RegionManager keeps no copy of `candidate` after this call
 	/// returns.
 	virtual void enqueueCandidate(PromotionCandidate candidate) = 0;
+
+	/// Returns a transiently-unexecutable candidate to policy ownership.
+	/// Built-in queues order by enqueue_sequence, so the default delegation
+	/// preserves age rather than appending the request as if it were new.
+	virtual void requeueCandidate(PromotionCandidate candidate) {
+		enqueueCandidate(std::move(candidate));
+	}
 
 	/// `anchor_id` no longer depends on any Region (releaseAnchor() or
 	/// evictAnchorNow()); called immediately, never deferred to a trigger.
@@ -153,6 +227,37 @@ class ReplacementPolicy {
 	/// currently being promoted -- never select the thing being promoted).
 	/// Returns nullopt if nothing is eligible to evict.
 	virtual std::optional<VectorId> selectNextEvictionCandidate(VectorId excluded) = 0;
+
+	/// Cost-aware admission hook. The default preserves every existing/custom
+	/// policy's behavior; policies interested in transfer/reclaim cost override
+	/// it without giving up the pluggable ReplacementPolicy abstraction.
+	virtual AdmissionDecision evaluateAdmission(const PromotionCandidate&, const AdmissionContext&) {
+		return AdmissionDecision::Admit;
+	}
+
+	/// Batch-aware admission/count hook. Existing policies retain their prior
+	/// behavior through the default; new policies can return Defer after their
+	/// desired number/bytes of promotions without changing Coordinator code.
+	virtual BatchAdmissionDecision evaluateBatchAdmission(
+			const PromotionCandidate& candidate, const AdmissionContext& admission,
+			const RelocationBatchContext&) {
+		return evaluateAdmission(candidate, admission) == AdmissionDecision::Admit
+					 ? BatchAdmissionDecision::Admit
+					 : BatchAdmissionDecision::Reject;
+	}
+
+	/// Actual grant notification. Legacy policies already track at selection
+	/// time and can ignore this default hook; admission-aware policies should
+	/// only make an Anchor evictable here, after RegionManager confirms that at
+	/// least one dependency exists.
+	virtual void onPromotionCommitted(VectorId, const AdmissionContext&) {}
+
+	/// Structured eviction hook. The default delegates to the legacy Anchor-
+	/// only selector, retaining source compatibility for existing policies.
+	virtual std::optional<VectorId> selectEvictionCandidate(
+			VectorId excluded, std::size_t, const std::vector<EvictionCandidate>&) {
+		return selectNextEvictionCandidate(excluded);
+	}
 };
 
 /// Default policy: admits candidates in arrival order and reclaims whichever
@@ -179,6 +284,9 @@ class FifoReplacementPolicy final : public ReplacementPolicy {
 	bool hasPendingCandidates() const override;
 	std::optional<PromotionCandidate> selectNextPromotionCandidate() override;
 	std::optional<VectorId> selectNextEvictionCandidate(VectorId excluded) override;
+	std::optional<VectorId> selectEvictionCandidate(
+			VectorId excluded, std::size_t required_bytes,
+			const std::vector<EvictionCandidate>& candidates) override;
 
  private:
 	mutable std::mutex mutex_;
@@ -226,6 +334,9 @@ class LruReplacementPolicy final : public ReplacementPolicy {
 	bool hasPendingCandidates() const override;
 	std::optional<PromotionCandidate> selectNextPromotionCandidate() override;
 	std::optional<VectorId> selectNextEvictionCandidate(VectorId excluded) override;
+	std::optional<VectorId> selectEvictionCandidate(
+			VectorId excluded, std::size_t required_bytes,
+			const std::vector<EvictionCandidate>& candidates) override;
 
  private:
 	mutable std::mutex mutex_;
@@ -279,6 +390,9 @@ class LfuReplacementPolicy final : public ReplacementPolicy {
 	bool hasPendingCandidates() const override;
 	std::optional<PromotionCandidate> selectNextPromotionCandidate() override;
 	std::optional<VectorId> selectNextEvictionCandidate(VectorId excluded) override;
+	std::optional<VectorId> selectEvictionCandidate(
+			VectorId excluded, std::size_t required_bytes,
+			const std::vector<EvictionCandidate>& candidates) override;
 
  private:
 	struct TrackedEntry {
@@ -334,6 +448,9 @@ class ClockReplacementPolicy final : public ReplacementPolicy {
 	bool hasPendingCandidates() const override;
 	std::optional<PromotionCandidate> selectNextPromotionCandidate() override;
 	std::optional<VectorId> selectNextEvictionCandidate(VectorId excluded) override;
+	std::optional<VectorId> selectEvictionCandidate(
+			VectorId excluded, std::size_t required_bytes,
+			const std::vector<EvictionCandidate>& candidates) override;
 
  private:
 	struct ClockEntry {
@@ -406,6 +523,9 @@ class TwoQReplacementPolicy final : public ReplacementPolicy {
 	bool hasPendingCandidates() const override;
 	std::optional<PromotionCandidate> selectNextPromotionCandidate() override;
 	std::optional<VectorId> selectNextEvictionCandidate(VectorId excluded) override;
+	std::optional<VectorId> selectEvictionCandidate(
+			VectorId excluded, std::size_t required_bytes,
+			const std::vector<EvictionCandidate>& candidates) override;
 
  private:
 	std::size_t ghost_capacity_;
@@ -421,6 +541,59 @@ class TwoQReplacementPolicy final : public ReplacementPolicy {
 
 	std::list<VectorId> a1out_;  // ghost FIFO: ids only, no PromotionCandidate data
 	std::unordered_map<VectorId, std::list<VectorId>::iterator> a1out_position_;
+};
+
+/// Cost-aware Region policy. It keeps Region as the semantic object while
+/// comparing candidates and victims using allocation-unit-rounded marginal
+/// bytes. Heat decays lazily (no O(N) scan), admission is normalized by
+/// incremental bytes, and eviction considers only capacity that removing an
+/// Anchor can actually reclaim. All knobs are constructor-injected so this
+/// remains one policy among many rather than hard-coding a single strategy.
+struct CostAwareReplacementConfig {
+	std::uint64_t minimum_observations = 1;
+	std::chrono::milliseconds heat_half_life{5000};
+	std::chrono::milliseconds minimum_residency{0};
+	double admission_hysteresis = 1.0;
+	double potential_writeback_weight = 0.0;
+	std::size_t maximum_incremental_bytes = 0;  // 0 = unlimited
+};
+
+class CostAwareReplacementPolicy final : public ReplacementPolicy {
+ public:
+	explicit CostAwareReplacementPolicy(CostAwareReplacementConfig config = {});
+
+	void enqueueCandidate(PromotionCandidate candidate) override;
+	void onAnchorEvicted(VectorId anchor_id) override;
+	void onAnchorTouched(VectorId anchor_id) override;
+	bool onRelocationTrigger() override;
+	bool hasPendingCandidates() const override;
+	std::optional<PromotionCandidate> selectNextPromotionCandidate() override;
+	std::optional<VectorId> selectNextEvictionCandidate(VectorId excluded) override;
+	AdmissionDecision evaluateAdmission(const PromotionCandidate& candidate,
+															 const AdmissionContext& context) override;
+	void onPromotionCommitted(VectorId anchor_id, const AdmissionContext& context) override;
+	std::optional<VectorId> selectEvictionCandidate(
+			VectorId excluded, std::size_t required_bytes,
+			const std::vector<EvictionCandidate>& candidates) override;
+
+ private:
+	using Clock = std::chrono::steady_clock;
+	struct ResidentEntry {
+		double heat = 1.0;
+		Clock::time_point last_update;
+		Clock::time_point admitted_at;
+		std::size_t resident_bytes = 0;
+	};
+
+	double decayedHeat(const ResidentEntry& entry, Clock::time_point now) const;
+	double victimRetentionDensity(const ResidentEntry& entry, const EvictionCandidate& candidate,
+														 Clock::time_point now) const;
+	static std::size_t roundedUnits(std::size_t bytes, std::size_t unit_bytes);
+
+	CostAwareReplacementConfig config_;
+	mutable std::mutex mutex_;
+	std::deque<PromotionCandidate> pending_candidates_;
+	std::unordered_map<VectorId, ResidentEntry> resident_;
 };
 
 }  // namespace arachne

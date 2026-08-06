@@ -38,6 +38,7 @@ struct RegionAccess {
 	RegionId region = 0;
 	HostRegionView host;
 	bool on_device = false;
+	std::shared_ptr<void> residency_pin;
 	std::optional<gpu::DeviceRegionPool::Lease> device_lease;  // engaged iff on_device
 };
 
@@ -133,7 +134,7 @@ class Controller {
 			 std::size_t gpu_unit_bytes = gpu::kDefaultUnitBytes,
 			 std::unique_ptr<gpu::CompactionPolicy> compaction_policy = nullptr,
 			 CoordinatorConfig coordinator_config = {},
-			 gpu::AllocationPolicy allocation_policy = gpu::AllocationPolicy::Normal);
+			 gpu::AllocationPolicy allocation_policy = gpu::AllocationPolicy::Async);
 
 	SearchResult search(const Query& query);
 
@@ -186,6 +187,7 @@ class Controller {
 	struct RoutingDecision {
 		bool gpu_only = false;
 		RegionFootprint predicted_scope;  // derived from the matched Anchor's dependent Regions
+		std::vector<RegionResidencyHint> residency_hints;
 	};
 		RoutingDecision route(const Query& query);
 		SearchPlan routeSearch(const Query& query);

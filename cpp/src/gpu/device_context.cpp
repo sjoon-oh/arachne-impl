@@ -24,8 +24,8 @@ const char* ToString(AllocationPolicy policy) {
 	switch (policy) {
 		case AllocationPolicy::Pooled:
 			return "Pooled";
-		case AllocationPolicy::Normal:
-			return "Normal";
+		case AllocationPolicy::Async:
+			return "Async";
 	}
 	return "Unknown";
 }

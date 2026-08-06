@@ -1,10 +1,37 @@
 #include "core/replacement_policy.hpp"
 
+#include <cmath>
+#include <limits>
+
 namespace arachne {
+
+namespace {
+
+std::uint64_t CandidateOrder(const PromotionCandidate& candidate) {
+	return candidate.enqueue_sequence == 0 ? std::numeric_limits<std::uint64_t>::max()
+															 : candidate.enqueue_sequence;
+}
+
+void EnqueueByAge(std::deque<PromotionCandidate>& queue, PromotionCandidate candidate) {
+	const std::uint64_t order = CandidateOrder(candidate);
+	auto position = std::upper_bound(queue.begin(), queue.end(), order,
+			[](std::uint64_t value, const PromotionCandidate& queued) {
+				return value < CandidateOrder(queued);
+			});
+	queue.insert(position, std::move(candidate));
+}
+
+bool ContainsCandidate(const std::vector<EvictionCandidate>& candidates, VectorId anchor_id) {
+	return std::any_of(candidates.begin(), candidates.end(), [anchor_id](const EvictionCandidate& candidate) {
+		return candidate.anchor_id == anchor_id;
+	});
+}
+
+}  // namespace
 
 void FifoReplacementPolicy::enqueueCandidate(PromotionCandidate candidate) {
 	std::lock_guard<std::mutex> lock(mutex_);
-	pending_candidates_.push_back(std::move(candidate));
+	EnqueueByAge(pending_candidates_, std::move(candidate));
 }
 
 void FifoReplacementPolicy::onAnchorEvicted(VectorId anchor_id) {
@@ -61,9 +88,18 @@ std::optional<VectorId> FifoReplacementPolicy::selectNextEvictionCandidate(Vecto
 	return std::nullopt;
 }
 
+std::optional<VectorId> FifoReplacementPolicy::selectEvictionCandidate(
+		VectorId excluded, std::size_t, const std::vector<EvictionCandidate>& candidates) {
+	std::lock_guard<std::mutex> lock(mutex_);
+	for (VectorId candidate : promoted_order_) {
+		if (candidate != excluded && ContainsCandidate(candidates, candidate)) return candidate;
+	}
+	return std::nullopt;
+}
+
 void LruReplacementPolicy::enqueueCandidate(PromotionCandidate candidate) {
 	std::lock_guard<std::mutex> lock(mutex_);
-	pending_candidates_.push_back(std::move(candidate));
+	EnqueueByAge(pending_candidates_, std::move(candidate));
 }
 
 void LruReplacementPolicy::onAnchorEvicted(VectorId anchor_id) {
@@ -130,13 +166,22 @@ std::optional<VectorId> LruReplacementPolicy::selectNextEvictionCandidate(Vector
 	return std::nullopt;
 }
 
+std::optional<VectorId> LruReplacementPolicy::selectEvictionCandidate(
+		VectorId excluded, std::size_t, const std::vector<EvictionCandidate>& candidates) {
+	std::lock_guard<std::mutex> lock(mutex_);
+	for (VectorId candidate : lru_order_) {
+		if (candidate != excluded && ContainsCandidate(candidates, candidate)) return candidate;
+	}
+	return std::nullopt;
+}
+
 // ---------------------------------------------------------------------------
 // LfuReplacementPolicy
 // ---------------------------------------------------------------------------
 
 void LfuReplacementPolicy::enqueueCandidate(PromotionCandidate candidate) {
 	std::lock_guard<std::mutex> lock(mutex_);
-	pending_candidates_.push_back(std::move(candidate));
+	EnqueueByAge(pending_candidates_, std::move(candidate));
 }
 
 void LfuReplacementPolicy::onAnchorEvicted(VectorId anchor_id) {
@@ -211,13 +256,24 @@ std::optional<VectorId> LfuReplacementPolicy::selectNextEvictionCandidate(Vector
 	return std::nullopt;
 }
 
+std::optional<VectorId> LfuReplacementPolicy::selectEvictionCandidate(
+		VectorId excluded, std::size_t, const std::vector<EvictionCandidate>& candidates) {
+	std::lock_guard<std::mutex> lock(mutex_);
+	for (const auto& [freq, bucket] : freq_buckets_) {
+		for (VectorId candidate : bucket) {
+			if (candidate != excluded && ContainsCandidate(candidates, candidate)) return candidate;
+		}
+	}
+	return std::nullopt;
+}
+
 // ---------------------------------------------------------------------------
 // ClockReplacementPolicy
 // ---------------------------------------------------------------------------
 
 void ClockReplacementPolicy::enqueueCandidate(PromotionCandidate candidate) {
 	std::lock_guard<std::mutex> lock(mutex_);
-	pending_candidates_.push_back(std::move(candidate));
+	EnqueueByAge(pending_candidates_, std::move(candidate));
 }
 
 void ClockReplacementPolicy::onAnchorEvicted(VectorId anchor_id) {
@@ -306,6 +362,25 @@ std::optional<VectorId> ClockReplacementPolicy::selectNextEvictionCandidate(Vect
 	return std::nullopt;  // everything still standing is excluded
 }
 
+std::optional<VectorId> ClockReplacementPolicy::selectEvictionCandidate(
+		VectorId excluded, std::size_t, const std::vector<EvictionCandidate>& candidates) {
+	std::lock_guard<std::mutex> lock(mutex_);
+	if (ring_.empty()) return std::nullopt;
+
+	const std::size_t max_steps = ring_.size() * 2;
+	for (std::size_t step = 0; step < max_steps; ++step) {
+		ClockEntry& entry = ring_[hand_];
+		hand_ = (hand_ + 1) % ring_.size();
+		if (entry.anchor_id == excluded || !ContainsCandidate(candidates, entry.anchor_id)) continue;
+		if (entry.referenced) {
+			entry.referenced = false;
+			continue;
+		}
+		return entry.anchor_id;
+	}
+	return std::nullopt;
+}
+
 // ---------------------------------------------------------------------------
 // TwoQReplacementPolicy
 // ---------------------------------------------------------------------------
@@ -314,7 +389,7 @@ TwoQReplacementPolicy::TwoQReplacementPolicy(std::size_t ghost_capacity) : ghost
 
 void TwoQReplacementPolicy::enqueueCandidate(PromotionCandidate candidate) {
 	std::lock_guard<std::mutex> lock(mutex_);
-	pending_candidates_.push_back(std::move(candidate));
+	EnqueueByAge(pending_candidates_, std::move(candidate));
 }
 
 void TwoQReplacementPolicy::onAnchorEvicted(VectorId anchor_id) {
@@ -423,6 +498,204 @@ std::optional<VectorId> TwoQReplacementPolicy::selectNextEvictionCandidate(Vecto
 		if (candidate != excluded) return candidate;
 	}
 	return std::nullopt;
+}
+
+std::optional<VectorId> TwoQReplacementPolicy::selectEvictionCandidate(
+		VectorId excluded, std::size_t, const std::vector<EvictionCandidate>& candidates) {
+	std::lock_guard<std::mutex> lock(mutex_);
+	for (VectorId candidate : a1in_) {
+		if (candidate != excluded && ContainsCandidate(candidates, candidate)) return candidate;
+	}
+	for (VectorId candidate : am_) {
+		if (candidate != excluded && ContainsCandidate(candidates, candidate)) return candidate;
+	}
+	return std::nullopt;
+}
+
+CostAwareReplacementPolicy::CostAwareReplacementPolicy(CostAwareReplacementConfig config)
+		: config_(std::move(config)) {
+	if (config_.admission_hysteresis < 0.0) config_.admission_hysteresis = 0.0;
+	if (config_.potential_writeback_weight < 0.0) config_.potential_writeback_weight = 0.0;
+}
+
+void CostAwareReplacementPolicy::enqueueCandidate(PromotionCandidate candidate) {
+	std::lock_guard<std::mutex> lock(mutex_);
+	candidate.observations = std::max<std::uint64_t>(1, candidate.observations);
+	for (PromotionCandidate& pending : pending_candidates_) {
+		if (pending.anchor_id != candidate.anchor_id || pending.epoch != candidate.epoch) continue;
+		pending.observations += candidate.observations;
+		for (RegionId region : candidate.footprint.regions) {
+			if (std::find(pending.footprint.regions.begin(), pending.footprint.regions.end(), region) ==
+					pending.footprint.regions.end()) {
+				pending.footprint.regions.push_back(region);
+			}
+		}
+		if (!candidate.vector_bytes.empty()) {
+			pending.vector_bytes = std::move(candidate.vector_bytes);
+			pending.vector_dim = candidate.vector_dim;
+			pending.vector_dtype = candidate.vector_dtype;
+		}
+		if (pending.enqueue_sequence == 0 ||
+				(candidate.enqueue_sequence != 0 && candidate.enqueue_sequence < pending.enqueue_sequence)) {
+			pending.enqueue_sequence = candidate.enqueue_sequence;
+			pending.enqueued_at = candidate.enqueued_at;
+		}
+		if (pending.first_batch_sequence == 0 ||
+				(candidate.first_batch_sequence != 0 &&
+				 candidate.first_batch_sequence < pending.first_batch_sequence)) {
+			pending.first_batch_sequence = candidate.first_batch_sequence;
+		}
+		pending.last_batch_sequence = std::max(pending.last_batch_sequence, candidate.last_batch_sequence);
+		pending.planning_attempts = std::max(pending.planning_attempts, candidate.planning_attempts);
+		return;
+	}
+	EnqueueByAge(pending_candidates_, std::move(candidate));
+}
+
+void CostAwareReplacementPolicy::onAnchorEvicted(VectorId anchor_id) {
+	std::lock_guard<std::mutex> lock(mutex_);
+	pending_candidates_.erase(std::remove_if(pending_candidates_.begin(), pending_candidates_.end(),
+																				[anchor_id](const PromotionCandidate& candidate) {
+																					return candidate.anchor_id == anchor_id;
+																				}),
+										 pending_candidates_.end());
+	resident_.erase(anchor_id);
+}
+
+double CostAwareReplacementPolicy::decayedHeat(const ResidentEntry& entry, Clock::time_point now) const {
+	double half_life = std::chrono::duration<double>(config_.heat_half_life).count();
+	if (half_life <= 0.0) return entry.heat;
+	double elapsed = std::chrono::duration<double>(now - entry.last_update).count();
+	return entry.heat * std::exp2(-elapsed / half_life);
+}
+
+void CostAwareReplacementPolicy::onAnchorTouched(VectorId anchor_id) {
+	std::lock_guard<std::mutex> lock(mutex_);
+	auto it = resident_.find(anchor_id);
+	if (it == resident_.end()) return;
+	Clock::time_point now = Clock::now();
+	it->second.heat = decayedHeat(it->second, now) + 1.0;
+	it->second.last_update = now;
+}
+
+bool CostAwareReplacementPolicy::onRelocationTrigger() {
+	std::lock_guard<std::mutex> lock(mutex_);
+	return !pending_candidates_.empty();
+}
+
+bool CostAwareReplacementPolicy::hasPendingCandidates() const {
+	std::lock_guard<std::mutex> lock(mutex_);
+	return !pending_candidates_.empty();
+}
+
+std::optional<PromotionCandidate> CostAwareReplacementPolicy::selectNextPromotionCandidate() {
+	std::lock_guard<std::mutex> lock(mutex_);
+	if (pending_candidates_.empty()) return std::nullopt;
+	PromotionCandidate candidate = std::move(pending_candidates_.front());
+	pending_candidates_.pop_front();
+	return candidate;
+}
+
+std::size_t CostAwareReplacementPolicy::roundedUnits(std::size_t bytes, std::size_t unit_bytes) {
+	unit_bytes = std::max<std::size_t>(1, unit_bytes);
+	return std::max<std::size_t>(1, (bytes + unit_bytes - 1) / unit_bytes);
+}
+
+double CostAwareReplacementPolicy::victimRetentionDensity(const ResidentEntry& entry,
+		const EvictionCandidate& candidate, Clock::time_point now) const {
+	double heat = decayedHeat(entry, now);
+	double writeback_ratio = candidate.reclaimable_bytes == 0
+														 ? 0.0
+														 : static_cast<double>(candidate.potential_writeback_bytes) /
+																 static_cast<double>(candidate.reclaimable_bytes);
+	double cost = heat + config_.potential_writeback_weight * writeback_ratio;
+	return cost / static_cast<double>(roundedUnits(candidate.reclaimable_bytes, 1));
+}
+
+AdmissionDecision CostAwareReplacementPolicy::evaluateAdmission(
+		const PromotionCandidate& candidate, const AdmissionContext& context) {
+	if (candidate.observations < config_.minimum_observations) return AdmissionDecision::Reject;
+	if (config_.maximum_incremental_bytes != 0 &&
+			context.incremental_bytes > config_.maximum_incremental_bytes) {
+		return AdmissionDecision::Reject;
+	}
+	if (context.incremental_bytes == 0) return AdmissionDecision::Admit;
+
+	std::size_t available = context.gpu_budget_bytes > context.gpu_bytes_allocated
+													 ? context.gpu_budget_bytes - context.gpu_bytes_allocated
+													 : 0;
+	if (available >= context.incremental_bytes) return AdmissionDecision::Admit;
+
+	std::lock_guard<std::mutex> lock(mutex_);
+	Clock::time_point now = Clock::now();
+	double best_victim_density = std::numeric_limits<double>::infinity();
+	for (const EvictionCandidate& victim : context.eviction_candidates) {
+		if (victim.anchor_id == candidate.anchor_id || victim.reclaimable_bytes == 0) continue;
+		auto it = resident_.find(victim.anchor_id);
+		if (it == resident_.end() || now - it->second.admitted_at < config_.minimum_residency) continue;
+		best_victim_density = std::min(best_victim_density, victimRetentionDensity(it->second, victim, now));
+	}
+	if (!std::isfinite(best_victim_density)) return AdmissionDecision::Reject;
+
+	double candidate_density = static_cast<double>(std::max<std::uint64_t>(1, candidate.observations)) /
+													 static_cast<double>(roundedUnits(context.incremental_bytes,
+																								 context.allocation_unit_bytes));
+	// Victim density is expressed per byte; normalize the candidate's unit
+	// density to the same scale before applying hysteresis.
+	candidate_density /= static_cast<double>(std::max<std::size_t>(1, context.allocation_unit_bytes));
+	return candidate_density >= best_victim_density * config_.admission_hysteresis
+				 ? AdmissionDecision::Admit
+				 : AdmissionDecision::Reject;
+}
+
+void CostAwareReplacementPolicy::onPromotionCommitted(VectorId anchor_id, const AdmissionContext& context) {
+	std::lock_guard<std::mutex> lock(mutex_);
+	Clock::time_point now = Clock::now();
+	auto [it, inserted] = resident_.try_emplace(anchor_id, ResidentEntry{1.0, now, now, context.total_footprint_bytes});
+	if (!inserted) {
+		it->second.heat = decayedHeat(it->second, now) + 1.0;
+		it->second.last_update = now;
+		it->second.resident_bytes = context.total_footprint_bytes;
+	}
+}
+
+std::optional<VectorId> CostAwareReplacementPolicy::selectEvictionCandidate(
+		VectorId excluded, std::size_t required_bytes, const std::vector<EvictionCandidate>& candidates) {
+	std::lock_guard<std::mutex> lock(mutex_);
+	Clock::time_point now = Clock::now();
+	double best_score = std::numeric_limits<double>::infinity();
+	std::optional<VectorId> best;
+	for (const EvictionCandidate& candidate : candidates) {
+		if (candidate.anchor_id == excluded || candidate.reclaimable_bytes == 0) continue;
+		auto it = resident_.find(candidate.anchor_id);
+		if (it == resident_.end() || now - it->second.admitted_at < config_.minimum_residency) continue;
+		double coverage_penalty = candidate.reclaimable_bytes >= required_bytes
+														 ? 1.0
+														 : static_cast<double>(required_bytes) /
+																 static_cast<double>(candidate.reclaimable_bytes);
+		double score = victimRetentionDensity(it->second, candidate, now) * coverage_penalty;
+		if (score < best_score) {
+			best_score = score;
+			best = candidate.anchor_id;
+		}
+	}
+	return best;
+}
+
+std::optional<VectorId> CostAwareReplacementPolicy::selectNextEvictionCandidate(VectorId excluded) {
+	std::lock_guard<std::mutex> lock(mutex_);
+	Clock::time_point now = Clock::now();
+	double coldest = std::numeric_limits<double>::infinity();
+	std::optional<VectorId> best;
+	for (const auto& [anchor_id, entry] : resident_) {
+		if (anchor_id == excluded || now - entry.admitted_at < config_.minimum_residency) continue;
+		double heat = decayedHeat(entry, now);
+		if (heat < coldest) {
+			coldest = heat;
+			best = anchor_id;
+		}
+	}
+	return best;
 }
 
 }  // namespace arachne

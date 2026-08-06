@@ -20,20 +20,22 @@ namespace arachne::gpu {
 inline constexpr std::size_t kDefaultDataPoolBytes = std::size_t{1} << 30;      // 1 GiB
 inline constexpr std::size_t kDefaultMetadataPoolBytes = std::size_t{1} << 26;  // 64 MiB
 
-/// Default unit size for AllocationPolicy::Pooled's UnitPoolArena -- see its
-/// own doc comment for the granularity/fragmentation trade-off. 2 MiB
-/// matches the smallest Region size Arachne is expected to manage, so a
-/// single Region rarely spans more than a handful of units. Pass a
-/// different `unit_bytes` to DeviceContext's constructor for other Region
-/// size distributions or fine-grained test control.
-inline constexpr std::size_t kDefaultUnitBytes = std::size_t{1} << 21;  // 2 MiB
+/// Default accounting/allocation unit for AllocationPolicy::Pooled. A Region
+/// remains the semantic admission, transfer, and eviction object; this 4 KiB
+/// unit only determines how finely the preallocated arena accounts for its
+/// contiguous storage. Keeping those concepts separate lets future partial-
+/// residency policies select Region-owned extents without turning individual
+/// pages into independently replaceable cache objects. Callers can still
+/// choose a larger unit for lower allocator-metadata overhead.
+inline constexpr std::size_t kDefaultUnitBytes = std::size_t{1} << 12;  // 4 KiB
 
 /// How DeviceContext backs dataArena()/metadataArena()/dataResource()/
 /// metadataResource() -- see the class overview below. Adding a third
 /// strategy later only touches DeviceContext's constructor.
 enum class AllocationPolicy {
 	Pooled,
-	Normal,
+	Async,
+	Normal = Async,
 };
 
 /// DeviceContext owns everything physical about one GPU: CUDA device
@@ -113,7 +115,7 @@ class DeviceContext {
 	// SchedulingConfig::max_execution_threads for one stream per worker).
 	// `unit_bytes` sizes the Pooled arena's fixed subregion unit; ignored
 	// under AllocationPolicy::Normal.
-	explicit DeviceContext(int device_id = 0, AllocationPolicy policy = AllocationPolicy::Normal,
+	explicit DeviceContext(int device_id = 0, AllocationPolicy policy = AllocationPolicy::Async,
 												 std::size_t data_pool_bytes = kDefaultDataPoolBytes,
 												 std::size_t metadata_pool_bytes = kDefaultMetadataPoolBytes,
 												 std::size_t worker_stream_count = 1, std::size_t unit_bytes = kDefaultUnitBytes);
@@ -165,6 +167,8 @@ class DeviceContext {
 	/// metadataResource().
 	UnitPoolArena* dataArena() { return data_arena_.get(); }
 	UnitPoolArena* metadataArena() { return metadata_arena_.get(); }
+	const UnitPoolArena* dataArena() const { return data_arena_.get(); }
+	const UnitPoolArena* metadataArena() const { return metadata_arena_.get(); }
 
  private:
 	// Declaration order matters: member init runs in declaration order (not

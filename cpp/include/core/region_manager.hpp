@@ -167,20 +167,39 @@ using RegionManagerCondVar = std::condition_variable;
 /// write authority (`lease`). There is exactly one Region per RegionId --
 /// unlike the old per-Anchor Stitch, every Anchor depending on the same
 /// Region observes the same host/device/lease state.
+enum class RegionResidencyState {
+	HostOnly,
+	Promoting,
+	Resident,
+	Retiring,
+};
+
 struct Region {
 	RegionId id = 0;
 	HostRegionView host;
 	gpu::DeviceRegionHandle device;
 	LeaseHandle lease;
+	RegionResidencyState residency_state = RegionResidencyState::HostOnly;
+	std::uint64_t residency_generation = 0;
+	std::size_t residency_pins = 0;
 };
 
-/// Configuration for the Coordinator thread (see start()). `trigger_interval`
-/// only bounds how often the Coordinator wakes to drain its intake queues and
-/// offer the replacement policy a chance to run; the decision of whether to
-/// actually run a relocation batch is ReplacementPolicy::onRelocationTrigger()'s
-/// alone. Queue-append calls never wake the Coordinator early on their own.
+/// Configuration for the Coordinator thread (see start()). Promotion enqueue
+/// wakes the event-driven consumer immediately; `trigger_interval` is the
+/// coalescing window between the first prepared candidate and batch commit,
+/// not an intake polling interval.
 struct CoordinatorConfig {
 	std::chrono::milliseconds trigger_interval{100};
+	/// Soft per-pass movement limits. A single oversized first candidate/victim
+	/// is allowed so progress is possible; subsequent work is returned to the
+	/// policy for a later pass. Zero disables the corresponding limit.
+	std::size_t max_promotion_bytes_per_pass = 0;
+	std::size_t max_eviction_bytes_per_pass = 0;
+	/// Minimum physical-reservation utilization required for near-fit handle
+	/// reuse, expressed as an integer percentage. The default 90 rejects a
+	/// 1-unit target reusing a 2-unit victim slot; 0 permits any fitting slot,
+	/// and values above 100 are clamped to 100 during start().
+	std::uint8_t near_fit_min_utilization_percent = 90;
 };
 
 /// GPU residency policy owner -- see the file-level overview above for
@@ -188,8 +207,8 @@ struct CoordinatorConfig {
 /// diagram.
 class RegionManager {
  public:
-	/// `replacement_policy` defaults to FifoReplacementPolicy when left null,
-	/// mirroring OpScheduler's own SchedulingPolicy default.
+	/// `replacement_policy` defaults to CostAwareReplacementPolicy when left
+	/// null. FIFO/LRU/LFU/Clock/2Q and external policies remain injectable.
 	explicit RegionManager(std::unique_ptr<ReplacementPolicy> replacement_policy = nullptr);
 	~RegionManager();
 
@@ -210,6 +229,15 @@ class RegionManager {
 
 	/// RegionIds `anchor_id` currently depends on (empty if none).
 	std::vector<RegionId> regionsOf(VectorId anchor_id) const;
+
+	/// Returns an all-or-nothing routing snapshot for an Anchor. Empty means
+	/// that at least one dependency is not currently publishable as Resident.
+	std::vector<RegionResidencyHint> residencyHints(VectorId anchor_id) const;
+
+	/// Atomically validates and pins every hinted Region. A null result means
+	/// the routing hint became stale; callers should use the Hybrid path.
+	/// The returned opaque guard unpins all Regions when its last copy dies.
+	std::shared_ptr<void> tryPinResidency(const std::vector<RegionResidencyHint>& hints);
 
 	/// Records `anchor_id` as a dependent of `region_id` (idempotent). Returns
 	/// false without recording anything if `region_id` was never registered --
@@ -303,6 +331,9 @@ class RegionManager {
 		std::uint64_t regions_written_back_total = 0;
 		std::uint64_t anchor_evictions_total = 0;
 		std::uint64_t compactions_total = 0;
+		std::uint64_t relocation_batches_total = 0;
+		std::uint64_t candidates_requeued_total = 0;
+		std::uint64_t near_fit_reuses_total = 0;
 	};
 	Stats stats() const;
 
@@ -315,6 +346,7 @@ class RegionManager {
 		Promoted,       // anchor_id now depends on region (already did, or just started).
 		NotEligible,    // unregistered, adapter can't resolve/lease it -- not retryable.
 		OutOfCapacity,  // registered and lease-eligible, but no room on GPU right now -- retryable.
+		Deferred,       // another transition currently owns this Region -- retry in a later batch.
 	};
 
 	// Capacity-aware allocation with a compaction fallback (tryAllocate ->
@@ -322,8 +354,41 @@ class RegionManager {
 	// gpu::DeviceRegionPool::tryAllocate() call. See the "allocateWithCompaction()
 	// fallback chain" invariant in the file-level overview above for why
 	// `pending` must be flushed before compact() runs.
-	std::optional<gpu::DeviceRegionHandle> allocateWithCompaction(std::size_t bytes,
-																																 std::vector<gpu::DeviceRegionPool::Lease>& pending);
+	std::optional<gpu::DeviceRegionHandle> allocateWithCompaction(
+			std::size_t bytes, gpu::DeviceRegionPool::TransferBatch& pending);
+	struct PendingPromotionCommit {
+		VectorId anchor_id = 0;
+		RegionId region_id = 0;
+		gpu::DeviceRegionHandle device;
+		LeaseHandle lease;
+		std::uint64_t residency_generation = 0;
+		std::uint64_t anchor_epoch = 0;
+	};
+	using ReusableAllocations = std::unordered_map<RegionId, gpu::DeviceRegionHandle>;
+
+	struct PlannedPromotion {
+		PromotionCandidate candidate;
+		AdmissionContext admission;
+	};
+	struct RelocationPlan {
+		std::uint64_t batch_sequence = 0;
+		std::vector<PlannedPromotion> promotions;
+		std::vector<VectorId> evictions;
+		std::size_t required_incremental_bytes = 0;
+		std::size_t immediately_reclaimable_bytes = 0;
+	};
+	struct PromotionStorageRequest {
+		RegionId region_id = 0;
+		std::size_t logical_bytes = 0;
+		std::size_t reserved_bytes = 0;
+	};
+
+	struct ResidencyPinBatch {
+		RegionManager* owner = nullptr;
+		std::vector<RegionResidencyHint> hints;
+		~ResidencyPinBatch();
+	};
+	void unpinResidency(const std::vector<RegionResidencyHint>& hints);
 
 	// Region promotion (design point 4): acquires a write lease and enqueues
 	// (does not wait for) the host-to-device copy of `region`'s data if it
@@ -332,8 +397,18 @@ class RegionManager {
 	// replacement_policy_ or RoutingCache -- selectNextPromotionCandidate()
 	// and processPromotions() own those, respectively (see their own doc
 	// comments).
-	MakeResult make(VectorId anchor_id, RegionId region, std::vector<gpu::DeviceRegionPool::Lease>& pending,
-								 std::vector<std::vector<std::byte>>& zero_headers);
+	MakeResult make(VectorId anchor_id, std::uint64_t anchor_epoch, RegionId region,
+			gpu::DeviceRegionPool::TransferBatch& pending,
+			std::vector<PendingPromotionCommit>& commits, ReusableAllocations& reusable);
+
+	AdmissionContext buildAdmissionContext(const PromotionCandidate& candidate) const;
+	std::vector<EvictionCandidate> buildEvictionCandidates() const;
+	std::size_t reservedRegionBytes(const Region& region) const;
+	std::size_t promotionBytes(const std::vector<PlannedPromotion>& promotions) const;
+	std::size_t projectedReclaimableBytes(const std::vector<VectorId>& victims,
+			bool require_unpinned) const;
+	std::vector<PromotionStorageRequest> buildPromotionStorageRequests(
+			const std::vector<PlannedPromotion>& promotions) const;
 
 	// `anchor_id`'s current epoch, 0 if it has never had one (releaseAnchor()
 	// is the only thing that bumps it). Caller must already hold mutex_.
@@ -345,7 +420,10 @@ class RegionManager {
 	// eviction (see the OutOfCapacity retry loop invariant above), then
 	// registers each Anchor in RoutingCache iff it gained at least one Region
 	// dependency. Flushes every host-to-device copy from the whole pass once.
-	void processPromotions();
+	std::optional<RelocationPlan> buildRelocationPlan(
+			std::uint64_t batch_sequence, bool retain_failed_candidates);
+	void processRelocationBatch(bool retain_failed_candidates);
+	void requeueCandidates(std::vector<PromotionCandidate> candidates);
 
 	// The actual (was Controller::evictAnchor()) reclaim of every Region
 	// dependency `anchor_id` holds -- unlike releaseAnchor() above, this runs
@@ -354,11 +432,15 @@ class RegionManager {
 	// (processPromotions()'s capacity-retry loop), which needs the freed
 	// capacity immediately. Also erases `anchor_id` from RoutingCache.
 	void evictAnchorNow(VectorId anchor_id);
+	std::vector<Region> retireAnchorsNow(const std::vector<VectorId>& anchor_ids);
 
 	// Shared by evictAnchorNow() and the Coordinator's periodic draining of
 	// releaseAnchor()'s deferred reclaims: batched write-back (if dirty) then
 	// free() for every GPU-resident Region in `snapshots`.
 	void reclaimRegions(const std::vector<Region>& snapshots);
+	ReusableAllocations reclaimRegionsForPlan(
+			const std::vector<Region>& snapshots,
+			const std::vector<PromotionStorageRequest>& requests);
 	void writeBackDirtyRegions(const std::vector<Region>& regions);
 
 	// The Coordinator thread body: wakes every trigger_interval (or
@@ -400,9 +482,12 @@ class RegionManager {
 	bool coordinator_running_ = false;
 	bool coordinator_stop_requested_ = false;
 	bool coordinator_force_wake_ = false;  // set by waitIdle()/shutdown() to skip the trigger_interval wait
+	bool coordinator_reclaim_ready_ = false;  // a retiring Region reached zero logical pins
 	bool coordinator_busy_ = false;        // true while a batch is actively being processed (queues already drained)
 	std::deque<PromotionCandidate> pending_promotions_;  // RegionManager's own MPSC intake queue
 	std::deque<Region> pending_reclaims_;
+	std::atomic<std::uint64_t> next_candidate_sequence_{1};
+	std::uint64_t next_batch_sequence_ = 1;  // Coordinator-thread-only
 
 	// Stats' backing counters -- see stats() above. Independent atomics
 	// rather than a mutex-guarded struct: each is bumped from a different
@@ -413,6 +498,9 @@ class RegionManager {
 	std::atomic<std::uint64_t> stat_regions_written_back_{0};
 	std::atomic<std::uint64_t> stat_anchor_evictions_{0};
 	std::atomic<std::uint64_t> stat_compactions_total_{0};
+	std::atomic<std::uint64_t> stat_relocation_batches_{0};
+	std::atomic<std::uint64_t> stat_candidates_requeued_{0};
+	std::atomic<std::uint64_t> stat_near_fit_reuses_{0};
 };
 
 }  // namespace arachne

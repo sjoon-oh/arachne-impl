@@ -20,13 +20,17 @@ OpScheduler::OpScheduler(SchedulingConfig config, std::unique_ptr<SchedulingPoli
 
 OpScheduler::~OpScheduler() { shutdown(); }
 
-void OpScheduler::start(IAdapter& adapter, std::function<void(std::size_t)> on_worker_start) {
+void OpScheduler::start(IAdapter& adapter, std::function<void(std::size_t)> on_worker_start,
+		std::function<void(TraverseRequest&)> prepare_traverse,
+		std::function<void(ModifyRequest&)> prepare_modify) {
 	std::scoped_lock lock(mutex_);
 	if (running_) {
 		throw std::logic_error("OpScheduler already started");
 	}
 	adapter_ = &adapter;
 	on_worker_start_ = std::move(on_worker_start);
+	prepare_traverse_ = std::move(prepare_traverse);
+	prepare_modify_ = std::move(prepare_modify);
 	stop_requested_ = false;
 	running_ = true;
 	planner_ = std::thread(&OpScheduler::plannerLoop, this);
@@ -239,11 +243,23 @@ void OpScheduler::executeTraverseBatch(ScheduledOperationBatch batch) {
 	std::vector<TraverseRequest> requests;
 	requests.reserve(batch.size());
 	for (auto& op : batch) requests.push_back(std::get<TraverseTask>(op).request);
+	if (prepare_traverse_) {
+		for (TraverseRequest& request : requests) prepare_traverse_(request);
+	}
 
-	// SchedulingPolicy::canAppendToBatch() guarantees every request in the
-	// batch shares the same ExecutionMode, so the front element's mode picks
-	// which single IAdapter entry point serves the whole batch.
-	bool device = requests.front().mode == ExecutionMode::GpuOnly;
+	// Routing hints can become stale independently. Keep adapter calls batch
+	// homogeneous by demoting the entire batch if any request failed its
+	// execution-time residency validation.
+	bool device = true;
+	for (const TraverseRequest& request : requests) {
+		if (request.mode != ExecutionMode::GpuOnly) device = false;
+	}
+	if (!device) {
+		for (TraverseRequest& request : requests) {
+			request.mode = ExecutionMode::Hybrid;
+			request.residency_pin.reset();
+		}
+	}
 
 	try {
 		std::vector<TraverseResult> results =
@@ -253,6 +269,7 @@ void OpScheduler::executeTraverseBatch(ScheduledOperationBatch batch) {
 					"IAdapter::traverseHost/traverseDevice: result count does not match request count");
 		}
 		for (std::size_t i = 0; i < batch.size(); ++i) {
+			results[i].execution_mode = requests[i].mode;
 			TraverseTask& task = std::get<TraverseTask>(batch[i]);
 			// Runs on this worker thread, before set_value() -- see
 			// schedule()'s doc comment for the ordering guarantee this gives a
@@ -276,8 +293,21 @@ void OpScheduler::executeModifyBatch(ScheduledOperationBatch batch) {
 	std::vector<ModifyRequest> requests;
 	requests.reserve(batch.size());
 	for (auto& op : batch) requests.push_back(std::get<ModifyTask>(op).request);
+	if (prepare_modify_) {
+		for (ModifyRequest& request : requests) prepare_modify_(request);
+	}
 
-	bool device = requests.front().mode == ExecutionMode::GpuOnly;
+	bool device = true;
+	for (const ModifyRequest& request : requests) {
+		if (request.mode != ExecutionMode::GpuOnly) device = false;
+	}
+	if (!device) {
+		for (ModifyRequest& request : requests) {
+			request.mode = ExecutionMode::Hybrid;
+			request.lease = LeaseHandle{};
+			request.residency_pin.reset();
+		}
+	}
 
 	try {
 		std::vector<ModifyResult> results =
@@ -287,6 +317,7 @@ void OpScheduler::executeModifyBatch(ScheduledOperationBatch batch) {
 					"IAdapter::modifyHost/modifyDevice: result count does not match request count");
 		}
 		for (std::size_t i = 0; i < batch.size(); ++i) {
+			results[i].execution_mode = requests[i].mode;
 			std::get<ModifyTask>(batch[i]).promise.set_value(std::move(results[i]));
 		}
 	} catch (...) {
