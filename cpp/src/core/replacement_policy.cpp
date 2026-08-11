@@ -3,6 +3,8 @@
 #include <cmath>
 #include <limits>
 
+#include "logging.hpp"
+
 namespace arachne {
 
 namespace {
@@ -614,9 +616,18 @@ double CostAwareReplacementPolicy::victimRetentionDensity(const ResidentEntry& e
 
 AdmissionDecision CostAwareReplacementPolicy::evaluateAdmission(
 		const PromotionCandidate& candidate, const AdmissionContext& context) {
-	if (candidate.observations < config_.minimum_observations) return AdmissionDecision::Reject;
+	if (candidate.observations < config_.minimum_observations) {
+		ARACHNE_LOG_INFO(
+				"CostAwareReplacementPolicy: reject anchor {} -- observations={} below minimum_observations={}",
+				candidate.anchor_id, candidate.observations, config_.minimum_observations);
+		return AdmissionDecision::Reject;
+	}
 	if (config_.maximum_incremental_bytes != 0 &&
 			context.incremental_bytes > config_.maximum_incremental_bytes) {
+		ARACHNE_LOG_INFO(
+				"CostAwareReplacementPolicy: reject anchor {} -- incremental_bytes={} exceeds "
+				"maximum_incremental_bytes={}",
+				candidate.anchor_id, context.incremental_bytes, config_.maximum_incremental_bytes);
 		return AdmissionDecision::Reject;
 	}
 	if (context.incremental_bytes == 0) return AdmissionDecision::Admit;
@@ -635,7 +646,13 @@ AdmissionDecision CostAwareReplacementPolicy::evaluateAdmission(
 		if (it == resident_.end() || now - it->second.admitted_at < config_.minimum_residency) continue;
 		best_victim_density = std::min(best_victim_density, victimRetentionDensity(it->second, victim, now));
 	}
-	if (!std::isfinite(best_victim_density)) return AdmissionDecision::Reject;
+	if (!std::isfinite(best_victim_density)) {
+		ARACHNE_LOG_INFO(
+				"CostAwareReplacementPolicy: reject anchor {} -- available={} < incremental_bytes={} and no "
+				"eligible victim found among {} eviction candidate(s)",
+				candidate.anchor_id, available, context.incremental_bytes, context.eviction_candidates.size());
+		return AdmissionDecision::Reject;
+	}
 
 	double candidate_density = static_cast<double>(std::max<std::uint64_t>(1, candidate.observations)) /
 													 static_cast<double>(roundedUnits(context.incremental_bytes,
@@ -643,9 +660,14 @@ AdmissionDecision CostAwareReplacementPolicy::evaluateAdmission(
 	// Victim density is expressed per byte; normalize the candidate's unit
 	// density to the same scale before applying hysteresis.
 	candidate_density /= static_cast<double>(std::max<std::size_t>(1, context.allocation_unit_bytes));
-	return candidate_density >= best_victim_density * config_.admission_hysteresis
-				 ? AdmissionDecision::Admit
-				 : AdmissionDecision::Reject;
+	bool admit = candidate_density >= best_victim_density * config_.admission_hysteresis;
+	if (!admit) {
+		ARACHNE_LOG_INFO(
+				"CostAwareReplacementPolicy: reject anchor {} -- candidate_density={} < best_victim_density={} * "
+				"hysteresis={}",
+				candidate.anchor_id, candidate_density, best_victim_density, config_.admission_hysteresis);
+	}
+	return admit ? AdmissionDecision::Admit : AdmissionDecision::Reject;
 }
 
 void CostAwareReplacementPolicy::onPromotionCommitted(VectorId anchor_id, const AdmissionContext& context) {

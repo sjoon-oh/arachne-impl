@@ -8,6 +8,8 @@
 #include <unordered_set>
 #include <utility>
 
+#include "logging.hpp"
+
 namespace arachne {
 
 ASRoutingCache::ASRoutingCache(std::uint32_t dim, DistanceMetric metric, VectorDType dtype,
@@ -54,7 +56,11 @@ void ASRoutingCache::erase(VectorId id) {
 																			 static_cast<double>(total);
 		should_compact = ratio >= max_tombstone_ratio_;
 	}
-	if (should_compact) triggerCompaction();
+	if (should_compact) {
+		ARACHNE_LOG_INFO("ASRoutingCache::erase: tombstone ratio reached max_tombstone_ratio_={}, triggering compaction",
+											max_tombstone_ratio_);
+		triggerCompaction();
+	}
 }
 
 void ASRoutingCache::waitForCompaction() {
@@ -63,12 +69,17 @@ void ASRoutingCache::waitForCompaction() {
 
 void ASRoutingCache::triggerCompaction() {
 	bool expected = false;
-	if (!compacting_.compare_exchange_strong(expected, true)) return;
+	if (!compacting_.compare_exchange_strong(expected, true)) {
+		ARACHNE_LOG_DEBUG("ASRoutingCache::triggerCompaction: compaction already in flight, skipping");
+		return;
+	}
 
 	if (compaction_thread_.joinable()) compaction_thread_.join();
 	compaction_thread_ = std::thread([this] {
+		ARACHNE_LOG_INFO("ASRoutingCache: background compaction started");
 		compactImpl();
 		compacting_.store(false);
+		ARACHNE_LOG_INFO("ASRoutingCache: background compaction finished");
 	});
 }
 
@@ -127,6 +138,9 @@ void ASRoutingCache::compactImpl() {
 			}
 		}
 
+		ARACHNE_LOG_INFO(
+				"ASRoutingCache::compactImpl: rebuilt active index -- {} live id(s) migrated (shadow_capacity={})",
+				migrated.size(), shadow_capacity);
 		active_ = std::move(shadow);
 	}
 }

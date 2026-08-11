@@ -42,6 +42,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -119,6 +120,19 @@ class StressIndex final : public IAdapter {
 	/// must be called once before any insert()/search()/remove() goes
 	/// through `controller`.
 	void registerAllRegions(Controller& controller);
+
+	/// See IAdapter::exportTo()/loadFrom()'s own doc comment for the general
+	/// contract. Format here is a flat binary dump: a header of
+	/// (dim_, dtype_, capacity_, vectors_per_region_, next_free_slot_),
+	/// followed by buffer_ verbatim, one byte per capacity_ slot for
+	/// deleted_, then id_to_slot_ as a count followed by (id, slot) pairs.
+	/// loadFrom() throws std::invalid_argument if `path`'s header doesn't
+	/// match this instance's own dim_/dtype_/capacity_/vectors_per_region_ --
+	/// it never resizes buffer_/regions_ to fit, since regions_ (and any
+	/// Region already registered/promoted against a live Controller) are
+	/// fixed at construction time.
+	void exportTo(const std::string& path) const override;
+	void loadFrom(const std::string& path) override;
 
 	std::size_t liveCount() const;
 	std::uint32_t dim() const { return dim_; }

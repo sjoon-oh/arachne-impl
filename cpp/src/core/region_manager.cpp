@@ -396,6 +396,11 @@ void RegionManager::coordinatorLoop() {
 		pending_reclaims_.clear();
 		lock.unlock();
 
+		ARACHNE_LOG_INFO(
+				"coordinatorLoop: wakeup -- forced={} stop={} deadline_reached={} reclaim_ready={} admitted={} "
+				"reclaims={}",
+				forced, stop, deadline_reached, reclaim_ready, admitted.size(), reclaims.size());
+
 		// Ingestion happens every wakeup regardless of what runs below -- this
 		// keeps the policy's view current without waiting for a trigger.
 		for (PromotionCandidate& candidate : admitted) {
@@ -699,6 +704,14 @@ std::optional<RegionManager::RelocationPlan> RegionManager::buildRelocationPlan(
 				available, budget, coordinator_config_.max_promotion_bytes_per_pass};
 		BatchAdmissionDecision decision =
 				replacement_policy_->evaluateBatchAdmission(*candidate, admission, batch_context);
+		ARACHNE_LOG_INFO(
+				"buildRelocationPlan[{}]: admission for anchor {} (incremental_bytes={}) -> {} "
+				"(plan.promotions.size()={} selected_incremental={} retain_failed_candidates={})",
+				batch_sequence, candidate->anchor_id, admission.incremental_bytes,
+				decision == BatchAdmissionDecision::Admit ? "Admit"
+				: decision == BatchAdmissionDecision::Defer ? "Defer"
+																										 : "Reject",
+				plan.promotions.size(), selected_incremental, retain_failed_candidates);
 		if (decision == BatchAdmissionDecision::Reject) continue;
 		if (decision == BatchAdmissionDecision::Defer) {
 			if (retain_failed_candidates) deferred.push_back(std::move(*candidate));
@@ -715,9 +728,16 @@ std::optional<RegionManager::RelocationPlan> RegionManager::buildRelocationPlan(
 		plan.promotions.push_back(PlannedPromotion{std::move(*candidate), std::move(admission)});
 		std::size_t required = promotionBytes(plan.promotions);
 		if (required > budget) {
+			VectorId dropped_anchor = plan.promotions.back().candidate.anchor_id;
 			PromotionCandidate over_budget = std::move(plan.promotions.back().candidate);
 			plan.promotions.pop_back();
-			if (!plan.promotions.empty() && retain_failed_candidates) deferred.push_back(std::move(over_budget));
+			bool requeued = !plan.promotions.empty() && retain_failed_candidates;
+			ARACHNE_LOG_INFO(
+					"buildRelocationPlan[{}]: anchor {} pushed cumulative required={} over budget={} with {} other "
+					"promotion(s) already in this batch -- {} (retain_failed_candidates={})",
+					batch_sequence, dropped_anchor, required, budget, plan.promotions.size(),
+					requeued ? "requeued for a later pass" : "DROPPED PERMANENTLY (not requeued)", retain_failed_candidates);
+			if (requeued) deferred.push_back(std::move(over_budget));
 			// A single candidate larger than the entire budget is permanently
 			// infeasible and intentionally rejected rather than retried forever.
 			break;
@@ -739,20 +759,44 @@ std::optional<RegionManager::RelocationPlan> RegionManager::buildRelocationPlan(
 			[&promoted_anchors](const EvictionCandidate& candidate) {
 				return promoted_anchors.contains(candidate.anchor_id);
 			}), candidates.end());
+	ARACHNE_LOG_INFO(
+			"buildRelocationPlan[{}]: required={} available={} eviction_candidates={} -- entering victim-selection loop",
+			batch_sequence, plan.required_incremental_bytes, available, candidates.size());
 
 	while (available + plan.immediately_reclaimable_bytes < plan.required_incremental_bytes) {
 		std::size_t remaining = plan.required_incremental_bytes -
 				(available + plan.immediately_reclaimable_bytes);
 		std::optional<VectorId> victim =
 				replacement_policy_->selectEvictionCandidate(/*excluded=*/0, remaining, candidates);
-		if (!victim.has_value()) break;
+		if (!victim.has_value()) {
+			ARACHNE_LOG_INFO(
+					"buildRelocationPlan[{}]: selectEvictionCandidate() returned no victim with remaining={} and {} "
+					"candidates left -- stopping victim selection short",
+					batch_sequence, remaining, candidates.size());
+			break;
+		}
 		auto found = std::find_if(candidates.begin(), candidates.end(),
 				[&victim](const EvictionCandidate& candidate) { return candidate.anchor_id == *victim; });
-		if (found == candidates.end()) break;
+		if (found == candidates.end()) {
+			ARACHNE_LOG_INFO(
+					"buildRelocationPlan[{}]: selectEvictionCandidate() returned anchor {} which isn't in the "
+					"candidate list -- stopping victim selection short",
+					batch_sequence, victim.value());
+			break;
+		}
 		plan.evictions.push_back(*victim);
 		std::size_t projected = projectedReclaimableBytes(plan.evictions, /*require_unpinned=*/true);
+		ARACHNE_LOG_INFO(
+				"buildRelocationPlan[{}]: selected victim anchor {} (resident_bytes={} reclaimable_bytes={} "
+				"reclaimable_now_bytes={}) -- plan.evictions now {} anchor(s), projected reclaimable {} -> {}",
+				batch_sequence, *victim, found->resident_bytes, found->reclaimable_bytes, found->reclaimable_now_bytes,
+				plan.evictions.size(), plan.immediately_reclaimable_bytes, projected);
 		if (coordinator_config_.max_eviction_bytes_per_pass != 0 && plan.evictions.size() > 1 &&
 				projected > coordinator_config_.max_eviction_bytes_per_pass) {
+			ARACHNE_LOG_INFO(
+					"buildRelocationPlan[{}]: projected {} exceeds max_eviction_bytes_per_pass={} with {} victims "
+					"already selected -- dropping the just-added victim and stopping",
+					batch_sequence, projected, coordinator_config_.max_eviction_bytes_per_pass, plan.evictions.size());
 			plan.evictions.pop_back();
 			break;
 		}
@@ -761,6 +805,11 @@ std::optional<RegionManager::RelocationPlan> RegionManager::buildRelocationPlan(
 	}
 
 	if (available + plan.immediately_reclaimable_bytes < plan.required_incremental_bytes) {
+		ARACHNE_LOG_INFO(
+				"buildRelocationPlan[{}]: giving up -- available={} + immediately_reclaimable={} still < required={} "
+				"after selecting {} victim(s); retain_failed_candidates={}",
+				batch_sequence, available, plan.immediately_reclaimable_bytes, plan.required_incremental_bytes,
+				plan.evictions.size(), retain_failed_candidates);
 		if (retain_failed_candidates) {
 			std::vector<PromotionCandidate> retry;
 			for (PlannedPromotion& promotion : plan.promotions) retry.push_back(std::move(promotion.candidate));
@@ -768,6 +817,11 @@ std::optional<RegionManager::RelocationPlan> RegionManager::buildRelocationPlan(
 		}
 		return std::nullopt;
 	}
+	ARACHNE_LOG_INFO(
+			"buildRelocationPlan[{}]: committed plan with {} promotion(s), {} eviction(s), "
+			"required={} available={} immediately_reclaimable={}",
+			batch_sequence, plan.promotions.size(), plan.evictions.size(), plan.required_incremental_bytes, available,
+			plan.immediately_reclaimable_bytes);
 	return plan;
 }
 
@@ -782,7 +836,14 @@ void RegionManager::processRelocationBatch(bool retain_failed_candidates) {
 	const std::size_t budget = device_region_pool_->budgetBytes(gpu::MemoryKind::Data);
 	const std::size_t reserved = device_region_pool_->bytesReserved(gpu::MemoryKind::Data);
 	const std::size_t available = budget > reserved ? budget - reserved : 0;
-	if (available + projectedReclaimableBytes(plan.evictions, true) < plan.required_incremental_bytes) {
+	const std::size_t revalidated_reclaimable = projectedReclaimableBytes(plan.evictions, true);
+	if (available + revalidated_reclaimable < plan.required_incremental_bytes) {
+		ARACHNE_LOG_INFO(
+				"processRelocationBatch[{}]: execution-time re-validation FAILED -- available={} + "
+				"revalidated_reclaimable={} < required={} (plan had {} eviction(s) selected during planning with "
+				"immediately_reclaimable={}) -- abandoning batch, retain_failed_candidates={}",
+				plan.batch_sequence, available, revalidated_reclaimable, plan.required_incremental_bytes,
+				plan.evictions.size(), plan.immediately_reclaimable_bytes, retain_failed_candidates);
 		if (retain_failed_candidates) {
 			std::vector<PromotionCandidate> retry;
 			for (PlannedPromotion& promotion : plan.promotions) retry.push_back(std::move(promotion.candidate));
@@ -790,10 +851,19 @@ void RegionManager::processRelocationBatch(bool retain_failed_candidates) {
 		}
 		return;
 	}
+	ARACHNE_LOG_INFO(
+			"processRelocationBatch[{}]: execution-time re-validation passed (available={} revalidated_reclaimable={} "
+			"required={}) -- retiring {} anchor(s), promoting {} candidate(s)",
+			plan.batch_sequence, available, revalidated_reclaimable, plan.required_incremental_bytes,
+			plan.evictions.size(), plan.promotions.size());
 
 	std::vector<Region> retired = retireAnchorsNow(plan.evictions);
+	ARACHNE_LOG_INFO("processRelocationBatch[{}]: retireAnchorsNow() orphaned {} region(s) out of {} evicted anchor(s)",
+			plan.batch_sequence, retired.size(), plan.evictions.size());
 	ReusableAllocations reusable = reclaimRegionsForPlan(
 			retired, buildPromotionStorageRequests(plan.promotions));
+	ARACHNE_LOG_INFO("processRelocationBatch[{}]: reclaimRegionsForPlan() reused {} of {} orphaned region(s)",
+			plan.batch_sequence, reusable.size(), retired.size());
 
 	gpu::DeviceRegionPool::TransferBatch pending;
 	std::vector<PendingPromotionCommit> commits;
@@ -805,6 +875,12 @@ void RegionManager::processRelocationBatch(bool retain_failed_candidates) {
 			if (!unique.insert(region).second) continue;
 			MakeResult result = make(promotion.candidate.anchor_id, promotion.candidate.epoch,
 					region, pending, commits, reusable);
+			ARACHNE_LOG_INFO("processRelocationBatch[{}]: make(anchor={}, region={}) -> {}", plan.batch_sequence,
+					promotion.candidate.anchor_id, region,
+					result == MakeResult::Promoted        ? "Promoted"
+					: result == MakeResult::NotEligible    ? "NotEligible"
+					: result == MakeResult::OutOfCapacity  ? "OutOfCapacity"
+																									: "Deferred");
 			if (result == MakeResult::OutOfCapacity || result == MakeResult::Deferred) {
 				retry[i] = true;
 				break;
@@ -835,6 +911,9 @@ void RegionManager::processRelocationBatch(bool retain_failed_candidates) {
 				region_it->second.residency_state = RegionResidencyState::HostOnly;
 			}
 		}
+		ARACHNE_LOG_INFO("processRelocationBatch[{}]: publish region={} anchor={} generation={} -> {}",
+				plan.batch_sequence, commit.region_id, commit.anchor_id, commit.residency_generation,
+				published ? "Resident" : "publish failed (stale generation/epoch), reverted to HostOnly");
 		if (published) {
 			stat_regions_promoted_.fetch_add(1, std::memory_order_relaxed);
 		} else {

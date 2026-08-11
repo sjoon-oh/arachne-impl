@@ -437,7 +437,13 @@ DeviceRegionPool::CompactionResult DeviceRegionPool::tryOpenContiguousExtentLock
 	});
 
 	CompactionPolicy::Plan plan = compaction_policy_->plan(arena, movable, required_units);
-	if (!plan.feasible) return {};
+	if (!plan.feasible) {
+		ARACHNE_LOG_INFO(
+				"DeviceRegionPool::tryOpenContiguousExtentLocked: required_units={} not satisfiable -- "
+				"compaction_policy_->plan() found no feasible plan among {} movable block(s)",
+				required_units, movable.size());
+		return {};
+	}
 
 	std::size_t relocated_count = 0;
 	std::size_t bytes_relocated = 0;
@@ -464,6 +470,10 @@ DeviceRegionPool::CompactionResult DeviceRegionPool::tryOpenContiguousExtentLock
 		bytes_relocated += it->second.reserved_bytes;
 	}
 
+	ARACHNE_LOG_INFO(
+			"DeviceRegionPool::tryOpenContiguousExtentLocked: compacted {} block(s) ({} bytes relocated) to open "
+			"{} unit(s)",
+			relocated_count, bytes_relocated, required_units);
 	return CompactionResult{relocated_count, bytes_relocated};
 }
 

@@ -3,6 +3,7 @@
 #include <stdexcept>
 #include <utility>
 
+#include "logging.hpp"
 #include "telemetry/trace.hpp"
 
 namespace arachne {
@@ -38,6 +39,9 @@ void OpScheduler::start(IAdapter& adapter, std::function<void(std::size_t)> on_w
 	for (std::size_t i = 0; i < max_execution_threads_; ++i) {
 		execution_workers_.emplace_back(&OpScheduler::workerLoop, this, i);
 	}
+	ARACHNE_LOG_INFO(
+			"OpScheduler::start: {} execution worker(s), traverse_batch_size={} modify_batch_size={}",
+			max_execution_threads_, traverse_batch_size_, modify_batch_size_);
 }
 
 void OpScheduler::shutdown() {
@@ -50,6 +54,7 @@ void OpScheduler::shutdown() {
 		cv_incoming_.notify_all();
 		cv_dispatch_.notify_all();
 	}
+	ARACHNE_LOG_INFO("OpScheduler::shutdown: stop requested, joining worker threads");
 
 	if (planner_.joinable()) {
 		planner_.join();
@@ -66,6 +71,7 @@ void OpScheduler::shutdown() {
 	adapter_ = nullptr;
 	on_worker_start_ = nullptr;
 	execution_workers_.clear();
+	ARACHNE_LOG_INFO("OpScheduler::shutdown: all worker threads joined");
 }
 
 std::future<TraverseResult> OpScheduler::schedule(TraverseRequest request,
@@ -278,6 +284,10 @@ void OpScheduler::executeTraverseBatch(ScheduledOperationBatch batch) {
 			task.promise.set_value(std::move(results[i]));
 		}
 	} catch (...) {
+		ARACHNE_LOG_ERROR(
+				"OpScheduler::executeTraverseBatch: adapter threw for a batch of {} request(s) (device={}) -- "
+				"propagating exception to every future in the batch",
+				batch.size(), device);
 		std::exception_ptr eptr = std::current_exception();
 		for (auto& op : batch) {
 			try {
@@ -321,6 +331,10 @@ void OpScheduler::executeModifyBatch(ScheduledOperationBatch batch) {
 			std::get<ModifyTask>(batch[i]).promise.set_value(std::move(results[i]));
 		}
 	} catch (...) {
+		ARACHNE_LOG_ERROR(
+				"OpScheduler::executeModifyBatch: adapter threw for a batch of {} request(s) (device={}) -- "
+				"propagating exception to every future in the batch",
+				batch.size(), device);
 		std::exception_ptr eptr = std::current_exception();
 		for (auto& op : batch) {
 			try {

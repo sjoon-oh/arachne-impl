@@ -55,6 +55,10 @@ Controller::Controller(IAdapter& adapter, RoutingCache& routing_cache, Schedulin
 				}
 			});
 	region_manager_.start(adapter_, device_region_pool_, routing_cache_, coordinator_config);
+	ARACHNE_LOG_INFO(
+			"Controller: started (gpu_data_budget={} gpu_metadata_budget={} gpu_unit_bytes={} "
+			"max_execution_threads={})",
+			gpu_data_budget_bytes, gpu_metadata_budget_bytes, gpu_unit_bytes, scheduling_config.max_execution_threads);
 }
 
 SearchResult Controller::search(const Query& query) {
@@ -125,6 +129,7 @@ InsertResult Controller::insert(const Record& record) {
 		// unimplemented traverseDevice()/modifyDevice(), see IAdapter's doc
 		// comment) -- record.id was never actually inserted either way, so it
 		// must not stay claimed.
+		ARACHNE_LOG_WARN("insert: id {} threw during dispatch, releasing claimed id", record.id);
 		std::lock_guard<std::mutex> lock(live_ids_mutex_);
 		live_ids_.erase(record.id);
 		throw;
@@ -140,6 +145,8 @@ DeleteResult Controller::remove(VectorId id) {
 	if (final_result.ok) {
 		std::lock_guard<std::mutex> lock(live_ids_mutex_);
 		live_ids_.erase(id);
+	} else {
+		ARACHNE_LOG_WARN("remove: id {} failed at the adapter, id remains live", id);
 	}
 	return final_result;
 }
@@ -281,7 +288,10 @@ void Controller::verify(const Query& query, VectorId anchor_id, const TraverseRe
 	region_manager_.releaseAnchor(anchor_id);
 }
 
-void Controller::registerRegion(RegionId id, HostRegionView host) { region_manager_.registerRegion(id, host); }
+void Controller::registerRegion(RegionId id, HostRegionView host) {
+	ARACHNE_LOG_INFO("Controller::registerRegion: region {} ({} bytes host)", id, host.bytes);
+	region_manager_.registerRegion(id, host);
+}
 
 RegionAccess Controller::acquireRegion(RegionId region) {
 	Region snapshot = region_manager_.regionOf(region);  // throws if unregistered
@@ -312,6 +322,10 @@ ControllerStats Controller::stats() const {
 	return result;
 }
 
-void Controller::waitIdle() { region_manager_.waitIdle(); }
+void Controller::waitIdle() {
+	ARACHNE_LOG_INFO("Controller::waitIdle: forcing coordinator drain");
+	region_manager_.waitIdle();
+	ARACHNE_LOG_INFO("Controller::waitIdle: drain complete");
+}
 
 }  // namespace arachne

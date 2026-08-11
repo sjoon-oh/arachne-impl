@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <fstream>
 #include <set>
 #include <stdexcept>
 
@@ -217,6 +218,109 @@ std::vector<RegionId> StressIndex::allRegions() const {
 
 void StressIndex::registerAllRegions(Controller& controller) {
 	for (const auto& region : regions_) controller.registerRegion(region->id(), region->hostView());
+}
+
+namespace {
+template <typename T>
+void WritePod(std::ofstream& out, const T& value) {
+	out.write(reinterpret_cast<const char*>(&value), sizeof(value));
+}
+
+template <typename T>
+void ReadPod(std::ifstream& in, T& value) {
+	in.read(reinterpret_cast<char*>(&value), sizeof(value));
+}
+}  // namespace
+
+void StressIndex::exportTo(const std::string& path) const {
+	std::ofstream out(path, std::ios::binary | std::ios::trunc);
+	if (!out) throw std::runtime_error("StressIndex::exportTo: cannot open '" + path + "' for writing");
+
+	std::lock_guard<std::mutex> lock(mutex_);
+
+	WritePod(out, dim_);
+	WritePod(out, static_cast<std::uint32_t>(dtype_));
+	WritePod(out, capacity_);
+	WritePod(out, vectors_per_region_);
+	WritePod(out, next_free_slot_);
+
+	out.write(reinterpret_cast<const char*>(buffer_.data()), static_cast<std::streamsize>(buffer_.size()));
+
+	// deleted_ is std::vector<bool> (bit-packed) -- write one plain byte per
+	// slot rather than relying on any particular bit layout being stable
+	// across a dump/reload.
+	for (std::size_t slot = 0; slot < capacity_; ++slot) {
+		std::uint8_t flag = deleted_[slot] ? 1 : 0;
+		WritePod(out, flag);
+	}
+
+	std::size_t live = id_to_slot_.size();
+	WritePod(out, live);
+	for (const auto& [id, slot] : id_to_slot_) {
+		WritePod(out, id);
+		WritePod(out, slot);
+	}
+
+	if (!out) throw std::runtime_error("StressIndex::exportTo: write to '" + path + "' failed");
+}
+
+void StressIndex::loadFrom(const std::string& path) {
+	std::ifstream in(path, std::ios::binary);
+	if (!in) throw std::runtime_error("StressIndex::loadFrom: cannot open '" + path + "' for reading");
+
+	std::uint32_t dim = 0;
+	std::uint32_t dtype_raw = 0;
+	std::size_t capacity = 0;
+	std::size_t vectors_per_region = 0;
+	std::size_t next_free_slot = 0;
+	ReadPod(in, dim);
+	ReadPod(in, dtype_raw);
+	ReadPod(in, capacity);
+	ReadPod(in, vectors_per_region);
+	ReadPod(in, next_free_slot);
+	if (!in) throw std::runtime_error("StressIndex::loadFrom: truncated header in '" + path + "'");
+
+	if (dim != dim_ || static_cast<VectorDType>(dtype_raw) != dtype_ || capacity != capacity_ ||
+			vectors_per_region != vectors_per_region_) {
+		throw std::invalid_argument(
+				"StressIndex::loadFrom: '" + path +
+				"' was exported from a StressIndex with a different dim/dtype/capacity/vectors_per_region "
+				"-- construct a StressIndex with matching configuration before loading");
+	}
+
+	// Parsed fully into local storage before touching any member below -- a
+	// failed loadFrom() (thrown above or below) must leave this instance's
+	// prior state completely untouched rather than partially overwritten.
+	std::vector<std::byte> loaded_buffer(buffer_.size());
+	in.read(reinterpret_cast<char*>(loaded_buffer.data()), static_cast<std::streamsize>(loaded_buffer.size()));
+	if (!in) throw std::runtime_error("StressIndex::loadFrom: truncated buffer in '" + path + "'");
+
+	std::vector<bool> loaded_deleted(capacity_);
+	for (std::size_t slot = 0; slot < capacity_; ++slot) {
+		std::uint8_t flag = 0;
+		ReadPod(in, flag);
+		loaded_deleted[slot] = (flag != 0);
+	}
+	if (!in) throw std::runtime_error("StressIndex::loadFrom: truncated deleted-bitmap in '" + path + "'");
+
+	std::size_t live = 0;
+	ReadPod(in, live);
+	std::unordered_map<VectorId, std::size_t> loaded_id_to_slot;
+	loaded_id_to_slot.reserve(live);
+	for (std::size_t i = 0; i < live; ++i) {
+		VectorId id = 0;
+		std::size_t slot = 0;
+		ReadPod(in, id);
+		ReadPod(in, slot);
+		loaded_id_to_slot.emplace(id, slot);
+	}
+	if (!in) throw std::runtime_error("StressIndex::loadFrom: truncated id map in '" + path + "'");
+
+	std::lock_guard<std::mutex> lock(mutex_);
+	buffer_ = std::move(loaded_buffer);
+	deleted_ = std::move(loaded_deleted);
+	id_to_slot_ = std::move(loaded_id_to_slot);
+	next_free_slot_ = next_free_slot;
 }
 
 std::size_t StressIndex::liveCount() const {

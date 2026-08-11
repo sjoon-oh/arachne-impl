@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <memory>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 #include "adapter/region.hpp"
@@ -149,6 +150,48 @@ class IAdapter {
 	/// returned above into IRegion callbacks for lease management.
 	virtual IRegion* resolveRegion(RegionId id) = 0;
 	virtual std::vector<RegionId> allRegions() const = 0;
+
+	/// Bulk-builds this adapter's full state from `dataset` in one call,
+	/// entirely the adapter's own responsibility -- same reasoning as the
+	/// Export/Load split below: Core never mediates this, since *how* an
+	/// index ingests a dataset (what internal structures it builds, whether
+	/// it parallelizes, ...) is exactly the kind of "how" question Core stays
+	/// out of. Deliberately bypasses Controller/OpScheduler entirely: no
+	/// per-vector routing or residency decision is meaningful before any
+	/// Region even exists yet. Structurally the same contract as loadFrom():
+	/// after build() returns, resolveRegion()/allRegions() must report every
+	/// Region this dataset produced, and the caller is responsible for
+	/// re-registering them via Controller::registerRegion() the same way it
+	/// would after loadFrom() -- Core's Region bookkeeping is never itself
+	/// populated by build(). An adapter that cannot handle `dataset.dtype` (or
+	/// any other mismatch against how it was constructed) should validate and
+	/// throw rather than try to reshape itself, same as loadFrom(). Default
+	/// throws std::logic_error: opt-in, like the Device paths and
+	/// exportTo()/loadFrom() above.
+	virtual void build(const VectorBatchView& dataset);
+
+	/// Persistence, entirely the adapter's own responsibility -- the same
+	/// reasoning as the Host/Device split above: Core only ever decides
+	/// *where* traverse/modify run, never *how* an index represents or
+	/// reconstructs itself, and that includes how (or whether) it survives a
+	/// process restart. exportTo() writes this adapter's full state -- every
+	/// Region's host-mapped bytes plus any Region-*external* bookkeeping the
+	/// adapter itself owns (an id->slot map, a graph entry point, ...) -- to
+	/// `path`, in whatever format the concrete adapter chooses; Core never
+	/// inspects the result. loadFrom() is the inverse: called on an
+	/// already-constructed adapter (built with the same configuration --
+	/// dimension, capacity, ... -- the exporting adapter had; an
+	/// implementation is expected to validate this and throw rather than try
+	/// to reshape itself), it restores that full state from `path`. After
+	/// loadFrom() returns, resolveRegion()/allRegions() must report the same
+	/// Regions the exported adapter had, so a caller can re-register them
+	/// with Controller::registerRegion() the same way it would after building
+	/// fresh -- Core's Region bookkeeping is never itself persisted or
+	/// restored; it's always rebuilt from what the adapter reports. Both
+	/// default to throwing std::logic_error: opt-in, like the Device paths
+	/// above.
+	virtual void exportTo(const std::string& path) const;
+	virtual void loadFrom(const std::string& path);
 };
 
 inline std::vector<TraverseResult> IAdapter::traverseDevice(const std::vector<TraverseRequest>&) {
@@ -161,6 +204,18 @@ inline std::vector<ModifyResult> IAdapter::modifyDevice(const std::vector<Modify
 	throw std::logic_error(
 			"IAdapter::modifyDevice: not implemented by this adapter (a GpuOnly request was "
 			"routed to an adapter with no device-native modification)");
+}
+
+inline void IAdapter::build(const VectorBatchView&) {
+	throw std::logic_error("IAdapter::build: not implemented by this adapter");
+}
+
+inline void IAdapter::exportTo(const std::string&) const {
+	throw std::logic_error("IAdapter::exportTo: not implemented by this adapter");
+}
+
+inline void IAdapter::loadFrom(const std::string&) {
+	throw std::logic_error("IAdapter::loadFrom: not implemented by this adapter");
 }
 
 }  // namespace arachne

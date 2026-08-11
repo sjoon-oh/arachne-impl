@@ -62,6 +62,22 @@ struct Record {
 	VectorView vector;
 };
 
+/// A caller-owned, contiguous batch of `count` vectors, each `dtype`-encoded
+/// and `dim`-wide, packed back to back -- the shape IAdapter::build() (see
+/// adapter/index_adapter.hpp) takes to bulk-load a dataset. Mirrors how real
+/// datasets actually sit in memory (one flat buffer read from a benchmark
+/// file, hnswlib's own bulk-load examples) rather than Record's
+/// one-VectorView-per-vector indirection, which is the right shape for a
+/// single insert but not for handing over N vectors at once. `ids` is
+/// optional: nullptr means "assign 0, 1, 2, ... in order".
+struct VectorBatchView {
+	const void* data = nullptr;
+	std::uint32_t dim = 0;
+	VectorDType dtype = VectorDType::Float32;
+	std::size_t count = 0;
+	const VectorId* ids = nullptr;
+};
+
 struct Neighbor {
 	VectorId id = 0;
 	float distance = 0.0f;
