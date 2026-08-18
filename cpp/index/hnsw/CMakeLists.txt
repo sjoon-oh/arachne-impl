@@ -1,5 +1,5 @@
 # HnswIndex: the real (not test-double) IAdapter over thirdparty/hnswlib.
-# See hnsw_index.hpp for its [SKELETON] status and report.md for the design.
+# See hnsw_index.hpp for the class overview and report.md for the design.
 #
 # A separate library from arachne_core (rather than folded into
 # ARACHNE_CORE_SOURCES) because it's an adapter -- a *consumer* of
@@ -10,6 +10,9 @@
 # CMakeLists.txt.
 add_library(arachne_index_hnsw
 	hnsw_index.cpp
+	hnsw_index_anchor_entry.cpp
+	hnsw_index_dist.cpp
+	hnsw_dist_kernel.cu
 )
 add_library(arachne::index_hnsw ALIAS arachne_index_hnsw)
 

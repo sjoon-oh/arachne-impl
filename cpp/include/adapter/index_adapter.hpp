@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -41,6 +42,16 @@ struct TraverseRequest {
 	// Its lifetime covers the complete adapter call and prevents retirement
 	// from reclaiming any Region between routing and physical pool acquire().
 	std::shared_ptr<void> residency_pin;
+	// Set by Controller::route() whenever RoutingCache reports this query near
+	// a known Anchor (Controller::RoutingDecision::anchor_id), regardless of
+	// whether that Anchor's Regions are currently GPU-resident. An adapter may
+	// use this as a hint for its own purposes (e.g. an opportunistic entry-point
+	// cache keyed by Anchor id) -- Core never interprets it itself. Caution:
+	// this id is *not* guaranteed to be a real element in the adapter's own
+	// dataset -- an Anchor minted from a Hybrid search (see Controller::search())
+	// carries the *query* vector, not a stored one, so an adapter must not
+	// assume `*anchor_id` is resolvable as one of its own ids.
+	std::optional<VectorId> anchor_id;
 };
 
 struct TraverseResult {
@@ -130,6 +141,19 @@ struct ModifyResult {
 /// link_list_locks_/label_lookup_lock, is generally fine as-is; one that
 /// isn't needs its own locking, or the caller must be configured with
 /// max_execution_threads = 1).
+///
+/// Traverse/Modify isolation: the guarantee above is about concurrency
+/// within one entry point (traverseHost-vs-traverseHost, modifyHost-vs-
+/// modifyHost, ...) -- it says nothing about traverseHost()/traverseDevice()
+/// running on one worker while modifyHost()/modifyDevice() runs concurrently
+/// on another, against the same adapter instance. Most indexes don't make
+/// that combination safe even when they do make same-kind concurrency safe:
+/// hnswlib's own README documents add_items as thread-safe with other
+/// add_items, and knn_query as thread-safe with other knn_query, but never
+/// states the two are safe together. requiresTraverseModifyIsolation() lets
+/// OpScheduler serialize exactly that combination on an adapter's behalf --
+/// see its own doc comment (op_scheduler.hpp) for precisely what it does and
+/// does not restrict.
 class IAdapter {
  public:
 	virtual ~IAdapter() = default;
@@ -145,6 +169,17 @@ class IAdapter {
 	/// to Host -- deliberate, see class doc.
 	virtual std::vector<TraverseResult> traverseDevice(const std::vector<TraverseRequest>& requests);
 	virtual std::vector<ModifyResult> modifyDevice(const std::vector<ModifyRequest>& requests);
+
+	/// See class doc's "Traverse/Modify isolation" paragraph. Default true:
+	/// safe-by-default, matching hnswlib's own documented concurrency model
+	/// (same-kind-safe, cross-kind unstated). An adapter with its own answer
+	/// for traverse-vs-modify safety (e.g. RCU/epoch-based, or one the caller
+	/// always runs with max_execution_threads = 1) may override this to
+	/// return false and take on that responsibility itself. Read once by
+	/// OpScheduler::start(), before any worker thread is spawned -- changing
+	/// the returned value later has no effect on an already-started
+	/// scheduler.
+	virtual bool requiresTraverseModifyIsolation() const { return true; }
 
 	/// Structural accessors, not primitives: let Core resolve footprints
 	/// returned above into IRegion callbacks for lease management.

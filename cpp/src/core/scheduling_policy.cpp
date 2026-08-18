@@ -12,6 +12,12 @@ ExecutionMode ModeOf(const ScheduledOperation& op) {
 	return std::get<ModifyTask>(op).request.mode;
 }
 
+// Only ever called with a ScheduledOperation already known to hold a
+// ModifyTask (canAppendToBatch() only reaches this after kind_matches has
+// confirmed `candidate` and, transitively via the batch's own
+// kind-homogeneity invariant, current_batch.front() both hold ModifyTask).
+ModifyOp OpOf(const ScheduledOperation& op) { return std::get<ModifyTask>(op).request.op; }
+
 }  // namespace
 
 ScheduledKind FifoSchedulingPolicy::chooseBatchKind(const ScheduledOperationQueue& queue) const {
@@ -43,8 +49,18 @@ bool FifoSchedulingPolicy::canAppendToBatch(ScheduledKind batch_kind, const Sche
 													 : std::holds_alternative<ModifyTask>(candidate);
 	if (!kind_matches) return false;
 
+	if (current_batch.empty()) return true;
+
 	// Mode-homogeneity invariant -- see SchedulingPolicy's class doc comment.
-	return current_batch.empty() || ModeOf(candidate) == ModeOf(current_batch.front());
+	if (ModeOf(candidate) != ModeOf(current_batch.front())) return false;
+
+	// Op-homogeneity invariant (Modify batches only) -- see SchedulingPolicy's
+	// class doc comment.
+	if (batch_kind == ScheduledKind::Modify && OpOf(candidate) != OpOf(current_batch.front())) {
+		return false;
+	}
+
+	return true;
 }
 
 }  // namespace arachne

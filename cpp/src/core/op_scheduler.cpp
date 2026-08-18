@@ -32,6 +32,7 @@ void OpScheduler::start(IAdapter& adapter, std::function<void(std::size_t)> on_w
 	on_worker_start_ = std::move(on_worker_start);
 	prepare_traverse_ = std::move(prepare_traverse);
 	prepare_modify_ = std::move(prepare_modify);
+	traverse_modify_isolation_enabled_ = adapter_->requiresTraverseModifyIsolation();
 	stop_requested_ = false;
 	running_ = true;
 	planner_ = std::thread(&OpScheduler::plannerLoop, this);
@@ -40,8 +41,9 @@ void OpScheduler::start(IAdapter& adapter, std::function<void(std::size_t)> on_w
 		execution_workers_.emplace_back(&OpScheduler::workerLoop, this, i);
 	}
 	ARACHNE_LOG_INFO(
-			"OpScheduler::start: {} execution worker(s), traverse_batch_size={} modify_batch_size={}",
-			max_execution_threads_, traverse_batch_size_, modify_batch_size_);
+			"OpScheduler::start: {} execution worker(s), traverse_batch_size={} modify_batch_size={} "
+			"traverse_modify_isolation_enabled={}",
+			max_execution_threads_, traverse_batch_size_, modify_batch_size_, traverse_modify_isolation_enabled_);
 }
 
 void OpScheduler::shutdown() {
@@ -71,6 +73,14 @@ void OpScheduler::shutdown() {
 	adapter_ = nullptr;
 	on_worker_start_ = nullptr;
 	execution_workers_.clear();
+	// Should already be back to this state -- every dispatched batch's
+	// releaseExecutionSlot() runs before its worker loops back, and both
+	// planner_/execution_workers_ are fully joined above -- but reset
+	// explicitly so a subsequent start() on this same instance never inherits
+	// stale gate state.
+	inflight_traverse_ = 0;
+	inflight_modify_ = 0;
+	inflight_modify_op_.reset();
 	ARACHNE_LOG_INFO("OpScheduler::shutdown: all worker threads joined");
 }
 
@@ -154,11 +164,32 @@ void OpScheduler::plannerLoop() {
 		}
 
 		ScheduledKind batch_kind = policy_->chooseBatchKind(queue_);
+		std::optional<ModifyOp> batch_op;
+		if (batch_kind == ScheduledKind::Modify) {
+			batch_op = std::get<ModifyTask>(queue_.front()).request.op;
+		}
+
+		if (!canAdmit(batch_kind, batch_op)) {
+			// Something already in flight conflicts with the next batch this
+			// policy would build (see IAdapter::requiresTraverseModifyIsolation()
+			// and this class's own doc comment). Wait for in-flight execution
+			// state to change -- releaseExecutionSlot() notifies cv_incoming_ too
+			// -- then loop back to the top and re-decide from scratch: queue_
+			// itself can only be *appended* to while blocked here (nothing else
+			// ever removes from it but this thread), but re-deciding is cheap and
+			// avoids leaning on that invariant.
+			cv_incoming_.wait(lock, [this, batch_kind, batch_op] {
+				return stop_requested_ || canAdmit(batch_kind, batch_op);
+			});
+			continue;
+		}
+
 		ScheduledOperationBatch batch;
 		std::size_t batch_target = targetBatchSizeFor(batch_kind);
 		collectBatch(batch, batch_kind, batch_target, lock);
 
 		if (!batch.empty()) {
+			reserveExecutionSlot(batch_kind, batch_op);
 			dispatch_queue_.push_back(std::move(batch));
 			cv_dispatch_.notify_one();
 		}
@@ -184,7 +215,12 @@ void OpScheduler::workerLoop(std::size_t worker_index) {
 			batch = std::move(dispatch_queue_.front());
 			dispatch_queue_.pop_front();
 		}
+		// Captured before executeBatch() moves-from batch -- reserveExecutionSlot()
+		// (plannerLoop()) already recorded this same (kind, op) when the batch was
+		// built, so releasing by kind alone is enough to find the right counter.
+		ScheduledKind kind = kindOf(batch.front());
 		executeBatch(std::move(batch));
+		releaseExecutionSlot(kind);
 	}
 }
 
@@ -228,6 +264,49 @@ void OpScheduler::collectBatch(ScheduledOperationBatch& batch, ScheduledKind bat
 			batch.push_back(std::move(*iter));
 			queue_.erase(iter);
 		}
+}
+
+bool OpScheduler::canAdmit(ScheduledKind kind, std::optional<ModifyOp> op) const {
+	if (!traverse_modify_isolation_enabled_) return true;
+
+	if (kind == ScheduledKind::Traverse) {
+		return inflight_modify_ == 0;
+	}
+
+	// Modify: blocked by any in-flight Traverse, or by an in-flight Modify of
+	// a *different* op -- same-op Modify batches may still run concurrently
+	// (see this class's doc comment).
+	if (inflight_traverse_ > 0) return false;
+	if (inflight_modify_ > 0 && inflight_modify_op_ != op) return false;
+	return true;
+}
+
+void OpScheduler::reserveExecutionSlot(ScheduledKind kind, std::optional<ModifyOp> op) {
+	if (!traverse_modify_isolation_enabled_) return;
+
+	if (kind == ScheduledKind::Traverse) {
+		++inflight_traverse_;
+		return;
+	}
+	inflight_modify_op_ = op;
+	++inflight_modify_;
+}
+
+void OpScheduler::releaseExecutionSlot(ScheduledKind kind) {
+	if (!traverse_modify_isolation_enabled_) return;
+
+	{
+		std::scoped_lock lock(mutex_);
+		if (kind == ScheduledKind::Traverse) {
+			--inflight_traverse_;
+		} else {
+			--inflight_modify_;
+			if (inflight_modify_ == 0) inflight_modify_op_.reset();
+		}
+	}
+	// Wakes the planner if it's blocked in canAdmit()'s wait (plannerLoop()),
+	// same condition variable schedule() already uses for new arrivals.
+	cv_incoming_.notify_all();
 }
 
 void OpScheduler::executeBatch(ScheduledOperationBatch batch) {

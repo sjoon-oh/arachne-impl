@@ -8,6 +8,7 @@
 #include <future>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <thread>
 
 #include "adapter/index_adapter.hpp"
@@ -78,6 +79,30 @@ struct SchedulingConfig {
 /// modify_batch_size_ cap how large a batch stage 2 builds before handing it
 /// to stage 3; batch_wait_timeout_ optionally lets a non-empty batch wait a
 /// bit for more eligible ops rather than dispatching immediately.
+///
+/// Stage 2 also runs a Traverse/Modify execution-admission gate, right after
+/// SchedulingPolicy picks a batch_kind and before collectBatch() builds it
+/// (see canAdmit()/reserveExecutionSlot()/releaseExecutionSlot()). This is
+/// separate from SchedulingPolicy on purpose -- SchedulingPolicy only ever
+/// looks at one batch-in-progress against queue_ (composition), never at
+/// what's already executing on the worker pool (cross-batch admission), and
+/// mixing the two concerns into one interface would make every policy
+/// implementation re-solve the same admission problem. The gate itself is
+/// deliberately consulted here, in the planner thread, rather than inside
+/// workerLoop()/executeBatch(): a worker that can't yet run a batch it
+/// already popped would sit blocked holding nothing useful, whereas a batch
+/// the planner hasn't built yet simply stays represented as ordinary pending
+/// ops in queue_ -- other, non-conflicting batches keep flowing to workers
+/// meanwhile, and no worker thread is ever tied up waiting.
+///
+/// Rule enforced when an adapter's IAdapter::requiresTraverseModifyIsolation()
+/// returns true (the default): Traverse batches may run concurrently with
+/// other Traverse batches; a Modify batch may run concurrently with other
+/// Modify batches of the *same* ModifyOp; a Modify batch of a *different*
+/// ModifyOp, or any Modify running alongside any Traverse, must wait for the
+/// conflicting batch(es) to finish first. An adapter returning false from
+/// requiresTraverseModifyIsolation() opts out entirely -- the gate always
+/// admits, identical to this feature not existing.
 class OpScheduler {
  public:
   explicit OpScheduler(SchedulingConfig config = {},
@@ -138,6 +163,16 @@ private:
 	void executeTraverseBatch(ScheduledOperationBatch batch);
 	void executeModifyBatch(ScheduledOperationBatch batch);
 
+	// Traverse/Modify execution-admission gate -- see class doc comment and
+	// IAdapter::requiresTraverseModifyIsolation(). canAdmit()/
+	// reserveExecutionSlot() assume the caller already holds mutex_ (only
+	// ever called from plannerLoop(), which holds it for the whole loop
+	// body); releaseExecutionSlot() takes mutex_ itself (called from
+	// workerLoop(), after executeBatch() returns, outside any lock).
+	bool canAdmit(ScheduledKind kind, std::optional<ModifyOp> op) const;
+	void reserveExecutionSlot(ScheduledKind kind, std::optional<ModifyOp> op);
+	void releaseExecutionSlot(ScheduledKind kind);
+
 	void setBatchSizeValue(ScheduledKind kind, std::size_t size);
 	void setExecutionThreadValue(std::size_t threads);
 
@@ -174,6 +209,16 @@ private:
 	ScheduledOperationQueue queue_;
 	std::deque<ScheduledOperationBatch> dispatch_queue_;
 	std::uint64_t next_id_ = 1;
+
+	// Traverse/Modify execution-admission gate state -- guarded by mutex_,
+	// see canAdmit()/reserveExecutionSlot()/releaseExecutionSlot(). Set once
+	// in start() from adapter.requiresTraverseModifyIsolation(), before any
+	// worker thread is spawned -- same happens-before reasoning as
+	// on_worker_start_ above applies to reading it afterward.
+	bool traverse_modify_isolation_enabled_ = true;
+	std::size_t inflight_traverse_ = 0;
+	std::size_t inflight_modify_ = 0;
+	std::optional<ModifyOp> inflight_modify_op_;
 
 	// Adapter call target (owned outside this class)
 	IAdapter* adapter_ = nullptr;

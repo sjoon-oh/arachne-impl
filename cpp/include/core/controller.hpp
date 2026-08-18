@@ -188,6 +188,12 @@ class Controller {
 		bool gpu_only = false;
 		RegionFootprint predicted_scope;  // derived from the matched Anchor's dependent Regions
 		std::vector<RegionResidencyHint> residency_hints;
+		// The matched Anchor's id, set whenever routing_cache_.nearest() hits --
+		// independent of gpu_only (an adapter's entry-point cache benefits from
+		// seeing this on a Hybrid request too, so it can populate itself for a
+		// later GpuOnly attempt at the same Anchor). See TraverseRequest::anchor_id
+		// (adapter/index_adapter.hpp) for the caveat about what this id means.
+		std::optional<VectorId> anchor_id;
 	};
 		RoutingDecision route(const Query& query);
 		SearchPlan routeSearch(const Query& query);

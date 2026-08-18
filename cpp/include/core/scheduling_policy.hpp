@@ -45,14 +45,26 @@ using ScheduledOperationBatch = std::vector<ScheduledOperation>;
 /// repeatedly to grow the batch one op at a time until it's full or no
 /// eligible candidate remains.
 ///
-/// Every implementation must enforce one invariant regardless of its own
-/// ordering strategy: a batch must be mode-homogeneous, not just
-/// kind-homogeneous. OpScheduler dispatches a whole batch to exactly one of
-/// IAdapter's Host/Device entry points (adapter/index_adapter.hpp), so a
-/// candidate whose ExecutionMode (TraverseRequest::mode/ModifyRequest::mode)
-/// doesn't match the batch-in-progress's must be rejected by
-/// canAppendToBatch() -- there would be no single call correct for a mixed
-/// batch otherwise.
+/// Every implementation must enforce two invariants regardless of its own
+/// ordering strategy:
+///  - A batch must be mode-homogeneous, not just kind-homogeneous.
+///    OpScheduler dispatches a whole batch to exactly one of IAdapter's
+///    Host/Device entry points (adapter/index_adapter.hpp), so a candidate
+///    whose ExecutionMode (TraverseRequest::mode/ModifyRequest::mode)
+///    doesn't match the batch-in-progress's must be rejected by
+///    canAppendToBatch() -- there would be no single call correct for a
+///    mixed batch otherwise.
+///  - A Modify batch must also be op-homogeneous (ModifyRequest::op):
+///    Insert and Delete are different operations against the index (Insert
+///    is itself Traversal-then-Modification, Delete is Modification-only --
+///    see IAdapter's own doc comment) with different request shapes and
+///    different routing (e.g. Controller::routeRemove() never considers
+///    GpuOnly, routeInsert() does), so a candidate whose op doesn't match
+///    the batch-in-progress's must be rejected the same way a mode mismatch
+///    is -- this lets an adapter's modifyHost()/modifyDevice() assume every
+///    request in one call shares the same op, without weakening the
+///    existing IAdapter contract (a single batch call per Host/Device
+///    invocation) to do it.
 class SchedulingPolicy {
  public:
 	virtual ~SchedulingPolicy() = default;

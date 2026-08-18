@@ -69,12 +69,28 @@ SearchResult Controller::search(const Query& query) {
 	// already answers it, so there's nothing for the replacement policy to
 	// usefully consider promoting.
 	VectorId anchor_id = (plan.primary.mode == ExecutionMode::Hybrid) ? next_anchor_id_.fetch_add(1) : 0;
+	// If routeSearch() didn't already find an existing Anchor for this query
+	// (plan.primary.anchor_id still empty), this freshly minted id is what
+	// requestPromotion() below registers this locality under -- give the
+	// adapter that same identity up front so a Hybrid traversal completing
+	// this call can populate its own entry-point cache (see
+	// TraverseRequest::anchor_id's doc comment) against the exact id a later
+	// query landing on this same, now-registered Anchor will be routed with.
+	// Left untouched when routeSearch() already found a real Anchor (a
+	// different id would just discard it).
+	if (anchor_id != 0 && !plan.primary.anchor_id) plan.primary.anchor_id = anchor_id;
 	TraverseResult result = dispatch(plan.primary, anchor_id);
 	bool final_was_hybrid = (result.execution_mode == ExecutionMode::Hybrid);
 
 	if (plan.fallback_to_hybrid && !result.completed_within_scope) {
 		TraverseRequest fallback_request{query, ExecutionMode::Hybrid, {}};
 		anchor_id = next_anchor_id_.fetch_add(1);
+		// This fresh id is what requestPromotion() below will register `query`
+		// under if this Hybrid retry leads to a promotion -- give an adapter's
+		// own entry-point cache (see TraverseRequest::anchor_id) the same id up
+		// front so a completed traversal here can populate itself against the
+		// identity this locality will actually be known by going forward.
+		fallback_request.anchor_id = anchor_id;
 		result = dispatch(fallback_request, anchor_id);
 		final_was_hybrid = true;
 	}
@@ -106,6 +122,13 @@ InsertResult Controller::insert(const Record& record) {
 		RoutingDecision decision = route(lookup_query);
 		TraverseRequest lookup{lookup_query, decision.gpu_only ? ExecutionMode::GpuOnly : ExecutionMode::Hybrid,
 													 decision.predicted_scope};
+		lookup.anchor_id = decision.anchor_id;
+		// Same reasoning as search()'s own fix above: record.id is always what
+		// requestPromotion() below registers this locality under (unlike
+		// search(), insert() always has a real, non-synthetic id available), so
+		// fall back to it when routeInsert()/route() didn't already find an
+		// existing Anchor.
+		if (!lookup.anchor_id) lookup.anchor_id = record.id;
 		// Unlike search(), always registers record.id as a promotion candidate
 		// (it's always a brand-new Anchor here, never a redundant
 		// re-registration) regardless of whether the Modify call below even
@@ -158,6 +181,7 @@ Controller::SearchPlan Controller::routeSearch(const Query& query) {
 	plan.primary.query = query;
 	plan.primary.mode = ExecutionMode::Hybrid;
 	plan.primary.scope = {};
+	plan.primary.anchor_id = decision.anchor_id;
 	plan.fallback_to_hybrid = false;
 	if (decision.gpu_only) {
 		plan.primary.mode = ExecutionMode::GpuOnly;
@@ -254,6 +278,7 @@ Controller::RoutingDecision Controller::route(const Query& query) {
 	ARACHNE_TRACE_SCOPE("Controller", "route");
 	RoutingDecision decision;
 	if (std::optional<VectorId> anchor_id = routing_cache_.nearest(query.vector)) {
+		decision.anchor_id = anchor_id;
 		// Copied out of region_manager_ rather than referenced: it's guarded by
 		// region_manager_'s own internal mutex, which can't outlive this call.
 		std::vector<RegionResidencyHint> hints = region_manager_.residencyHints(*anchor_id);
