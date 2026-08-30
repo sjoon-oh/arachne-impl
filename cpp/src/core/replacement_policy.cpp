@@ -83,14 +83,6 @@ std::optional<PromotionCandidate> FifoReplacementPolicy::selectNextPromotionCand
 	return candidate;
 }
 
-std::optional<VectorId> FifoReplacementPolicy::selectNextEvictionCandidate(VectorId excluded) {
-	std::lock_guard lock(mutex_);
-	for (VectorId candidate : promoted_order_) {
-		if (candidate != excluded) return candidate;
-	}
-	return std::nullopt;
-}
-
 std::optional<VectorId> FifoReplacementPolicy::selectEvictionCandidate(
 		VectorId excluded, std::size_t, const std::vector<EvictionCandidate>& candidates) {
 	std::lock_guard lock(mutex_);
@@ -159,14 +151,6 @@ std::optional<PromotionCandidate> LruReplacementPolicy::selectNextPromotionCandi
 		lru_position_.emplace(candidate.anchor_id, std::prev(lru_order_.end()));
 	}
 	return candidate;
-}
-
-std::optional<VectorId> LruReplacementPolicy::selectNextEvictionCandidate(VectorId excluded) {
-	std::lock_guard lock(mutex_);
-	for (VectorId candidate : lru_order_) {
-		if (candidate != excluded) return candidate;
-	}
-	return std::nullopt;
 }
 
 std::optional<VectorId> LruReplacementPolicy::selectEvictionCandidate(
@@ -249,16 +233,6 @@ std::optional<PromotionCandidate> LfuReplacementPolicy::selectNextPromotionCandi
 	return candidate;
 }
 
-std::optional<VectorId> LfuReplacementPolicy::selectNextEvictionCandidate(VectorId excluded) {
-	std::lock_guard lock(mutex_);
-	for (const auto& [freq, bucket] : freq_buckets_) {  // ascending frequency order
-		for (VectorId candidate : bucket) {
-			if (candidate != excluded) return candidate;
-		}
-	}
-	return std::nullopt;
-}
-
 std::optional<VectorId> LfuReplacementPolicy::selectEvictionCandidate(
 		VectorId excluded, std::size_t, const std::vector<EvictionCandidate>& candidates) {
 	std::lock_guard lock(mutex_);
@@ -337,32 +311,6 @@ std::optional<PromotionCandidate> ClockReplacementPolicy::selectNextPromotionCan
 		ring_.push_back(ClockEntry{candidate.anchor_id, /*referenced=*/true});
 	}
 	return candidate;
-}
-
-std::optional<VectorId> ClockReplacementPolicy::selectNextEvictionCandidate(VectorId excluded) {
-	std::lock_guard lock(mutex_);
-	if (ring_.empty()) return std::nullopt;
-
-	// Bounded by two full sweeps: every entry can only be spared once (its
-	// bit cleared on the first pass) before the second pass finds it
-	// unreferenced -- see the class doc comment.
-	std::size_t limit = 2 * ring_.size();
-	for (std::size_t steps = 0; steps < limit; ++steps) {
-		if (hand_ >= ring_.size()) hand_ = 0;
-		ClockEntry& entry = ring_[hand_];
-
-		if (entry.anchor_id == excluded) {
-			hand_ = (hand_ + 1) % ring_.size();
-			continue;
-		}
-		if (entry.referenced) {
-			entry.referenced = false;  // second chance: spared once, bit cleared
-			hand_ = (hand_ + 1) % ring_.size();
-			continue;
-		}
-		return entry.anchor_id;  // unreferenced and not excluded -- victim found; hand_ stays here
-	}
-	return std::nullopt;  // everything still standing is excluded
 }
 
 std::optional<VectorId> ClockReplacementPolicy::selectEvictionCandidate(
@@ -487,20 +435,6 @@ std::optional<PromotionCandidate> TwoQReplacementPolicy::selectNextPromotionCand
 		a1in_position_.emplace(anchor_id, std::prev(a1in_.end()));
 	}
 	return candidate;
-}
-
-std::optional<VectorId> TwoQReplacementPolicy::selectNextEvictionCandidate(VectorId excluded) {
-	std::lock_guard lock(mutex_);
-	// a1in_ first (cheapest, safest sacrifice), am_ only once a1in_ is
-	// exhausted -- see the class doc comment for why this ordering alone is
-	// what protects am_ from scan pollution.
-	for (VectorId candidate : a1in_) {
-		if (candidate != excluded) return candidate;
-	}
-	for (VectorId candidate : am_) {
-		if (candidate != excluded) return candidate;
-	}
-	return std::nullopt;
 }
 
 std::optional<VectorId> TwoQReplacementPolicy::selectEvictionCandidate(
@@ -688,17 +622,20 @@ AdmissionDecision CostAwareReplacementPolicy::evaluateAdmission(
 	drainTouchQueueLocked();  // apply any heat updates queued since the last drain before reading resident_ below
 	Clock::time_point now = Clock::now();
 	double best_victim_density = std::numeric_limits<double>::infinity();
-	for (const EvictionCandidate& victim : context.eviction_candidates) {
-		if (victim.anchor_id == candidate.anchor_id || victim.reclaimable_bytes == 0) continue;
-		std::optional<double> density = groupRetentionDensity(victim, now);
-		if (!density.has_value()) continue;
-		best_victim_density = std::min(best_victim_density, *density);
+	if (context.eviction_candidates) {
+		for (const EvictionCandidate& victim : *context.eviction_candidates) {
+			if (victim.anchor_id == candidate.anchor_id || victim.reclaimable_bytes == 0) continue;
+			std::optional<double> density = groupRetentionDensity(victim, now);
+			if (!density.has_value()) continue;
+			best_victim_density = std::min(best_victim_density, *density);
+		}
 	}
 	if (!std::isfinite(best_victim_density)) {
 		ARACHNE_LOG_INFO(
 				"CostAwareReplacementPolicy: reject anchor {} -- available={} < incremental_bytes={} and no "
 				"eligible victim found among {} eviction candidate(s)",
-				candidate.anchor_id, available, context.incremental_bytes, context.eviction_candidates.size());
+				candidate.anchor_id, available, context.incremental_bytes,
+				context.eviction_candidates ? context.eviction_candidates->size() : 0);
 		return AdmissionDecision::Reject;
 	}
 
@@ -753,23 +690,6 @@ std::optional<VectorId> CostAwareReplacementPolicy::selectEvictionCandidate(
 		if (score < best_score) {
 			best_score = score;
 			best = candidate.anchor_id;
-		}
-	}
-	return best;
-}
-
-std::optional<VectorId> CostAwareReplacementPolicy::selectNextEvictionCandidate(VectorId excluded) {
-	std::lock_guard lock(mutex_);
-	drainTouchQueueLocked();  // apply any heat updates queued since the last drain before reading resident_ below
-	Clock::time_point now = Clock::now();
-	double coldest = std::numeric_limits<double>::infinity();
-	std::optional<VectorId> best;
-	for (const auto& [anchor_id, entry] : resident_) {
-		if (anchor_id == excluded || now - entry.admitted_at < config_.minimum_residency) continue;
-		double heat = decayedHeat(entry, now);
-		if (heat < coldest) {
-			coldest = heat;
-			best = anchor_id;
 		}
 	}
 	return best;

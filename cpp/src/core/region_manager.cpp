@@ -695,8 +695,8 @@ void RegionManager::assignAnchorToGroup(VectorId anchor_id, const std::vector<Re
 	for (RegionId region_id : footprint_regions) region_group_[region_id] = assigned;
 }
 
-AdmissionContext RegionManager::buildAdmissionContext(
-		const PromotionCandidate& candidate, std::optional<std::vector<EvictionCandidate>>& eviction_candidates_cache) const {
+AdmissionContext RegionManager::buildAdmissionContext(const PromotionCandidate& candidate,
+		std::shared_ptr<const std::vector<EvictionCandidate>>& eviction_candidates_cache) const {
 	AdmissionContext context;
 	context.allocation_unit_bytes = device_region_pool_->allocationUnitBytes(gpu::MemoryKind::Data);
 	std::unordered_set<RegionId> unique_regions;
@@ -734,8 +734,15 @@ AdmissionContext RegionManager::buildAdmissionContext(
 	std::size_t available =
 			context.gpu_budget_bytes > context.gpu_bytes_allocated ? context.gpu_budget_bytes - context.gpu_bytes_allocated : 0;
 	if (available < context.incremental_bytes) {
-		if (!eviction_candidates_cache.has_value()) eviction_candidates_cache = buildEvictionCandidates();
-		context.eviction_candidates = *eviction_candidates_cache;
+		if (!eviction_candidates_cache) {
+			eviction_candidates_cache = std::make_shared<const std::vector<EvictionCandidate>>(buildEvictionCandidates());
+		}
+		// Shares the cached snapshot itself (an atomic refcount bump), not a
+		// deep copy of it -- see AdmissionContext::eviction_candidates' own
+		// doc comment for why an owned std::vector here was the actual cost
+		// of this whole function once it's called once per *candidate*
+		// rather than once per pass.
+		context.eviction_candidates = eviction_candidates_cache;
 	}
 	return context;
 }
@@ -813,8 +820,10 @@ std::optional<RegionManager::RelocationPlan> RegionManager::buildRelocationPlan(
 	// candidate in this pass actually needs eviction info, then reused for
 	// every other candidate examined here and for the victim-selection loop
 	// below -- see buildAdmissionContext()'s own comment for why recomputing
-	// it more than once per pass is always redundant.
-	std::optional<std::vector<EvictionCandidate>> eviction_candidates_cache;
+	// it more than once per pass is always redundant, and
+	// AdmissionContext::eviction_candidates' own doc comment for why this is
+	// a shared_ptr rather than a plain std::optional<std::vector<...>>.
+	std::shared_ptr<const std::vector<EvictionCandidate>> eviction_candidates_cache;
 
 	// Diagnostic-only (ARACHNE_ENABLE_TRACING build): brace-scoped so the
 	// timer covers exactly the promotion-collection loop below, distinct
@@ -919,8 +928,14 @@ std::optional<RegionManager::RelocationPlan> RegionManager::buildRelocationPlan(
 	}
 	// Reuses eviction_candidates_cache if some candidate above already
 	// populated it -- same "static for the whole pass" reasoning as
-	// buildAdmissionContext()'s own use of it.
-	if (!eviction_candidates_cache.has_value()) eviction_candidates_cache = buildEvictionCandidates();
+	// buildAdmissionContext()'s own use of it. Copied (not shared) into
+	// `candidates` below since this loop mutates its own working copy
+	// (erase-remove of already-promoted anchors) -- called once per pass,
+	// not once per candidate, so this copy was never the cost the shared_ptr
+	// change above targets.
+	if (!eviction_candidates_cache) {
+		eviction_candidates_cache = std::make_shared<const std::vector<EvictionCandidate>>(buildEvictionCandidates());
+	}
 	std::vector<EvictionCandidate> candidates = *eviction_candidates_cache;
 	candidates.erase(std::remove_if(candidates.begin(), candidates.end(),
 			[&promoted_anchors](const EvictionCandidate& candidate) {

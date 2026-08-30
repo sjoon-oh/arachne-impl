@@ -92,11 +92,14 @@ namespace arachne {
 //    allocations, so flushing already-promoted Leases first widens the pool
 //    of movable blocks instead of needlessly excluding Regions this same
 //    batch is itself responsible for pinning.
-//  - OutOfCapacity retry loop (processPromotions()): a make() call
-//    returning OutOfCapacity is retried by evicting a victim
-//    (selectNextEvictionCandidate()) and calling make() again, looping
-//    until Promoted or no victim is left. Pending Leases are flushed before
-//    every eviction, because evictAnchorNow()'s free() can block waiting on
+//  - OutOfCapacity handling (processRelocationBatch()): a make() call
+//    returning OutOfCapacity or Deferred is *not* retried in place with a
+//    fresh eviction anymore -- it's marked for retry and requeued
+//    (requeueCandidates()) for a later pass, which re-runs
+//    buildRelocationPlan()'s own collect + victim-selection phases (see
+//    selectEvictionCandidate()) from scratch against then-current state.
+//    Eviction itself (evictAnchorNow(), retireAnchorsNow() + reclaimRegions())
+//    still flushes pending Leases first, because free() can block waiting on
 //    a Lease this same pass is still holding open -- without the flush that
 //    is a real deadlock (the Coordinator thread waiting on itself), not
 //    just a missed optimization.
@@ -137,9 +140,14 @@ namespace arachne {
 //                                                         tryAllocate()
 //                                                         fail -> compact() -> tryAllocate()
 //                                                  OutOfCapacity?
-//                                                    -> selectNextEvictionCandidate()
-//                                                    -> evictAnchorNow(victim)
-//                                                    -> retry make()
+//                                                    -> mark for retry, requeued for a
+//                                                       later pass (not retried in place --
+//                                                       see the OutOfCapacity handling bullet
+//                                                       above; this diagram predates that and
+//                                                       is otherwise not kept in sync with
+//                                                       buildRelocationPlan()/
+//                                                       processRelocationBatch()'s current
+//                                                       collect+evict split)
 //                                                any Region promoted?
 //                                                  -> routing_cache_->ensure()
 //                                              one flush() for the whole pass
@@ -485,8 +493,17 @@ class RegionManager {
 	// in that loop promotes/evicts anything -- only processRelocationBatch()
 	// does, afterward), so recomputing buildEvictionCandidates() more than
 	// once per pass would only ever reproduce the exact same result.
-	AdmissionContext buildAdmissionContext(
-			const PromotionCandidate& candidate, std::optional<std::vector<EvictionCandidate>>& eviction_candidates_cache) const;
+	//
+	// A shared_ptr, not a plain std::optional<std::vector<...>>, specifically
+	// so AdmissionContext::eviction_candidates (which this hands out a copy
+	// of the *pointer* to, per candidate, not a copy of the vector) can
+	// safely outlive this pass -- a raw reference into this function-local
+	// cache would dangle the moment buildRelocationPlan() returns, since
+	// PlannedPromotion::admission (holding a copy of whatever was handed
+	// out here) is read again later by processRelocationBatch(), a separate
+	// call after this one's stack frame is gone.
+	AdmissionContext buildAdmissionContext(const PromotionCandidate& candidate,
+			std::shared_ptr<const std::vector<EvictionCandidate>>& eviction_candidates_cache) const;
 	std::vector<EvictionCandidate> buildEvictionCandidates() const;
 	std::size_t reservedRegionBytes(const Region& region) const;
 	std::size_t promotionBytes(const std::vector<PlannedPromotion>& promotions) const;

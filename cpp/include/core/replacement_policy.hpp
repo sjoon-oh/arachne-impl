@@ -7,6 +7,7 @@
 #include <deque>
 #include <list>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <unordered_map>
@@ -68,7 +69,7 @@ using CostAwareReplacementMutex = std::mutex;
 //            v
 //   granted / tracked  <----------------------------.
 //            |                                       |
-//            |-- selectNextEvictionCandidate() ------'  (reads tracked state)
+//            |-- selectEvictionCandidate() -----------'  (reads tracked state)
 //            |
 //            |-- onAnchorEvicted()  (any thread, immediate) --> purged from
 //            |                                                  every structure
@@ -93,7 +94,7 @@ using CostAwareReplacementMutex = std::mutex;
 //
 // Threading model: enqueueCandidate() and every "act on pending/tracked
 // state" call (onRelocationTrigger(), selectNextPromotionCandidate(),
-// selectNextEvictionCandidate()) run only on the Coordinator thread, mirroring
+// selectEvictionCandidate()) run only on the Coordinator thread, mirroring
 // the intake queue's MPSC/single-consumer shape. onAnchorEvicted() and
 // onAnchorTouched() are the exception: both run on whichever thread the
 // underlying event happened on, never funneled through the Coordinator --
@@ -176,15 +177,34 @@ struct AdmissionContext {
 	std::size_t allocation_unit_bytes = 1;
 	std::size_t gpu_bytes_allocated = 0;
 	std::size_t gpu_budget_bytes = 0;
-	/// Left empty whenever gpu_budget_bytes - gpu_bytes_allocated already
-	/// covers incremental_bytes -- i.e. this candidate doesn't need eviction
-	/// help to fit, so RegionManager doesn't bother building the list at all
-	/// (see buildAdmissionContext()'s own comment, region_manager.hpp). A
-	/// policy that only consults this field once it has independently
-	/// confirmed eviction is actually needed is unaffected; one that reads it
-	/// unconditionally must treat empty as "nothing needed evicting", not as
-	/// "nothing is evictable".
-	std::vector<EvictionCandidate> eviction_candidates;
+	/// Null whenever gpu_budget_bytes - gpu_bytes_allocated already covers
+	/// incremental_bytes -- i.e. this candidate doesn't need eviction help to
+	/// fit, so RegionManager doesn't bother building the list at all (see
+	/// buildAdmissionContext()'s own comment, region_manager.hpp). A policy
+	/// that only consults this field once it has independently confirmed
+	/// eviction is actually needed is unaffected; one that reads it
+	/// unconditionally must treat null (or an empty pointee) as "nothing
+	/// needed evicting", not as "nothing is evictable".
+	///
+	/// A shared_ptr to a shared, immutable snapshot -- not an owned
+	/// std::vector -- because RegionManager::buildAdmissionContext() builds
+	/// this at most once per buildRelocationPlan() pass and hands the *same*
+	/// snapshot to every candidate examined in that pass (see that method's
+	/// own comment for why recomputing it per-candidate would be redundant);
+	/// an owned vector would mean deep-copying it (including every entry's
+	/// own heap-allocated group_members) once per *candidate* instead of
+	/// once per *pass* -- measured to cost minutes at 1M-vector scale (see
+	/// the buildRelocationPlan_collect finding in
+	/// cpp/test/index/report/2026-08-29-anchor-id-independence.md). Safe to
+	/// keep sharing past this pass's own lifetime (e.g. via
+	/// PlannedPromotion::admission surviving into onPromotionCommitted()
+	/// after buildRelocationPlan() itself has returned) precisely because a
+	/// shared_ptr, unlike a raw reference into the pass-local cache it's
+	/// built from, keeps its pointee alive for as long as any copy of it
+	/// does -- see buildAdmissionContext()'s own comment (region_manager.hpp)
+	/// for why a raw reference was considered and rejected for exactly this
+	/// reason.
+	std::shared_ptr<const std::vector<EvictionCandidate>> eviction_candidates;
 };
 
 enum class AdmissionDecision { Admit, Reject };
@@ -262,11 +282,6 @@ class ReplacementPolicy {
 	/// eviction, not a correctness bug -- capacity retries still terminate).
 	virtual std::optional<PromotionCandidate> selectNextPromotionCandidate() = 0;
 
-	/// Chooses the next Anchor to reclaim, excluding `excluded` (the Anchor
-	/// currently being promoted -- never select the thing being promoted).
-	/// Returns nullopt if nothing is eligible to evict.
-	virtual std::optional<VectorId> selectNextEvictionCandidate(VectorId excluded) = 0;
-
 	/// Cost-aware admission hook. The default preserves every existing/custom
 	/// policy's behavior; policies interested in transfer/reclaim cost override
 	/// it without giving up the pluggable ReplacementPolicy abstraction.
@@ -291,12 +306,21 @@ class ReplacementPolicy {
 	/// least one dependency exists.
 	virtual void onPromotionCommitted(VectorId, const AdmissionContext&) {}
 
-	/// Structured eviction hook. The default delegates to the legacy Anchor-
-	/// only selector, retaining source compatibility for existing policies.
+	/// Chooses the next Anchor to reclaim, excluding `excluded` (the Anchor
+	/// currently being promoted -- never select the thing being promoted).
+	/// Returns nullopt if nothing is eligible to evict. `required_bytes`/
+	/// `candidates` give byte- and group-aware policies (CostAwareReplacementPolicy)
+	/// what they need to score victims properly; a policy that scores purely
+	/// by its own tracked order/recency/frequency (every other built-in
+	/// policy) is free to ignore both and just walk its own internal
+	/// structure, the same as before this was the sole eviction-selection
+	/// entry point (this used to be two separate virtuals -- a "legacy"
+	/// `selectNextEvictionCandidate(excluded)` every policy had to implement,
+	/// and this one, with a default that just delegated to it; collapsed to
+	/// one once nothing outside this file ever called the legacy one
+	/// directly anymore -- see cpp/test/index/report/ for that investigation).
 	virtual std::optional<VectorId> selectEvictionCandidate(
-			VectorId excluded, std::size_t, const std::vector<EvictionCandidate>&) {
-		return selectNextEvictionCandidate(excluded);
-	}
+			VectorId excluded, std::size_t required_bytes, const std::vector<EvictionCandidate>& candidates) = 0;
 
  protected:
 	/// Opt-in aging/starvation check a concrete policy's own
@@ -340,7 +364,6 @@ class FifoReplacementPolicy final : public ReplacementPolicy {
 	bool onRelocationTrigger() override;
 	bool hasPendingCandidates() const override;
 	std::optional<PromotionCandidate> selectNextPromotionCandidate() override;
-	std::optional<VectorId> selectNextEvictionCandidate(VectorId excluded) override;
 	std::optional<VectorId> selectEvictionCandidate(
 			VectorId excluded, std::size_t required_bytes,
 			const std::vector<EvictionCandidate>& candidates) override;
@@ -370,11 +393,12 @@ class FifoReplacementPolicy final : public ReplacementPolicy {
 /// Becoming resident (selectNextPromotionCandidate() granting a candidate
 /// for the first time) counts as a "use" and inserts at the most-recently-
 /// used (back) end; onAnchorTouched() splices an already-tracked Anchor
-/// there too; selectNextEvictionCandidate() scans from the least-recently-
+/// there too; selectEvictionCandidate() scans from the least-recently-
 /// used (front) end, mirroring FifoReplacementPolicy's linear scan of
-/// promoted_order_ (skipping `excluded`) -- only called during a capacity
-/// retry, not a hot path, so the linear skip-scan is not a concern here
-/// either.
+/// promoted_order_ (skipping `excluded` and anything not in the passed
+/// `candidates`) -- only called from buildRelocationPlan()'s
+/// victim-selection loop, not a hot path, so the linear skip-scan is not a
+/// concern here either.
 class LruReplacementPolicy final : public ReplacementPolicy {
  public:
 	void enqueueCandidate(PromotionCandidate candidate) override;
@@ -390,7 +414,6 @@ class LruReplacementPolicy final : public ReplacementPolicy {
 	bool onRelocationTrigger() override;
 	bool hasPendingCandidates() const override;
 	std::optional<PromotionCandidate> selectNextPromotionCandidate() override;
-	std::optional<VectorId> selectNextEvictionCandidate(VectorId excluded) override;
 	std::optional<VectorId> selectEvictionCandidate(
 			VectorId excluded, std::size_t required_bytes,
 			const std::vector<EvictionCandidate>& candidates) override;
@@ -427,7 +450,7 @@ class LruReplacementPolicy final : public ReplacementPolicy {
 /// its current bucket to bucket[freq+1] (O(1) list splice once the bucket
 /// is located); becoming resident starts an Anchor at bucket[1] (an
 /// implicit first "use", mirroring LRU/Clock's own treatment of grant-time).
-/// selectNextEvictionCandidate() walks buckets in ascending frequency order
+/// selectEvictionCandidate() walks buckets in ascending frequency order
 /// (cheap: only ever as many buckets as distinct frequencies in play, and
 /// stops at the first non-excluded match) -- ties within a bucket break
 /// FIFO (whichever reached that frequency first), a simpler tie-break than
@@ -446,7 +469,6 @@ class LfuReplacementPolicy final : public ReplacementPolicy {
 	bool onRelocationTrigger() override;
 	bool hasPendingCandidates() const override;
 	std::optional<PromotionCandidate> selectNextPromotionCandidate() override;
-	std::optional<VectorId> selectNextEvictionCandidate(VectorId excluded) override;
 	std::optional<VectorId> selectEvictionCandidate(
 			VectorId excluded, std::size_t required_bytes,
 			const std::vector<EvictionCandidate>& candidates) override;
@@ -476,7 +498,7 @@ class LfuReplacementPolicy final : public ReplacementPolicy {
 /// {anchor_id, referenced} pairs) plus a hash map of ring indices
 /// (`position_`) for O(1) lookup, and a sweeping `hand_` index.
 /// onAnchorTouched() just sets the located slot's `referenced` bit.
-/// selectNextEvictionCandidate() walks forward from `hand_`: an Anchor with
+/// selectEvictionCandidate() walks forward from `hand_`: an Anchor with
 /// `referenced == true` is given a second chance (bit cleared, hand
 /// advances past it) instead of being evicted immediately; the first
 /// non-excluded Anchor found with `referenced == false` is the victim
@@ -504,7 +526,6 @@ class ClockReplacementPolicy final : public ReplacementPolicy {
 	bool onRelocationTrigger() override;
 	bool hasPendingCandidates() const override;
 	std::optional<PromotionCandidate> selectNextPromotionCandidate() override;
-	std::optional<VectorId> selectNextEvictionCandidate(VectorId excluded) override;
 	std::optional<VectorId> selectEvictionCandidate(
 			VectorId excluded, std::size_t required_bytes,
 			const std::vector<EvictionCandidate>& candidates) override;
@@ -579,7 +600,6 @@ class TwoQReplacementPolicy final : public ReplacementPolicy {
 	bool onRelocationTrigger() override;
 	bool hasPendingCandidates() const override;
 	std::optional<PromotionCandidate> selectNextPromotionCandidate() override;
-	std::optional<VectorId> selectNextEvictionCandidate(VectorId excluded) override;
 	std::optional<VectorId> selectEvictionCandidate(
 			VectorId excluded, std::size_t required_bytes,
 			const std::vector<EvictionCandidate>& candidates) override;
@@ -630,10 +650,10 @@ class CostAwareReplacementPolicy final : public ReplacementPolicy {
 	/// own, separately-locked queue -- never touches mutex_) and returns.
 	/// The actual heat update happens later, in drainTouchQueueLocked(),
 	/// called from the Coordinator thread wherever resident_'s heat is about
-	/// to be read (evaluateAdmission(), selectEvictionCandidate(),
-	/// selectNextEvictionCandidate()) -- unlike this call, always from the
-	/// Coordinator thread and always while mutex_ is already held, so it
-	/// adds no new lock acquisition on that side either. See the latency-
+	/// to be read (evaluateAdmission(), selectEvictionCandidate()) -- unlike
+	/// this call, always from the Coordinator thread and always while
+	/// mutex_ is already held, so it adds no new lock acquisition on that
+	/// side either. See the latency-
 	/// tracing report entry this was added for: mutex_ is also what
 	/// evaluateAdmission()'s own O(eviction_candidates) scan holds for the
 	/// scan's whole duration, and a worker thread's onAnchorTouched() used to
@@ -645,7 +665,6 @@ class CostAwareReplacementPolicy final : public ReplacementPolicy {
 	bool onRelocationTrigger() override;
 	bool hasPendingCandidates() const override;
 	std::optional<PromotionCandidate> selectNextPromotionCandidate() override;
-	std::optional<VectorId> selectNextEvictionCandidate(VectorId excluded) override;
 	AdmissionDecision evaluateAdmission(const PromotionCandidate& candidate,
 															 const AdmissionContext& context) override;
 	void onPromotionCommitted(VectorId anchor_id, const AdmissionContext& context) override;

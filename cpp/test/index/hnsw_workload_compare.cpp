@@ -62,6 +62,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -184,11 +185,27 @@ struct Args {
 	// reclaimability rule, unchanged unless explicitly raised).
 	double group_merge_overlap_threshold = 0.5;
 	std::size_t max_eviction_group_size = 1;
+	// CoordinatorConfig::trigger_interval passthrough, milliseconds -- the
+	// coalescing window between the first prepared candidate and batch
+	// commit (see that field's own doc comment, region_manager.hpp), not an
+	// intake polling interval. Default matches CoordinatorConfig's own.
+	std::uint64_t trigger_interval_ms = 100;
 	// Which ReplacementPolicy the arachne engine's Controller uses -- see
 	// MakeReplacementPolicy() below for the accepted names. Defaults to
 	// nullptr passthrough (Controller's own default, CostAwareReplacementPolicy)
 	// to match every existing caller/script.
 	std::string replacement_policy = "cost_aware";
+	// CostAwareReplacementConfig knobs, exposed only for --replacement-policy
+	// cost_aware -- each stays std::nullopt (i.e. CostAwareReplacementConfig's
+	// own default) unless its flag is explicitly passed, so an unmodified
+	// invocation is still byte-for-byte the same nullptr passthrough as
+	// before these existed (see MakeReplacementPolicy()'s own comment).
+	std::optional<std::uint64_t> cost_aware_minimum_observations;
+	std::optional<std::uint64_t> cost_aware_heat_half_life_ms;
+	std::optional<std::uint64_t> cost_aware_minimum_residency_ms;
+	std::optional<double> cost_aware_admission_hysteresis;
+	std::optional<double> cost_aware_potential_writeback_weight;
+	std::optional<std::size_t> cost_aware_maximum_incremental_bytes;
 	// If non-empty, RunArachneController() skips index.build() and calls
 	// index.loadFrom(load_index_path) instead -- see the class's own
 	// exportTo()/loadFrom() (hnswlib's saveIndex()/loadIndex() wrapped, see
@@ -237,9 +254,37 @@ DistanceMetric ParseMetric(const std::string& s) {
 // itself" -- kept distinct from explicitly naming "cost_aware" purely so
 // --replacement-policy cost_aware and omitting the flag entirely are
 // observably the same thing (both end up nullptr), matching every existing
-// script/caller that never passed a replacement_policy argument at all.
-std::unique_ptr<ReplacementPolicy> MakeReplacementPolicy(const std::string& name) {
-	if (name == "cost_aware") return nullptr;
+// script/caller that never passed a replacement_policy argument at all. Still
+// true when none of the --cost-aware-* knobs below are passed either; the
+// moment even one is, this explicitly constructs a CostAwareReplacementPolicy
+// instead, starting from CostAwareReplacementConfig{}'s own defaults and
+// overriding only the fields that were actually given.
+std::unique_ptr<ReplacementPolicy> MakeReplacementPolicy(const Args& args) {
+	const std::string& name = args.replacement_policy;
+	if (name == "cost_aware") {
+		bool any_override = args.cost_aware_minimum_observations.has_value() ||
+				args.cost_aware_heat_half_life_ms.has_value() || args.cost_aware_minimum_residency_ms.has_value() ||
+				args.cost_aware_admission_hysteresis.has_value() ||
+				args.cost_aware_potential_writeback_weight.has_value() ||
+				args.cost_aware_maximum_incremental_bytes.has_value();
+		if (!any_override) return nullptr;
+		CostAwareReplacementConfig config;
+		if (args.cost_aware_minimum_observations) config.minimum_observations = *args.cost_aware_minimum_observations;
+		if (args.cost_aware_heat_half_life_ms) {
+			config.heat_half_life = std::chrono::milliseconds(*args.cost_aware_heat_half_life_ms);
+		}
+		if (args.cost_aware_minimum_residency_ms) {
+			config.minimum_residency = std::chrono::milliseconds(*args.cost_aware_minimum_residency_ms);
+		}
+		if (args.cost_aware_admission_hysteresis) config.admission_hysteresis = *args.cost_aware_admission_hysteresis;
+		if (args.cost_aware_potential_writeback_weight) {
+			config.potential_writeback_weight = *args.cost_aware_potential_writeback_weight;
+		}
+		if (args.cost_aware_maximum_incremental_bytes) {
+			config.maximum_incremental_bytes = *args.cost_aware_maximum_incremental_bytes;
+		}
+		return std::make_unique<CostAwareReplacementPolicy>(config);
+	}
 	if (name == "fifo") return std::make_unique<FifoReplacementPolicy>();
 	if (name == "lru") return std::make_unique<LruReplacementPolicy>();
 	if (name == "lfu") return std::make_unique<LfuReplacementPolicy>();
@@ -283,8 +328,23 @@ void PrintUsage(const char* argv0) {
 			"  --max-eviction-group-size N  CoordinatorConfig::max_eviction_group_size (default 1 -- every\n"
 			"                          Anchor its own singleton group, i.e. no behavior change from before\n"
 			"                          group-based eviction existed; raise to actually enable it)\n"
+			"  --trigger-interval-ms N  CoordinatorConfig::trigger_interval, milliseconds (default 100 --\n"
+			"                          coalescing window between the first prepared candidate and batch\n"
+			"                          commit, not an intake polling interval)\n"
 			"  --replacement-policy NAME  cost_aware|fifo|lru|lfu|clock|twoq (default cost_aware, Controller's\n"
 			"                          own default -- see MakeReplacementPolicy())\n"
+			"  --cost-aware-min-observations N       CostAwareReplacementConfig::minimum_observations\n"
+			"                          (default 1; --replacement-policy cost_aware only, ignored otherwise)\n"
+			"  --cost-aware-heat-half-life-ms N      CostAwareReplacementConfig::heat_half_life, milliseconds\n"
+			"                          (default 5000)\n"
+			"  --cost-aware-min-residency-ms N       CostAwareReplacementConfig::minimum_residency, ms\n"
+			"                          (default 0 -- no protection window)\n"
+			"  --cost-aware-admission-hysteresis N   CostAwareReplacementConfig::admission_hysteresis\n"
+			"                          (default 1.0 -- no margin over the best victim's density)\n"
+			"  --cost-aware-writeback-weight N        CostAwareReplacementConfig::potential_writeback_weight\n"
+			"                          (default 0.0 -- off)\n"
+			"  --cost-aware-max-incremental-bytes N   CostAwareReplacementConfig::maximum_incremental_bytes\n"
+			"                          (default 0 -- unlimited)\n"
 			"  --load-index PATH       skip index.build(), call index.loadFrom(PATH) instead (arachne engine\n"
 			"                          only) -- for reusing one pre-built graph across many policy/batch runs\n"
 			"  --save-index PATH       after a real build (not --load-index), call index.exportTo(PATH)\n"
@@ -353,8 +413,22 @@ ParseOutcome ParseArgs(int argc, char** argv, Args& args) {
 			args.group_merge_overlap_threshold = std::stod(next("--group-merge-overlap-threshold"));
 		} else if (arg == "--max-eviction-group-size") {
 			args.max_eviction_group_size = std::stoull(next("--max-eviction-group-size"));
+		} else if (arg == "--trigger-interval-ms") {
+			args.trigger_interval_ms = std::stoull(next("--trigger-interval-ms"));
 		} else if (arg == "--replacement-policy") {
 			args.replacement_policy = next("--replacement-policy");
+		} else if (arg == "--cost-aware-min-observations") {
+			args.cost_aware_minimum_observations = std::stoull(next("--cost-aware-min-observations"));
+		} else if (arg == "--cost-aware-heat-half-life-ms") {
+			args.cost_aware_heat_half_life_ms = std::stoull(next("--cost-aware-heat-half-life-ms"));
+		} else if (arg == "--cost-aware-min-residency-ms") {
+			args.cost_aware_minimum_residency_ms = std::stoull(next("--cost-aware-min-residency-ms"));
+		} else if (arg == "--cost-aware-admission-hysteresis") {
+			args.cost_aware_admission_hysteresis = std::stod(next("--cost-aware-admission-hysteresis"));
+		} else if (arg == "--cost-aware-writeback-weight") {
+			args.cost_aware_potential_writeback_weight = std::stod(next("--cost-aware-writeback-weight"));
+		} else if (arg == "--cost-aware-max-incremental-bytes") {
+			args.cost_aware_maximum_incremental_bytes = std::stoull(next("--cost-aware-max-incremental-bytes"));
 		} else if (arg == "--load-index") {
 			args.load_index_path = next("--load-index");
 		} else if (arg == "--save-index") {
@@ -573,7 +647,8 @@ EngineReport RunArachneController(const Args& args, const WorkloadLayout& layout
 	CoordinatorConfig coordinator_config;
 	coordinator_config.group_merge_overlap_threshold = args.group_merge_overlap_threshold;
 	coordinator_config.max_eviction_group_size = args.max_eviction_group_size;
-	Controller controller(index, routing_cache, scheduling_config, MakeReplacementPolicy(args.replacement_policy),
+	coordinator_config.trigger_interval = std::chrono::milliseconds(args.trigger_interval_ms);
+	Controller controller(index, routing_cache, scheduling_config, MakeReplacementPolicy(args),
 			args.gpu_data_budget_bytes, gpu::kDefaultMetadataPoolBytes, gpu::kDefaultUnitBytes, nullptr,
 			coordinator_config);
 	index.registerAllRegions(controller);
@@ -779,13 +854,34 @@ int main(int argc, char** argv) {
 			"  M=%zu ef_construction=%zu ef_search=%zu stream_top_k=%u\n"
 			"  vectors_per_region=%zu gpu_budget_bytes=%zu exec_threads=%zu client_threads=%zu "
 			"eval_affects_policy=%s\n"
-			"  replacement_policy=%s traverse_batch_size=%zu modify_batch_size=%zu batch_wait_timeout_us=%llu\n",
+			"  replacement_policy=%s traverse_batch_size=%zu modify_batch_size=%zu batch_wait_timeout_us=%llu "
+			"trigger_interval_ms=%llu\n",
 			args.workload_dir.c_str(), args.engine.c_str(), layout.dim, sizing.effective_num_base,
 			layout.base_pool_count, args.limit_base, sizing.effective_num_steps, layout.num_steps, args.limit_steps,
 			sizing.total_insert, sizing.capacity, args.m, args.ef_construction, args.ef_search, args.stream_top_k,
 			args.vectors_per_region, args.gpu_data_budget_bytes, args.max_execution_threads, args.client_threads,
 			args.eval_affects_policy ? "true" : "false", args.replacement_policy.c_str(), args.traverse_batch_size,
-			args.modify_batch_size, static_cast<unsigned long long>(args.batch_wait_timeout_us));
+			args.modify_batch_size, static_cast<unsigned long long>(args.batch_wait_timeout_us),
+			static_cast<unsigned long long>(args.trigger_interval_ms));
+	if (args.replacement_policy == "cost_aware") {
+		// Resolved values, not just what was passed -- an unset flag still
+		// prints CostAwareReplacementConfig{}'s own default here, so a sweep
+		// script's logs are self-describing regardless of which knobs it
+		// actually overrode.
+		CostAwareReplacementConfig defaults;
+		std::printf(
+				"  cost_aware: min_observations=%llu heat_half_life_ms=%lld min_residency_ms=%lld "
+				"admission_hysteresis=%g writeback_weight=%g max_incremental_bytes=%zu\n",
+				static_cast<unsigned long long>(
+						args.cost_aware_minimum_observations.value_or(defaults.minimum_observations)),
+				static_cast<long long>(args.cost_aware_heat_half_life_ms.value_or(
+						static_cast<std::uint64_t>(defaults.heat_half_life.count()))),
+				static_cast<long long>(args.cost_aware_minimum_residency_ms.value_or(
+						static_cast<std::uint64_t>(defaults.minimum_residency.count()))),
+				args.cost_aware_admission_hysteresis.value_or(defaults.admission_hysteresis),
+				args.cost_aware_potential_writeback_weight.value_or(defaults.potential_writeback_weight),
+				args.cost_aware_maximum_incremental_bytes.value_or(defaults.maximum_incremental_bytes));
+	}
 	if (args.limit_base != 0 && args.limit_base < layout.base_pool_count) {
 		std::printf(
 				"  WARNING: --limit-base (%zu) < full base pool (%zu) -- the workload's own groundtruth was\n"

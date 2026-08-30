@@ -13,6 +13,7 @@
 
 namespace {
 
+using arachne::EvictionCandidate;
 using arachne::HostRegionView;
 using arachne::LeaseHandle;
 using arachne::PromotionCandidate;
@@ -66,7 +67,9 @@ class RecordingReplacementPolicy : public ReplacementPolicy {
 	bool onRelocationTrigger() override { return false; }
 	bool hasPendingCandidates() const override { return false; }
 	std::optional<PromotionCandidate> selectNextPromotionCandidate() override { return std::nullopt; }
-	std::optional<VectorId> selectNextEvictionCandidate(VectorId) override { return std::nullopt; }
+	std::optional<VectorId> selectEvictionCandidate(VectorId, std::size_t, const std::vector<EvictionCandidate>&) override {
+		return std::nullopt;
+	}
 
  private:
 	RecordedPolicyEvents* events_;

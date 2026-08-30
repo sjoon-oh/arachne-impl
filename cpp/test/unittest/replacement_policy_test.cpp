@@ -17,7 +17,7 @@
 //     round-tripping through PromotionCandidate.
 //   - hasPendingCandidates() / onRelocationTrigger(): both reduce to "is
 //     there anything admitted but not yet selected".
-//   - selectNextEvictionCandidate(): the part that actually differs per
+//   - selectEvictionCandidate(): the part that actually differs per
 //     policy --
 //       Fifo:  oldest-granted-first.
 //       Lru:   least-recently-touched-first; becoming resident itself
@@ -59,6 +59,24 @@ using arachne::TwoQReplacementPolicy;
 using arachne::VectorId;
 
 PromotionCandidate MakeCandidate(VectorId anchor_id) { return PromotionCandidate{anchor_id, RegionFootprint{}}; }
+
+// Builds the `candidates` argument selectEvictionCandidate() now requires
+// (it used to be reachable via the two-method split's legacy
+// selectNextEvictionCandidate(excluded)-only entry point -- see
+// cpp/test/index/report/ for that cleanup). These tests are exercising each
+// policy's own tracked eviction *order* (FIFO/recency/frequency/ring
+// position/queue membership), not ContainsCandidate()'s filter itself, so
+// each call site passes every anchor id that test enqueues -- a safe
+// superset the filter never needs to narrow for what these tests check.
+std::vector<EvictionCandidate> Candidates(std::initializer_list<VectorId> ids) {
+	std::vector<EvictionCandidate> result;
+	for (VectorId id : ids) {
+		EvictionCandidate candidate;
+		candidate.anchor_id = id;
+		result.push_back(candidate);
+	}
+	return result;
+}
 
 // ---------------------------------------------------------------------------
 // selectNextPromotionCandidate(): admission order (the MPSC-queue-consumer
@@ -140,15 +158,15 @@ TEST(FifoReplacementPolicyTest, HasPendingCandidatesAndOnRelocationTriggerReflec
 }
 
 // ---------------------------------------------------------------------------
-// selectNextEvictionCandidate(): populated as a side effect of
+// selectEvictionCandidate(): populated as a side effect of
 // selectNextPromotionCandidate() (see that method's doc comment) -- there is
 // no separate grant-time notification.
 // ---------------------------------------------------------------------------
 
-TEST(FifoReplacementPolicyTest, SelectNextEvictionCandidateIsNulloptBeforeAnyPromotionSelected) {
+TEST(FifoReplacementPolicyTest, SelectEvictionCandidateIsNulloptBeforeAnyPromotionSelected) {
 	FifoReplacementPolicy policy;
 	policy.enqueueCandidate(MakeCandidate(1));  // admitted, but never selected
-	EXPECT_FALSE(policy.selectNextEvictionCandidate(/*excluded=*/0).has_value());
+	EXPECT_FALSE(policy.selectEvictionCandidate(/*excluded=*/0, /*required_bytes=*/0, Candidates({1})).has_value());
 }
 
 TEST(FifoReplacementPolicyTest, SelectingAPromotionCandidateMakesItEvictionEligible) {
@@ -156,12 +174,12 @@ TEST(FifoReplacementPolicyTest, SelectingAPromotionCandidateMakesItEvictionEligi
 	policy.enqueueCandidate(MakeCandidate(1));
 	policy.selectNextPromotionCandidate();  // records anchor 1 for eviction ordering
 
-	auto candidate = policy.selectNextEvictionCandidate(/*excluded=*/0);
+	auto candidate = policy.selectEvictionCandidate(/*excluded=*/0, /*required_bytes=*/0, Candidates({1}));
 	ASSERT_TRUE(candidate.has_value());
 	EXPECT_EQ(*candidate, 1u);
 }
 
-TEST(FifoReplacementPolicyTest, SelectNextEvictionCandidateReturnsOldestSelectedFirst) {
+TEST(FifoReplacementPolicyTest, SelectEvictionCandidateReturnsOldestSelectedFirst) {
 	FifoReplacementPolicy policy;
 	policy.enqueueCandidate(MakeCandidate(1));
 	policy.enqueueCandidate(MakeCandidate(2));
@@ -170,29 +188,29 @@ TEST(FifoReplacementPolicyTest, SelectNextEvictionCandidateReturnsOldestSelected
 	policy.selectNextPromotionCandidate();
 	policy.selectNextPromotionCandidate();
 
-	auto candidate = policy.selectNextEvictionCandidate(/*excluded=*/0);
+	auto candidate = policy.selectEvictionCandidate(/*excluded=*/0, /*required_bytes=*/0, Candidates({1, 2, 3}));
 	ASSERT_TRUE(candidate.has_value());
 	EXPECT_EQ(*candidate, 1u);
 }
 
-TEST(FifoReplacementPolicyTest, SelectNextEvictionCandidateSkipsExcluded) {
+TEST(FifoReplacementPolicyTest, SelectEvictionCandidateSkipsExcluded) {
 	FifoReplacementPolicy policy;
 	policy.enqueueCandidate(MakeCandidate(1));
 	policy.enqueueCandidate(MakeCandidate(2));
 	policy.selectNextPromotionCandidate();
 	policy.selectNextPromotionCandidate();
 
-	auto candidate = policy.selectNextEvictionCandidate(/*excluded=*/1);
+	auto candidate = policy.selectEvictionCandidate(/*excluded=*/1, /*required_bytes=*/0, Candidates({1, 2}));
 	ASSERT_TRUE(candidate.has_value());
 	EXPECT_EQ(*candidate, 2u);
 }
 
-TEST(FifoReplacementPolicyTest, SelectNextEvictionCandidateIsNulloptWhenOnlyExcludedIsSelected) {
+TEST(FifoReplacementPolicyTest, SelectEvictionCandidateIsNulloptWhenOnlyExcludedIsSelected) {
 	FifoReplacementPolicy policy;
 	policy.enqueueCandidate(MakeCandidate(1));
 	policy.selectNextPromotionCandidate();
 
-	EXPECT_FALSE(policy.selectNextEvictionCandidate(/*excluded=*/1).has_value());
+	EXPECT_FALSE(policy.selectEvictionCandidate(/*excluded=*/1, /*required_bytes=*/0, Candidates({1})).has_value());
 }
 
 TEST(FifoReplacementPolicyTest, ReSelectingTheSameAnchorDoesNotReorderEvictionOrder) {
@@ -207,7 +225,7 @@ TEST(FifoReplacementPolicyTest, ReSelectingTheSameAnchorDoesNotReorderEvictionOr
 	policy.selectNextPromotionCandidate();      // 2
 	policy.selectNextPromotionCandidate();      // 1 again
 
-	auto candidate = policy.selectNextEvictionCandidate(/*excluded=*/0);
+	auto candidate = policy.selectEvictionCandidate(/*excluded=*/0, /*required_bytes=*/0, Candidates({1, 2}));
 	ASSERT_TRUE(candidate.has_value());
 	EXPECT_EQ(*candidate, 1u);
 }
@@ -226,7 +244,7 @@ TEST(FifoReplacementPolicyTest, OnAnchorEvictedRemovesAnAlreadySelectedAnchorFro
 
 	policy.onAnchorEvicted(1);
 
-	auto candidate = policy.selectNextEvictionCandidate(/*excluded=*/0);
+	auto candidate = policy.selectEvictionCandidate(/*excluded=*/0, /*required_bytes=*/0, Candidates({1, 2}));
 	ASSERT_TRUE(candidate.has_value());
 	EXPECT_EQ(*candidate, 2u);
 }
@@ -256,7 +274,7 @@ TEST(FifoReplacementPolicyTest, OnAnchorEvictedOfUntrackedAnchorIsANoop) {
 
 	EXPECT_NO_THROW(policy.onAnchorEvicted(999));
 
-	auto candidate = policy.selectNextEvictionCandidate(/*excluded=*/0);
+	auto candidate = policy.selectEvictionCandidate(/*excluded=*/0, /*required_bytes=*/0, Candidates({1}));
 	ASSERT_TRUE(candidate.has_value());
 	EXPECT_EQ(*candidate, 1u);
 }
@@ -272,7 +290,7 @@ TEST(FifoReplacementPolicyTest, ReAdmittingAnEvictedAnchorGoesToTheBack) {
 	policy.enqueueCandidate(MakeCandidate(1));  // re-admitted
 	policy.selectNextPromotionCandidate();      // selected again -- should now be newer than 2
 
-	auto candidate = policy.selectNextEvictionCandidate(/*excluded=*/0);
+	auto candidate = policy.selectEvictionCandidate(/*excluded=*/0, /*required_bytes=*/0, Candidates({1, 2}));
 	ASSERT_TRUE(candidate.has_value());
 	EXPECT_EQ(*candidate, 2u);
 }
@@ -292,7 +310,7 @@ TEST(FifoReplacementPolicyTest, OnAnchorTouchedDoesNotAffectEvictionOrder) {
 	policy.onAnchorTouched(1);
 	policy.onAnchorTouched(1);
 
-	auto candidate = policy.selectNextEvictionCandidate(/*excluded=*/0);
+	auto candidate = policy.selectEvictionCandidate(/*excluded=*/0, /*required_bytes=*/0, Candidates({1, 2}));
 	ASSERT_TRUE(candidate.has_value());
 	EXPECT_EQ(*candidate, 1u);
 }
@@ -351,15 +369,15 @@ TEST(LruReplacementPolicyTest, HasPendingCandidatesAndOnRelocationTriggerReflect
 }
 
 // ---------------------------------------------------------------------------
-// selectNextEvictionCandidate(): unlike FIFO, ordered by recency of actual
+// selectEvictionCandidate(): unlike FIFO, ordered by recency of actual
 // use (onAnchorTouched()), not by promotion order -- becoming resident
 // (selection) itself counts as an initial "use".
 // ---------------------------------------------------------------------------
 
-TEST(LruReplacementPolicyTest, SelectNextEvictionCandidateIsNulloptBeforeAnyPromotionSelected) {
+TEST(LruReplacementPolicyTest, SelectEvictionCandidateIsNulloptBeforeAnyPromotionSelected) {
 	LruReplacementPolicy policy;
 	policy.enqueueCandidate(MakeCandidate(1));  // admitted, but never selected
-	EXPECT_FALSE(policy.selectNextEvictionCandidate(/*excluded=*/0).has_value());
+	EXPECT_FALSE(policy.selectEvictionCandidate(/*excluded=*/0, /*required_bytes=*/0, Candidates({1})).has_value());
 }
 
 TEST(LruReplacementPolicyTest, SelectingAPromotionCandidateMakesItEvictionEligible) {
@@ -367,12 +385,12 @@ TEST(LruReplacementPolicyTest, SelectingAPromotionCandidateMakesItEvictionEligib
 	policy.enqueueCandidate(MakeCandidate(1));
 	policy.selectNextPromotionCandidate();  // becoming resident counts as a use
 
-	auto candidate = policy.selectNextEvictionCandidate(/*excluded=*/0);
+	auto candidate = policy.selectEvictionCandidate(/*excluded=*/0, /*required_bytes=*/0, Candidates({1}));
 	ASSERT_TRUE(candidate.has_value());
 	EXPECT_EQ(*candidate, 1u);
 }
 
-TEST(LruReplacementPolicyTest, SelectNextEvictionCandidateReturnsLeastRecentlyUsedFirst) {
+TEST(LruReplacementPolicyTest, SelectEvictionCandidateReturnsLeastRecentlyUsedFirst) {
 	LruReplacementPolicy policy;
 	policy.enqueueCandidate(MakeCandidate(1));
 	policy.enqueueCandidate(MakeCandidate(2));
@@ -383,7 +401,7 @@ TEST(LruReplacementPolicyTest, SelectNextEvictionCandidateReturnsLeastRecentlyUs
 
 	// No onAnchorTouched() calls yet -- residency order is still the
 	// recency order, so the least-recently-used is the first one promoted.
-	auto candidate = policy.selectNextEvictionCandidate(/*excluded=*/0);
+	auto candidate = policy.selectEvictionCandidate(/*excluded=*/0, /*required_bytes=*/0, Candidates({1, 2, 3}));
 	ASSERT_TRUE(candidate.has_value());
 	EXPECT_EQ(*candidate, 1u);
 }
@@ -402,7 +420,7 @@ TEST(LruReplacementPolicyTest, OnAnchorTouchedMovesAnchorToTheMostRecentlyUsedEn
 	policy.onAnchorTouched(1);  // 1 is now the most-recently-used
 
 	// Least-recently-used is now 2, not 1.
-	auto candidate = policy.selectNextEvictionCandidate(/*excluded=*/0);
+	auto candidate = policy.selectEvictionCandidate(/*excluded=*/0, /*required_bytes=*/0, Candidates({1, 2, 3}));
 	ASSERT_TRUE(candidate.has_value());
 	EXPECT_EQ(*candidate, 2u);
 }
@@ -420,29 +438,29 @@ TEST(LruReplacementPolicyTest, RepeatedTouchesKeepPromotingTheSameAnchorToTheBac
 
 	// 1 was touched (repeatedly) more recently than 2 was ever touched --
 	// eviction order unaffected by touch *count*, only by recency.
-	auto candidate = policy.selectNextEvictionCandidate(/*excluded=*/0);
+	auto candidate = policy.selectEvictionCandidate(/*excluded=*/0, /*required_bytes=*/0, Candidates({1, 2}));
 	ASSERT_TRUE(candidate.has_value());
 	EXPECT_EQ(*candidate, 2u);
 }
 
-TEST(LruReplacementPolicyTest, SelectNextEvictionCandidateSkipsExcluded) {
+TEST(LruReplacementPolicyTest, SelectEvictionCandidateSkipsExcluded) {
 	LruReplacementPolicy policy;
 	policy.enqueueCandidate(MakeCandidate(1));
 	policy.enqueueCandidate(MakeCandidate(2));
 	policy.selectNextPromotionCandidate();
 	policy.selectNextPromotionCandidate();
 
-	auto candidate = policy.selectNextEvictionCandidate(/*excluded=*/1);
+	auto candidate = policy.selectEvictionCandidate(/*excluded=*/1, /*required_bytes=*/0, Candidates({1, 2}));
 	ASSERT_TRUE(candidate.has_value());
 	EXPECT_EQ(*candidate, 2u);
 }
 
-TEST(LruReplacementPolicyTest, SelectNextEvictionCandidateIsNulloptWhenOnlyExcludedIsSelected) {
+TEST(LruReplacementPolicyTest, SelectEvictionCandidateIsNulloptWhenOnlyExcludedIsSelected) {
 	LruReplacementPolicy policy;
 	policy.enqueueCandidate(MakeCandidate(1));
 	policy.selectNextPromotionCandidate();
 
-	EXPECT_FALSE(policy.selectNextEvictionCandidate(/*excluded=*/1).has_value());
+	EXPECT_FALSE(policy.selectEvictionCandidate(/*excluded=*/1, /*required_bytes=*/0, Candidates({1})).has_value());
 }
 
 TEST(LruReplacementPolicyTest, ReSelectingTheSameAnchorDoesNotResetItsRecency) {
@@ -456,7 +474,7 @@ TEST(LruReplacementPolicyTest, ReSelectingTheSameAnchorDoesNotResetItsRecency) {
 	policy.selectNextPromotionCandidate();      // 2
 	policy.selectNextPromotionCandidate();      // 1 again -- already tracked, recency unchanged
 
-	auto candidate = policy.selectNextEvictionCandidate(/*excluded=*/0);
+	auto candidate = policy.selectEvictionCandidate(/*excluded=*/0, /*required_bytes=*/0, Candidates({1, 2}));
 	ASSERT_TRUE(candidate.has_value());
 	EXPECT_EQ(*candidate, 1u);
 }
@@ -475,7 +493,7 @@ TEST(LruReplacementPolicyTest, OnAnchorEvictedRemovesAnAlreadySelectedAnchorFrom
 
 	policy.onAnchorEvicted(1);
 
-	auto candidate = policy.selectNextEvictionCandidate(/*excluded=*/0);
+	auto candidate = policy.selectEvictionCandidate(/*excluded=*/0, /*required_bytes=*/0, Candidates({1, 2}));
 	ASSERT_TRUE(candidate.has_value());
 	EXPECT_EQ(*candidate, 2u);
 }
@@ -501,7 +519,7 @@ TEST(LruReplacementPolicyTest, OnAnchorEvictedOfUntrackedAnchorIsANoop) {
 
 	EXPECT_NO_THROW(policy.onAnchorEvicted(999));
 
-	auto candidate = policy.selectNextEvictionCandidate(/*excluded=*/0);
+	auto candidate = policy.selectEvictionCandidate(/*excluded=*/0, /*required_bytes=*/0, Candidates({1}));
 	ASSERT_TRUE(candidate.has_value());
 	EXPECT_EQ(*candidate, 1u);
 }
@@ -522,7 +540,7 @@ TEST(LruReplacementPolicyTest, ReAdmittingAnEvictedAnchorGoesToTheMostRecentlyUs
 	policy.enqueueCandidate(MakeCandidate(1));  // re-admitted
 	policy.selectNextPromotionCandidate();      // selected (== used) again -- newer than 2
 
-	auto candidate = policy.selectNextEvictionCandidate(/*excluded=*/0);
+	auto candidate = policy.selectEvictionCandidate(/*excluded=*/0, /*required_bytes=*/0, Candidates({1, 2}));
 	ASSERT_TRUE(candidate.has_value());
 	EXPECT_EQ(*candidate, 2u);
 }
@@ -568,13 +586,13 @@ TEST(LfuReplacementPolicyTest, HasPendingCandidatesAndOnRelocationTriggerReflect
 	EXPECT_FALSE(policy.onRelocationTrigger());
 }
 
-TEST(LfuReplacementPolicyTest, SelectNextEvictionCandidateIsNulloptBeforeAnyPromotionSelected) {
+TEST(LfuReplacementPolicyTest, SelectEvictionCandidateIsNulloptBeforeAnyPromotionSelected) {
 	LfuReplacementPolicy policy;
 	policy.enqueueCandidate(MakeCandidate(1));
-	EXPECT_FALSE(policy.selectNextEvictionCandidate(/*excluded=*/0).has_value());
+	EXPECT_FALSE(policy.selectEvictionCandidate(/*excluded=*/0, /*required_bytes=*/0, Candidates({1})).has_value());
 }
 
-TEST(LfuReplacementPolicyTest, SelectNextEvictionCandidateReturnsLowestFrequencyFirst) {
+TEST(LfuReplacementPolicyTest, SelectEvictionCandidateReturnsLowestFrequencyFirst) {
 	LfuReplacementPolicy policy;
 	policy.enqueueCandidate(MakeCandidate(1));
 	policy.enqueueCandidate(MakeCandidate(2));
@@ -583,7 +601,7 @@ TEST(LfuReplacementPolicyTest, SelectNextEvictionCandidateReturnsLowestFrequency
 
 	policy.onAnchorTouched(2);  // 2 -> freq 2, so 1 (freq 1) is now strictly less frequent
 
-	auto candidate = policy.selectNextEvictionCandidate(/*excluded=*/0);
+	auto candidate = policy.selectEvictionCandidate(/*excluded=*/0, /*required_bytes=*/0, Candidates({1, 2}));
 	ASSERT_TRUE(candidate.has_value());
 	EXPECT_EQ(*candidate, 1u);
 }
@@ -603,12 +621,12 @@ TEST(LfuReplacementPolicyTest, FrequentlyTouchedAnchorOutranksARecentlyTouchedOn
 	policy.enqueueCandidate(MakeCandidate(2));
 	policy.selectNextPromotionCandidate();  // 2 at freq 1, granted (touched) most recently
 
-	auto candidate = policy.selectNextEvictionCandidate(/*excluded=*/0);
+	auto candidate = policy.selectEvictionCandidate(/*excluded=*/0, /*required_bytes=*/0, Candidates({1, 2}));
 	ASSERT_TRUE(candidate.has_value());
 	EXPECT_EQ(*candidate, 2u);  // lower frequency, even though 1 is "older"
 }
 
-TEST(LfuReplacementPolicyTest, SelectNextEvictionCandidateSkipsExcludedAcrossFrequencyBuckets) {
+TEST(LfuReplacementPolicyTest, SelectEvictionCandidateSkipsExcludedAcrossFrequencyBuckets) {
 	// excluded is the *sole* occupant of the minimum-frequency bucket -- the
 	// scan must continue into the next bucket rather than stopping there.
 	LfuReplacementPolicy policy;
@@ -618,7 +636,7 @@ TEST(LfuReplacementPolicyTest, SelectNextEvictionCandidateSkipsExcludedAcrossFre
 	policy.selectNextPromotionCandidate();  // 2 at freq 1
 	policy.onAnchorTouched(2);              // 2 -> freq 2; 1 alone at freq 1
 
-	auto candidate = policy.selectNextEvictionCandidate(/*excluded=*/1);
+	auto candidate = policy.selectEvictionCandidate(/*excluded=*/1, /*required_bytes=*/0, Candidates({1, 2}));
 	ASSERT_TRUE(candidate.has_value());
 	EXPECT_EQ(*candidate, 2u);
 }
@@ -632,7 +650,7 @@ TEST(LfuReplacementPolicyTest, OnAnchorEvictedRemovesAnAlreadySelectedAnchorFrom
 
 	policy.onAnchorEvicted(1);
 
-	auto candidate = policy.selectNextEvictionCandidate(/*excluded=*/0);
+	auto candidate = policy.selectEvictionCandidate(/*excluded=*/0, /*required_bytes=*/0, Candidates({1, 2}));
 	ASSERT_TRUE(candidate.has_value());
 	EXPECT_EQ(*candidate, 2u);
 }
@@ -658,7 +676,7 @@ TEST(LfuReplacementPolicyTest, OnAnchorEvictedOfUntrackedAnchorIsANoop) {
 
 	EXPECT_NO_THROW(policy.onAnchorEvicted(999));
 
-	auto candidate = policy.selectNextEvictionCandidate(/*excluded=*/0);
+	auto candidate = policy.selectEvictionCandidate(/*excluded=*/0, /*required_bytes=*/0, Candidates({1}));
 	ASSERT_TRUE(candidate.has_value());
 	EXPECT_EQ(*candidate, 1u);
 }
@@ -684,7 +702,7 @@ TEST(LfuReplacementPolicyTest, ReAdmittingAnEvictedAnchorStartsBackAtFrequencyOn
 
 	// Both at freq 1 now -- tie broken FIFO (whichever reached this
 	// frequency first), so 1 (re-admitted before 2 arrived) comes first.
-	auto candidate = policy.selectNextEvictionCandidate(/*excluded=*/0);
+	auto candidate = policy.selectEvictionCandidate(/*excluded=*/0, /*required_bytes=*/0, Candidates({1, 2}));
 	ASSERT_TRUE(candidate.has_value());
 	EXPECT_EQ(*candidate, 1u);
 }
@@ -729,10 +747,10 @@ TEST(ClockReplacementPolicyTest, HasPendingCandidatesAndOnRelocationTriggerRefle
 	EXPECT_FALSE(policy.onRelocationTrigger());
 }
 
-TEST(ClockReplacementPolicyTest, SelectNextEvictionCandidateIsNulloptBeforeAnyPromotionSelected) {
+TEST(ClockReplacementPolicyTest, SelectEvictionCandidateIsNulloptBeforeAnyPromotionSelected) {
 	ClockReplacementPolicy policy;
 	policy.enqueueCandidate(MakeCandidate(1));
-	EXPECT_FALSE(policy.selectNextEvictionCandidate(/*excluded=*/0).has_value());
+	EXPECT_FALSE(policy.selectEvictionCandidate(/*excluded=*/0, /*required_bytes=*/0, Candidates({1})).has_value());
 }
 
 TEST(ClockReplacementPolicyTest, FreshlyGrantedAnchorsSurviveOneSweepThenBecomeEvictable) {
@@ -743,7 +761,7 @@ TEST(ClockReplacementPolicyTest, FreshlyGrantedAnchorsSurviveOneSweepThenBecomeE
 	policy.enqueueCandidate(MakeCandidate(1));
 	policy.selectNextPromotionCandidate();
 
-	auto candidate = policy.selectNextEvictionCandidate(/*excluded=*/0);
+	auto candidate = policy.selectEvictionCandidate(/*excluded=*/0, /*required_bytes=*/0, Candidates({1}));
 	ASSERT_TRUE(candidate.has_value());  // bounded 2-sweep scan still finds it on pass 2
 	EXPECT_EQ(*candidate, 1u);
 }
@@ -759,36 +777,36 @@ TEST(ClockReplacementPolicyTest, OnAnchorTouchedGivesAnAlreadyClearedEntryASecon
 	// hand_ on the first cleared slot (anchor 1) without evicting anyone.
 	// excluded=999 (nonexistent) makes this a pure probe -- the result is
 	// deliberately discarded.
-	policy.selectNextEvictionCandidate(/*excluded=*/999);
+	policy.selectEvictionCandidate(/*excluded=*/999, /*required_bytes=*/0, Candidates({1, 2}));
 
 	// hand_ is now parked on anchor 1's (cleared) slot. Touching it right
 	// now is the "second chance" -- it must survive the next sweep, which
 	// should instead clear and evict anchor 2 (never touched again).
 	policy.onAnchorTouched(1);
 
-	auto candidate = policy.selectNextEvictionCandidate(/*excluded=*/0);
+	auto candidate = policy.selectEvictionCandidate(/*excluded=*/0, /*required_bytes=*/0, Candidates({1, 2}));
 	ASSERT_TRUE(candidate.has_value());
 	EXPECT_EQ(*candidate, 2u);
 }
 
-TEST(ClockReplacementPolicyTest, SelectNextEvictionCandidateSkipsExcluded) {
+TEST(ClockReplacementPolicyTest, SelectEvictionCandidateSkipsExcluded) {
 	ClockReplacementPolicy policy;
 	policy.enqueueCandidate(MakeCandidate(1));
 	policy.enqueueCandidate(MakeCandidate(2));
 	policy.selectNextPromotionCandidate();
 	policy.selectNextPromotionCandidate();
 
-	auto candidate = policy.selectNextEvictionCandidate(/*excluded=*/1);
+	auto candidate = policy.selectEvictionCandidate(/*excluded=*/1, /*required_bytes=*/0, Candidates({1, 2}));
 	ASSERT_TRUE(candidate.has_value());
 	EXPECT_EQ(*candidate, 2u);
 }
 
-TEST(ClockReplacementPolicyTest, SelectNextEvictionCandidateIsNulloptWhenOnlyExcludedIsSelected) {
+TEST(ClockReplacementPolicyTest, SelectEvictionCandidateIsNulloptWhenOnlyExcludedIsSelected) {
 	ClockReplacementPolicy policy;
 	policy.enqueueCandidate(MakeCandidate(1));
 	policy.selectNextPromotionCandidate();
 
-	EXPECT_FALSE(policy.selectNextEvictionCandidate(/*excluded=*/1).has_value());
+	EXPECT_FALSE(policy.selectEvictionCandidate(/*excluded=*/1, /*required_bytes=*/0, Candidates({1})).has_value());
 }
 
 TEST(ClockReplacementPolicyTest, OnAnchorEvictedRemovesAnAlreadySelectedAnchorFromEvictionOrder) {
@@ -800,7 +818,7 @@ TEST(ClockReplacementPolicyTest, OnAnchorEvictedRemovesAnAlreadySelectedAnchorFr
 
 	policy.onAnchorEvicted(1);
 
-	auto candidate = policy.selectNextEvictionCandidate(/*excluded=*/0);
+	auto candidate = policy.selectEvictionCandidate(/*excluded=*/0, /*required_bytes=*/0, Candidates({1, 2}));
 	ASSERT_TRUE(candidate.has_value());
 	EXPECT_EQ(*candidate, 2u);
 }
@@ -823,7 +841,7 @@ TEST(ClockReplacementPolicyTest, OnAnchorEvictedRemovalIsCorrectRegardlessOfRing
 	policy.onAnchorTouched(3);
 	// Both remaining anchors touched -- neither should be lost/duplicated;
 	// a full 2-sweep scan excluding one must still find the other.
-	auto candidate = policy.selectNextEvictionCandidate(/*excluded=*/2);
+	auto candidate = policy.selectEvictionCandidate(/*excluded=*/2, /*required_bytes=*/0, Candidates({2, 3}));
 	ASSERT_TRUE(candidate.has_value());
 	EXPECT_EQ(*candidate, 3u);
 }
@@ -849,7 +867,7 @@ TEST(ClockReplacementPolicyTest, OnAnchorEvictedOfUntrackedAnchorIsANoop) {
 
 	EXPECT_NO_THROW(policy.onAnchorEvicted(999));
 
-	auto candidate = policy.selectNextEvictionCandidate(/*excluded=*/0);
+	auto candidate = policy.selectEvictionCandidate(/*excluded=*/0, /*required_bytes=*/0, Candidates({1}));
 	ASSERT_TRUE(candidate.has_value());
 	EXPECT_EQ(*candidate, 1u);
 }
@@ -907,7 +925,7 @@ TEST(TwoQReplacementPolicyTest, FreshlyGrantedAnchorIsEvictionEligibleFromA1inIm
 	policy.enqueueCandidate(MakeCandidate(1));
 	policy.selectNextPromotionCandidate();
 
-	auto candidate = policy.selectNextEvictionCandidate(/*excluded=*/0);
+	auto candidate = policy.selectEvictionCandidate(/*excluded=*/0, /*required_bytes=*/0, Candidates({1}));
 	ASSERT_TRUE(candidate.has_value());
 	EXPECT_EQ(*candidate, 1u);
 }
@@ -925,7 +943,7 @@ TEST(TwoQReplacementPolicyTest, EvictionAlwaysPrefersA1inOverAmRegardlessOfOrder
 	policy.enqueueCandidate(MakeCandidate(2));
 	policy.selectNextPromotionCandidate();  // 2 -> a1in_ (first-timer)
 
-	auto candidate = policy.selectNextEvictionCandidate(/*excluded=*/0);
+	auto candidate = policy.selectEvictionCandidate(/*excluded=*/0, /*required_bytes=*/0, Candidates({1, 2}));
 	ASSERT_TRUE(candidate.has_value());
 	EXPECT_EQ(*candidate, 2u);  // a1in_ (2) preferred over am_ (1)
 }
@@ -941,7 +959,7 @@ TEST(TwoQReplacementPolicyTest, OnAnchorTouchedWithinAmActsAsOrdinaryLru) {
 
 	policy.onAnchorTouched(1);  // ordinary LRU touch within am_: 1 -> most-recently-used
 
-	auto candidate = policy.selectNextEvictionCandidate(/*excluded=*/0);
+	auto candidate = policy.selectEvictionCandidate(/*excluded=*/0, /*required_bytes=*/0, Candidates({1, 2}));
 	ASSERT_TRUE(candidate.has_value());
 	EXPECT_EQ(*candidate, 2u);  // least-recently-used within am_
 }
@@ -963,7 +981,7 @@ TEST(TwoQReplacementPolicyTest, EvictedA1inAnchorReturningLaterSkipsStraightToAm
 
 	// 2 (a1in_) must be preferred over 1 (am_), even though 1 was granted
 	// again more recently than 2.
-	auto candidate = policy.selectNextEvictionCandidate(/*excluded=*/0);
+	auto candidate = policy.selectEvictionCandidate(/*excluded=*/0, /*required_bytes=*/0, Candidates({1, 2}));
 	ASSERT_TRUE(candidate.has_value());
 	EXPECT_EQ(*candidate, 2u);
 }
@@ -987,18 +1005,18 @@ TEST(TwoQReplacementPolicyTest, GhostQueueIsBoundedByConfiguredCapacity) {
 	// this returns 1 only if 1 is genuinely a1in_'s front. If 1 had wrongly
 	// skipped to am_ (treated as a ghost hit), this would return 99 instead
 	// (a1in_'s sole occupant).
-	auto candidate = policy.selectNextEvictionCandidate(/*excluded=*/0);
+	auto candidate = policy.selectEvictionCandidate(/*excluded=*/0, /*required_bytes=*/0, Candidates({1, 99}));
 	ASSERT_TRUE(candidate.has_value());
 	EXPECT_EQ(*candidate, 1u);
 }
 
-TEST(TwoQReplacementPolicyTest, SelectNextEvictionCandidateSkipsExcludedAcrossQueues) {
+TEST(TwoQReplacementPolicyTest, SelectEvictionCandidateSkipsExcludedAcrossQueues) {
 	TwoQReplacementPolicy policy;
 	policy.enqueueCandidate(MakeCandidate(1));
 	policy.selectNextPromotionCandidate();  // 1 -> a1in_
 	policy.onAnchorTouched(1);              // 1 -> am_ (a1in_ now empty)
 
-	EXPECT_FALSE(policy.selectNextEvictionCandidate(/*excluded=*/1).has_value());
+	EXPECT_FALSE(policy.selectEvictionCandidate(/*excluded=*/1, /*required_bytes=*/0, Candidates({1})).has_value());
 }
 
 TEST(TwoQReplacementPolicyTest, OnAnchorEvictedRemovesAnUnselectedCandidateFromThePendingQueue) {
@@ -1066,7 +1084,7 @@ TEST(CostAwareReplacementPolicyTest, OnAnchorTouchedNeverBlocksOnTheAdmissionSca
 	admission.gpu_budget_bytes = 100;
 	admission.gpu_bytes_allocated = 100;  // available = 0
 	admission.incremental_bytes = 1;      // > available -- forces the locked scan below
-	admission.eviction_candidates = many_candidates;
+	admission.eviction_candidates = std::make_shared<const std::vector<EvictionCandidate>>(std::move(many_candidates));
 
 	std::atomic<bool> stop{false};
 	std::atomic<std::uint64_t> contender_calls{0};

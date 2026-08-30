@@ -6,3 +6,6 @@
 # test/stress -- neither subdirectory owns it.
 add_subdirectory(unittest)
 add_subdirectory(bin)
+# index/: a real-dataset (not synthetic) comparison of raw hnswlib vs the
+# full Arachne stack -- see index/hnsw_workload_compare.cpp's file overview.
+add_subdirectory(index)

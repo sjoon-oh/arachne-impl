@@ -130,7 +130,9 @@ class IntakeObservingPolicy : public ReplacementPolicy {
 		pending_.pop_front();
 		return candidate;
 	}
-	std::optional<VectorId> selectNextEvictionCandidate(VectorId) override { return std::nullopt; }
+	std::optional<VectorId> selectEvictionCandidate(VectorId, std::size_t, const std::vector<EvictionCandidate>&) override {
+		return std::nullopt;
+	}
 	bool waitForIntake(std::chrono::milliseconds timeout) {
 		std::unique_lock<std::mutex> lock(mutex_);
 		return cv_.wait_for(lock, timeout, [this] { return !pending_.empty(); });
@@ -685,6 +687,124 @@ TEST(RegionManagerCoordinatorTest, MaxPromotionBytesPerPassSplitsOneWaitIdleInto
 	manager.shutdown();
 }
 
+// Records the raw pointer behind AdmissionContext::eviction_candidates for
+// every candidate it's asked about, then always Rejects -- deliberately
+// never admits anything, so buildRelocationPlan_collect's while(true) loop
+// keeps pulling until the whole batch is drained in one single pass,
+// without needing an actual working promotion/eviction pipeline plugged in.
+class RecordingAlwaysRejectPolicy : public ReplacementPolicy {
+ public:
+	void enqueueCandidate(PromotionCandidate candidate) override {
+		std::lock_guard<std::mutex> lock(mutex_);
+		pending_.push_back(std::move(candidate));
+	}
+	void onAnchorEvicted(VectorId) override {}
+	void onAnchorTouched(VectorId) override {}
+	bool onRelocationTrigger() override {
+		std::lock_guard<std::mutex> lock(mutex_);
+		return !pending_.empty();
+	}
+	bool hasPendingCandidates() const override {
+		std::lock_guard<std::mutex> lock(mutex_);
+		return !pending_.empty();
+	}
+	std::optional<PromotionCandidate> selectNextPromotionCandidate() override {
+		std::lock_guard<std::mutex> lock(mutex_);
+		if (pending_.empty()) return std::nullopt;
+		PromotionCandidate candidate = std::move(pending_.front());
+		pending_.pop_front();
+		return candidate;
+	}
+	std::optional<VectorId> selectEvictionCandidate(VectorId, std::size_t, const std::vector<EvictionCandidate>&) override {
+		return std::nullopt;
+	}
+	BatchAdmissionDecision evaluateBatchAdmission(const PromotionCandidate&, const AdmissionContext& admission,
+			const RelocationBatchContext&) override {
+		std::lock_guard<std::mutex> lock(mutex_);
+		observed_pointers.push_back(admission.eviction_candidates.get());
+		return BatchAdmissionDecision::Reject;
+	}
+
+	mutable std::mutex mutex_;
+	mutable std::vector<const std::vector<EvictionCandidate>*> observed_pointers;
+
+ private:
+	std::deque<PromotionCandidate> pending_;
+};
+
+// Regression test for AdmissionContext::eviction_candidates being a
+// shared_ptr into RegionManager's own pass-local cache rather than an owned
+// std::vector -- see that field's own doc comment (replacement_policy.hpp)
+// for the deep-copy cost this replaced, measured to run into minutes at
+// 1M-vector scale (cpp/test/index/report/, the buildRelocationPlan_collect
+// finding). Proves the *sharing*, not just the values: every candidate
+// examined within one pass must see the exact same underlying snapshot
+// (same address), not merely an equal one.
+TEST(RegionManagerCoordinatorTest, AdmissionContextSharesTheSameEvictionCandidatesSnapshotAcrossOnePass) {
+	FakeAdapter adapter;
+	FakeRoutingCache routing_cache;
+	constexpr std::size_t kUnitBytes = 256;
+	// Region payload is 2 allocation units; budget is exactly 1 (already a
+	// multiple of kUnitBytes, so Pooled's own unit-rounding of the *budget*
+	// is a no-op here -- unlike a budget smaller than one whole unit, which
+	// Pooled would silently round up to fill it, defeating this setup; see
+	// the metadata pool note below for the other unit-rounding trap this
+	// avoids). So `available` (1 unit) is below every candidate's
+	// incremental_bytes (2 units) regardless of whether anything's ever
+	// actually promoted (this policy never admits), and
+	// buildAdmissionContext() takes the eviction_candidates branch for every
+	// one of them, every time -- exactly the condition this test needs.
+	constexpr std::size_t kRegionBytes = kUnitBytes * 2;
+	// metadata_pool_bytes deliberately small (not gpu::kDefaultMetadataPoolBytes,
+	// 64 MiB) -- Pooled's metadata arena is sized in the same kUnitBytes
+	// units as the data arena above, and a tiny kUnitBytes against the
+	// *default* 64 MiB metadata budget would round up to hundreds of
+	// thousands of units, which was observed to make DeviceContext's own
+	// construction hang for minutes building that arena's free-list.
+	gpu::DeviceContext device(/*device_id=*/0, gpu::AllocationPolicy::Pooled, /*data_bytes=*/kUnitBytes,
+			/*metadata_pool_bytes=*/kUnitBytes, /*worker_stream_count=*/1, /*unit_bytes=*/kUnitBytes);
+	gpu::DeviceRegionPool pool(device);
+	auto policy = std::make_unique<RecordingAlwaysRejectPolicy>();
+	RecordingAlwaysRejectPolicy* observed = policy.get();
+	RegionManager manager(std::move(policy));
+	manager.start(adapter, pool, routing_cache, CoordinatorConfig{kLongInterval});
+
+	constexpr int kCandidateCount = 5;
+	std::vector<std::vector<std::byte>> data(kCandidateCount, std::vector<std::byte>(kRegionBytes, std::byte{0}));
+	for (int i = 0; i < kCandidateCount; ++i) {
+		HostRegionView host{data[i].data(), kRegionBytes, 0};
+		adapter.addRegion(i + 1, host);
+		manager.registerRegion(i + 1, host);
+		manager.requestPromotion(100 + i, RegionFootprint{{static_cast<RegionId>(i + 1)}});
+	}
+	// All 5 submitted before any waitIdle() -- processed together in one
+	// buildRelocationPlan_collect pass (the policy always Rejects, so the
+	// collect loop keeps pulling until the queue is empty, never breaking
+	// early).
+	manager.waitIdle();
+
+	// Snapshot under lock, then release it -- shutdown() below joins the
+	// Coordinator thread, which must remain free to acquire this same
+	// mutex_ (e.g. one last hasPendingCandidates() check) on its way out;
+	// holding the lock across shutdown() would deadlock the join against
+	// that.
+	std::vector<const std::vector<EvictionCandidate>*> pointers;
+	{
+		std::lock_guard<std::mutex> lock(observed->mutex_);
+		pointers = observed->observed_pointers;
+	}
+	ASSERT_EQ(pointers.size(), static_cast<std::size_t>(kCandidateCount));
+	for (const auto* ptr : pointers) {
+		ASSERT_NE(ptr, nullptr) << "every candidate here needed eviction info -- none should see a null snapshot";
+	}
+	EXPECT_TRUE(std::all_of(pointers.begin(), pointers.end(),
+			[first = pointers.front()](const auto* ptr) { return ptr == first; }))
+			<< "every candidate examined within one pass must see the exact same eviction_candidates snapshot "
+				 "(shared, not deep-copied) -- see AdmissionContext::eviction_candidates' own doc comment";
+
+	manager.shutdown();
+}
+
 // A custom policy exercising ReplacementPolicy::HasExceededPlanningAttempts()
 // (the opt-in aging/give-up helper added to the base class this session) --
 // proves it's reachable from a subclass and behaves correctly against real
@@ -727,7 +847,9 @@ class GiveUpAfterAttemptsPolicy : public ReplacementPolicy {
 		pending_.pop_front();
 		return candidate;
 	}
-	std::optional<VectorId> selectNextEvictionCandidate(VectorId) override { return std::nullopt; }
+	std::optional<VectorId> selectEvictionCandidate(VectorId, std::size_t, const std::vector<EvictionCandidate>&) override {
+		return std::nullopt;
+	}
 
 	BatchAdmissionDecision evaluateBatchAdmission(const PromotionCandidate& candidate, const AdmissionContext&,
 			const RelocationBatchContext&) override {
