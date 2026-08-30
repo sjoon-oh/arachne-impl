@@ -70,6 +70,7 @@ DeviceContext::DeviceContext(int device_id, AllocationPolicy policy, std::size_t
 
 DeviceContext::~DeviceContext() {
 	for (cudaStream_t stream : worker_streams_) cudaStreamDestroy(stream);
+	if (worker_scratch_base_ != nullptr) cudaFree(worker_scratch_base_);
 }
 
 std::size_t DeviceContext::budgetBytes(MemoryKind kind) const {
@@ -85,6 +86,31 @@ cudaStream_t DeviceContext::workerStream(std::size_t index) const {
 		throw std::out_of_range("DeviceContext::workerStream: index out of range");
 	}
 	return worker_streams_[index];
+}
+
+void* DeviceContext::workerScratch(std::size_t index) const {
+	if (worker_scratch_base_ == nullptr) return nullptr;  // reserveWorkerScratch() never called, or bytes_per_worker==0
+	if (index >= worker_streams_.size()) {
+		throw std::out_of_range("DeviceContext::workerScratch: index out of range");
+	}
+	return static_cast<char*>(worker_scratch_base_) + index * worker_scratch_bytes_;
+}
+
+void DeviceContext::reserveWorkerScratch(std::size_t bytes_per_worker) {
+	if (worker_scratch_bytes_ != 0 || worker_scratch_base_ != nullptr) {
+		throw std::logic_error("DeviceContext::reserveWorkerScratch: already reserved");
+	}
+	worker_scratch_bytes_ = bytes_per_worker;
+	if (bytes_per_worker == 0) return;  // valid no-op -- workerScratch() keeps returning nullptr
+
+	std::size_t total_bytes = bytes_per_worker * worker_streams_.size();
+	cudaError_t status = cudaMalloc(&worker_scratch_base_, total_bytes);
+	if (status != cudaSuccess) {
+		throw std::runtime_error("DeviceContext::reserveWorkerScratch: cudaMalloc(" + std::to_string(total_bytes) +
+															" bytes) failed: " + cudaGetErrorString(status));
+	}
+	ARACHNE_LOG_INFO("DeviceContext::reserveWorkerScratch: reserved {} bytes/worker ({} bytes total, {} worker(s))",
+										bytes_per_worker, total_bytes, worker_streams_.size());
 }
 
 }  // namespace arachne::gpu

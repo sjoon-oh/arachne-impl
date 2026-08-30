@@ -151,6 +151,36 @@ class DeviceContext {
 
 	std::size_t workerStreamCount() const { return worker_streams_.size(); }
 
+	/// One dedicated, persistent scratch buffer per OpScheduler execution
+	/// worker -- same "index -> fixed resource" pattern as workerStream(),
+	/// for GPU memory instead of a stream. Meant for an adapter's own
+	/// short-lived per-call/per-hop device buffers (see IAdapter::
+	/// requiredScratchBytesPerWorker()'s doc comment for the intended use and
+	/// core/controller.hpp's Controller::workerScratch() for how a worker
+	/// thread reaches it), so a hot loop like HnswlibIndexGpu::
+	/// TraverseBatchOnDevice()'s per-hop distance computation doesn't pay a
+	/// cudaMalloc/cudaFree every round. Bypasses the Pooled/Async arena
+	/// machinery entirely -- unlike Region data, this is allocated exactly
+	/// once per DeviceContext lifetime and never grows/shrinks/fragments, so
+	/// there's nothing for that machinery to do here.
+	///
+	/// `index` must be < workerStreamCount(). Returns nullptr if
+	/// reserveWorkerScratch() was never called, or was called with
+	/// `bytes_per_worker == 0` -- a caller must treat that as "no scratch
+	/// available" and fall back to its own allocation, not as an error.
+	void* workerScratch(std::size_t index) const;
+
+	std::size_t workerScratchBytesPerWorker() const { return worker_scratch_bytes_; }
+
+	/// Reserves workerStreamCount() * `bytes_per_worker` bytes in one
+	/// cudaMalloc, sliced evenly across workerScratch(0..workerStreamCount()-1).
+	/// Must be called at most once, and before any OpScheduler worker thread
+	/// starts (Controller's constructor does this, right before
+	/// OpScheduler::start()) -- throws std::logic_error if called a second
+	/// time. `bytes_per_worker == 0` is a valid, cheap no-op: no cudaMalloc
+	/// happens, and every workerScratch(index) call keeps returning nullptr.
+	void reserveWorkerScratch(std::size_t bytes_per_worker);
+
 	/// The raw cudaMalloc/cudaFree resource both pools are ultimately backed
 	/// by (see the class overview above). Not meant for DeviceRegionPool to
 	/// allocate against directly -- see MemoryKind's doc comment.
@@ -192,6 +222,12 @@ class DeviceContext {
 	// has already run), destroyed in the destructor -- see workerStream()'s
 	// doc comment.
 	std::vector<cudaStream_t> worker_streams_;
+
+	// Set by reserveWorkerScratch() (at most once); worker_scratch_base_
+	// stays null until then, or forever if bytes_per_worker was 0 -- see
+	// workerScratch()'s doc comment.
+	std::size_t worker_scratch_bytes_ = 0;
+	void* worker_scratch_base_ = nullptr;
 };
 
 }  // namespace arachne::gpu

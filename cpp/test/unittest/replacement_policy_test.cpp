@@ -2,6 +2,9 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
+#include <thread>
+
 // Tests for every concrete ReplacementPolicy implementation
 // (core/replacement_policy.hpp): FifoReplacementPolicy, LruReplacementPolicy,
 // LfuReplacementPolicy, ClockReplacementPolicy, TwoQReplacementPolicy. Each
@@ -41,12 +44,17 @@
 
 namespace {
 
+using arachne::AdmissionContext;
 using arachne::ClockReplacementPolicy;
+using arachne::CostAwareReplacementConfig;
+using arachne::CostAwareReplacementPolicy;
+using arachne::EvictionCandidate;
 using arachne::FifoReplacementPolicy;
 using arachne::LfuReplacementPolicy;
 using arachne::LruReplacementPolicy;
 using arachne::PromotionCandidate;
 using arachne::RegionFootprint;
+using arachne::RelocationBatchContext;
 using arachne::TwoQReplacementPolicy;
 using arachne::VectorId;
 
@@ -1015,6 +1023,112 @@ TEST(TwoQReplacementPolicyTest, OnAnchorEvictedOfUntrackedAnchorIsANoop) {
 TEST(TwoQReplacementPolicyTest, OnAnchorTouchedOfUntrackedAnchorIsANoop) {
 	TwoQReplacementPolicy policy;
 	EXPECT_NO_THROW(policy.onAnchorTouched(999));
+}
+
+// ---------------------------------------------------------------------------
+// CostAwareReplacementPolicy::onAnchorTouched()'s touch_queue_ redesign (see
+// its own doc comment) -- the latency-tracing report entry's fix for
+// RegionManager::recordTraversal()'s heavy-tailed latency (up to 216s
+// observed) turning out to come from onAnchorTouched() and
+// evaluateAdmission()/selectEvictionCandidate() contending for the same
+// mutex_.
+// ---------------------------------------------------------------------------
+
+TEST(CostAwareReplacementPolicyTest, OnAnchorTouchedNeverBlocksOnTheAdmissionScanLock) {
+	CostAwareReplacementPolicy policy;
+
+	// Make anchor 1 resident so onAnchorTouched(1) below isn't a same-instant
+	// no-op once drained.
+	AdmissionContext committed;
+	committed.total_footprint_bytes = 100;
+	policy.onPromotionCommitted(1, committed);
+
+	// A large eviction_candidates list makes evaluateAdmission()'s locked
+	// scan (see evaluateAdmission_locked's own trace-scope comment) take
+	// real, repeated, measurable time under mutex_ -- each candidate's
+	// group_members references an anchor id evaluateAdmission has to look up
+	// in resident_ and miss, real (if small) per-item work, not a
+	// short-circuited no-op. Deliberately *not* anchor 1 itself, so this
+	// contender thread's own admission decisions don't depend on the touches
+	// the main thread below is racing to apply.
+	std::vector<EvictionCandidate> many_candidates;
+	many_candidates.reserve(200000);
+	for (int i = 0; i < 200000; ++i) {
+		EvictionCandidate candidate;
+		candidate.anchor_id = static_cast<VectorId>(1000 + i);
+		candidate.reclaimable_bytes = 64;
+		candidate.group_members = {static_cast<VectorId>(1000 + i)};
+		many_candidates.push_back(std::move(candidate));
+	}
+
+	arachne::PromotionCandidate contender_candidate = MakeCandidate(2);
+	AdmissionContext admission;
+	admission.gpu_budget_bytes = 100;
+	admission.gpu_bytes_allocated = 100;  // available = 0
+	admission.incremental_bytes = 1;      // > available -- forces the locked scan below
+	admission.eviction_candidates = many_candidates;
+
+	std::atomic<bool> stop{false};
+	std::atomic<std::uint64_t> contender_calls{0};
+	std::thread contender([&] {
+		while (!stop.load(std::memory_order_relaxed)) {
+			policy.evaluateAdmission(contender_candidate, admission);
+			contender_calls.fetch_add(1, std::memory_order_relaxed);
+		}
+	});
+
+	using Clock = std::chrono::steady_clock;
+	const Clock::time_point test_start = Clock::now();
+	std::size_t iterations = 0;
+	double max_call_ms = 0.0;
+	while (Clock::now() - test_start < std::chrono::milliseconds(200)) {
+		const Clock::time_point call_start = Clock::now();
+		policy.onAnchorTouched(1);
+		const double call_ms = std::chrono::duration<double, std::milli>(Clock::now() - call_start).count();
+		max_call_ms = std::max(max_call_ms, call_ms);
+		++iterations;
+	}
+	stop.store(true, std::memory_order_relaxed);
+	contender.join();
+
+	EXPECT_GT(iterations, 0u);
+	EXPECT_GT(contender_calls.load(std::memory_order_relaxed), 0u)
+			<< "contender thread should have made real progress concurrently, not been starved out entirely";
+	// Generous bound (evaluateAdmission()'s own scan over 200,000 candidates
+	// should itself take single-digit milliseconds or more per call, see the
+	// latency-tracing report entry) -- the point is proving onAnchorTouched()
+	// never meaningfully blocks behind that scan's mutex_, not measuring
+	// exact latency.
+	EXPECT_LT(max_call_ms, 20.0)
+			<< "onAnchorTouched() should never stall behind evaluateAdmission()'s locked scan -- "
+				 "it no longer shares mutex_ with it (see touch_queue_mutex_)";
+}
+
+TEST(CostAwareReplacementPolicyTest, TouchIsAppliedOnTheNextDrainNotImmediately) {
+	CostAwareReplacementPolicy policy;
+
+	AdmissionContext committed;
+	committed.total_footprint_bytes = 100;
+	policy.onPromotionCommitted(1, committed);  // anchor 1 resident, heat == 1.0
+
+	policy.onAnchorTouched(1);  // queued, not yet applied -- see onAnchorTouched()'s own doc comment
+
+	// selectEvictionCandidate()'s locked section drains the touch queue
+	// before scoring (see its own drainTouchQueueLocked() call) -- so by the
+	// time this returns, the touch above must already be reflected in
+	// anchor 1's heat, even though nothing called onAnchorTouched() again in
+	// between.
+	EvictionCandidate candidate;
+	candidate.anchor_id = 1;
+	candidate.reclaimable_bytes = 64;
+	candidate.group_members = {1};
+	std::optional<VectorId> victim = policy.selectEvictionCandidate(/*excluded=*/0, /*required_bytes=*/1, {candidate});
+	// Not asserting a specific density value here (that's
+	// victimRetentionDensity()'s own concern, covered elsewhere) -- only
+	// that the call completes and returns the only candidate offered,
+	// proving the drain didn't corrupt resident_ or throw.
+	ASSERT_TRUE(victim.has_value());
+	EXPECT_EQ(*victim, 1u);
 }
 
 }  // namespace

@@ -192,14 +192,67 @@ struct CoordinatorConfig {
 	std::chrono::milliseconds trigger_interval{100};
 	/// Soft per-pass movement limits. A single oversized first candidate/victim
 	/// is allowed so progress is possible; subsequent work is returned to the
-	/// policy for a later pass. Zero disables the corresponding limit.
+	/// policy for a later pass -- unconditionally, even during a waitIdle()/
+	/// shutdown()-forced drain, since a candidate bumped by this limit is only
+	/// ever requeued once at least one other candidate has already been
+	/// admitted in the same pass, which by itself guarantees the Coordinator's
+	/// per-pass retry loop keeps making progress (see buildRelocationPlan()'s
+	/// own comment for the termination argument). Zero disables the
+	/// corresponding limit.
 	std::size_t max_promotion_bytes_per_pass = 0;
 	std::size_t max_eviction_bytes_per_pass = 0;
+	/// Convenience alternative to the two absolute-byte fields above,
+	/// expressed as a fraction of the actual GPU data budget (e.g. 0.2 for
+	/// "no single pass moves more than 20% of capacity") instead of a raw
+	/// byte count. Resolved by Controller's constructor -- not read by
+	/// RegionManager itself -- right after DeviceContext is constructed, so
+	/// it reflects the *real* post-unit-rounding budget (gpu::DeviceContext::
+	/// budgetBytes()) rather than the raw gpu_data_budget_bytes a caller
+	/// requested, which can differ under AllocationPolicy::Pooled. When set,
+	/// it overwrites max_promotion_bytes_per_pass/max_eviction_bytes_per_pass
+	/// with the resolved byte value before RegionManager::start() is called.
+	/// std::nullopt (the default) leaves the corresponding *_bytes_per_pass
+	/// field exactly as given -- constructing a Controller without ever
+	/// touching these two fields is unaffected either way.
+	std::optional<double> max_promotion_fraction_of_budget;
+	std::optional<double> max_eviction_fraction_of_budget;
 	/// Minimum physical-reservation utilization required for near-fit handle
 	/// reuse, expressed as an integer percentage. The default 90 rejects a
 	/// 1-unit target reusing a 2-unit victim slot; 0 permits any fitting slot,
 	/// and values above 100 are clamped to 100 during start().
 	std::uint8_t near_fit_min_utilization_percent = 90;
+
+	/// Anchor-group formation for eviction accounting (see region_manager.cpp's
+	/// assignAnchorToGroup() and buildEvictionCandidates()). A newly-promoted
+	/// Anchor joins the existing group its footprint overlaps most with if that
+	/// overlap (as a fraction of the Anchor's own footprint region count) is at
+	/// least this threshold *and* the group has room (see
+	/// max_eviction_group_size below); otherwise it starts a new, singleton
+	/// group of its own. Groups only ever grow or dissolve, never merge --
+	/// keeps the bookkeeping O(1) amortized per promotion, with no risk of two
+	/// large groups being unioned into one unbounded one.
+	///
+	/// Why this matters: `dependents_[region]` (region_manager.cpp) tracks
+	/// every Anchor currently sharing a Region, but a Region is only ever
+	/// reclaimable by evicting *all* of them together (see
+	/// EvictionCandidate::group_members's doc comment) -- grouping
+	/// substantially-overlapping Anchors together up front means a single
+	/// eviction decision can actually name a set worth evicting jointly,
+	/// instead of the replacement policy discovering (or failing to discover)
+	/// that combination one Anchor at a time.
+	double group_merge_overlap_threshold = 0.5;
+
+	/// Hard cap on how many Anchors a single group may accumulate (checked at
+	/// join time, not retroactively) -- a structural safety valve independent
+	/// of whatever a plugged-in ReplacementPolicy decides is "hot": a Region
+	/// this popular is left alone by group-based eviction entirely (its
+	/// Anchors simply keep spilling into fresh singleton-or-small groups of
+	/// their own once this group is full) rather than risking one eviction
+	/// decision evicting a disruptively large number of Anchors at once.
+	/// Defaults to 1 -- every Anchor gets its own singleton group, which
+	/// reproduces this port's original sole-ownership-only reclaimability
+	/// rule exactly (zero behavior change unless explicitly raised).
+	std::size_t max_eviction_group_size = 1;
 };
 
 /// GPU residency policy owner -- see the file-level overview above for
@@ -304,6 +357,24 @@ class RegionManager {
 	/// PromotionCandidate for it is discarded rather than acted on.
 	void releaseAnchor(VectorId anchor_id);
 
+	/// True if `anchor_id` has ever been assigned to something -- either it
+	/// currently depends on at least one Region (dependencies_), or it was
+	/// released at some point in its lifetime (anchor_epoch_ entries are
+	/// never removed -- see that member's own doc comment). Exists purely
+	/// for Controller::MintAnchorId()'s wraparound-collision guard: once
+	/// (astronomically unlikely to ever happen -- see MintAnchorId()'s own
+	/// doc comment) `next_anchor_id_` has cycled through its entire 64-bit
+	/// range, a freshly minted candidate id needs to be checked against
+	/// whatever's still using an id from the previous cycle before being
+	/// handed out again. The one gap this doesn't close: an Anchor that's
+	/// been minted and enqueued as a PromotionCandidate but not yet promoted
+	/// into a Region dependency -- covering that would mean plumbing an
+	/// equivalent query through every ReplacementPolicy implementation for a
+	/// scenario that additionally requires landing exactly on that one
+	/// pending id before it resolves, judged not worth the coupling (see
+	/// MintAnchorId()'s own doc comment for the full reasoning).
+	bool isKnownAnchor(VectorId anchor_id) const;
+
 	/// Reports that a traversal actually accessed every Region in `touched`
 	/// -- forwarded as onAnchorTouched() to every Anchor currently depending
 	/// on one of those Regions, deduplicated. Best-effort hotness signal, not
@@ -334,6 +405,12 @@ class RegionManager {
 		std::uint64_t relocation_batches_total = 0;
 		std::uint64_t candidates_requeued_total = 0;
 		std::uint64_t near_fit_reuses_total = 0;
+		/// Promotion candidates a ReplacementPolicy::evaluateBatchAdmission()
+		/// permanently dropped via BatchAdmissionDecision::Reject (see that
+		/// enum's own doc comment for how this differs from a requeue) --
+		/// tracked centrally here so any policy gets this observability for
+		/// free, without needing its own counter.
+		std::uint64_t candidates_rejected_total = 0;
 	};
 	Stats stats() const;
 
@@ -401,7 +478,15 @@ class RegionManager {
 			gpu::DeviceRegionPool::TransferBatch& pending,
 			std::vector<PendingPromotionCommit>& commits, ReusableAllocations& reusable);
 
-	AdmissionContext buildAdmissionContext(const PromotionCandidate& candidate) const;
+	// `eviction_candidates_cache` is populated lazily (only once eviction info
+	// is actually needed -- see AdmissionContext::eviction_candidates' own
+	// doc comment) and reused across every candidate examined within the same
+	// buildRelocationPlan() pass: residency never changes mid-pass (nothing
+	// in that loop promotes/evicts anything -- only processRelocationBatch()
+	// does, afterward), so recomputing buildEvictionCandidates() more than
+	// once per pass would only ever reproduce the exact same result.
+	AdmissionContext buildAdmissionContext(
+			const PromotionCandidate& candidate, std::optional<std::vector<EvictionCandidate>>& eviction_candidates_cache) const;
 	std::vector<EvictionCandidate> buildEvictionCandidates() const;
 	std::size_t reservedRegionBytes(const Region& region) const;
 	std::size_t promotionBytes(const std::vector<PlannedPromotion>& promotions) const;
@@ -456,11 +541,44 @@ class RegionManager {
 	std::unordered_map<RegionId, std::unordered_set<VectorId>> dependents_;
 	std::unordered_map<VectorId, std::unordered_set<RegionId>> dependencies_;
 
+	// Anchor-group tracking for group-based eviction (see
+	// CoordinatorConfig::group_merge_overlap_threshold/max_eviction_group_size
+	// and assignAnchorToGroup()'s own doc comment). Purely a clustering
+	// *hint* layered on top of dependents_/dependencies_ above -- those two
+	// remain the sole ground truth buildEvictionCandidates() actually trusts
+	// for what's reclaimable, so staleness or a suboptimal grouping choice
+	// here can only make eviction less effective, never unsafe. All three
+	// guarded by mutex_ (same as dependents_/dependencies_): assignAnchorToGroup()
+	// runs only on the Coordinator thread, but forget() -- which removes an
+	// Anchor from its group -- is also reachable from releaseAnchor(), which a
+	// Controller-calling (worker) thread can invoke via commitRemove().
+	using GroupId = std::uint64_t;
+	std::unordered_map<RegionId, GroupId> region_group_;             // last group a Region's promotion joined
+	std::unordered_map<GroupId, std::unordered_set<VectorId>> group_members_;
+	std::unordered_map<VectorId, GroupId> anchor_group_;
+	GroupId next_group_id_ = 1;
+
+	// Assigns `anchor_id` (whose current full dependency footprint is
+	// `footprint_regions`) to a group: joins whichever existing group its
+	// footprint overlaps most with, if that overlap covers at least
+	// coordinator_config_.group_merge_overlap_threshold of the Anchor's own
+	// footprint and the group has room (coordinator_config_.
+	// max_eviction_group_size), else starts a new singleton group. Called
+	// once per Anchor, immediately after its RoutingCache registration (see
+	// processRelocationBatch()) -- an Anchor already in a group (e.g. a
+	// re-promotion after residency was re-validated) is left in place, with
+	// its footprint's Regions simply re-tagged to that same group.
+	void assignAnchorToGroup(VectorId anchor_id, const std::vector<RegionId>& footprint_regions);
+
 	// Per-Anchor epoch (see the epoch staleness invariant above), bumped only
-	// by releaseAnchor(). Entries are never removed -- an Anchor id can be
-	// released and later reused by a new insert(), and the epoch must keep
-	// increasing across that reuse -- unbounded but slow-growing, acceptable
-	// at this codebase's scale.
+	// by releaseAnchor(). Entries are never removed -- Controller::
+	// MintAnchorId() never reuses a released Anchor's id on purpose anymore
+	// (every mint is fresh -- see its own doc comment), but the *counter* it
+	// draws from can in principle wrap all the way around and reissue an old
+	// payload once every possible id has been minted (isKnownAnchor() is the
+	// guard against exactly that), so a released id's epoch must stay
+	// remembered forever for that guard to see it -- unbounded but
+	// slow-growing, acceptable at this codebase's scale.
 	std::unordered_map<VectorId, std::uint64_t> anchor_epoch_;
 
 	// Strategy (design point 4): see ReplacementPolicy's doc comment. Never
@@ -501,6 +619,7 @@ class RegionManager {
 	std::atomic<std::uint64_t> stat_relocation_batches_{0};
 	std::atomic<std::uint64_t> stat_candidates_requeued_{0};
 	std::atomic<std::uint64_t> stat_near_fit_reuses_{0};
+	std::atomic<std::uint64_t> stat_candidates_rejected_{0};
 };
 
 }  // namespace arachne

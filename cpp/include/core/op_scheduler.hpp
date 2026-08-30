@@ -10,6 +10,7 @@
 #include <mutex>
 #include <optional>
 #include <thread>
+#include <vector>
 
 #include "adapter/index_adapter.hpp"
 #include "core/scheduling_policy.hpp"
@@ -50,6 +51,19 @@ struct SchedulingConfig {
 	/// hand-built dispatch batch, the scheduler waits up to this long for
 	/// additional eligible operations to join the same batch.
 	std::chrono::microseconds batch_wait_timeout{0};
+
+	/// Bounds how long a currently-admissible (kind, op) class of pending
+	/// work may sit unpicked while SchedulingPolicy keeps preferring
+	/// something else, before the planner overrides that preference and
+	/// forces it to be scheduled next -- see OpScheduler's class doc comment
+	/// ("Starvation override"). 0 (the default) disables the override
+	/// entirely, matching this feature not existing: a policy that never
+	/// revisits a given (kind, op) can then withhold it indefinitely. This
+	/// is a safety net for a *pluggable, non-FIFO* SchedulingPolicy --
+	/// FifoSchedulingPolicy itself never needs it, since preserving arrival
+	/// order already guarantees every admissible class eventually becomes
+	/// the oldest pending work and gets picked.
+	std::chrono::microseconds starvation_threshold{0};
 };
 
 	/// Arachne's index-agnostic operation scheduler: the layer between
@@ -103,6 +117,41 @@ struct SchedulingConfig {
 /// conflicting batch(es) to finish first. An adapter returning false from
 /// requiresTraverseModifyIsolation() opts out entirely -- the gate always
 /// admits, identical to this feature not existing.
+///
+/// Choosing *which* (kind, op) class to build the next batch from is not
+/// simply "ask SchedulingPolicy once and commit": that would let a single
+/// inadmissible answer stall the whole pipeline (worker threads idle, other
+/// perfectly runnable work stuck behind it in queue_) whenever
+/// SchedulingPolicy's preferred kind happens to conflict with whatever's
+/// currently in flight. Instead, each planner iteration:
+///   1. Scans queue_ for every (kind, op) class that both has pending work
+///      *and* currently passes canAdmit() (admissibleClasses()) -- at most
+///      three: Traverse, Modify+Insert, Modify+Delete.
+///   2. If none are admissible, the planner genuinely has nothing safe to
+///      run and waits (the isolation rule above allows no alternative --
+///      not a scheduling gap, a real floor).
+///   3. Otherwise, SchedulingPolicy::chooseBatchKind() is still asked for
+///      its preference and honored whenever that preference is itself
+///      admissible -- SchedulingPolicy retains full authority over the
+///      common case. Only when its preferred kind isn't currently
+///      admissible does the planner fall back to whichever *other*
+///      admissible class has waited longest, rather than blocking while
+///      that work sits ready to run (selectNextBatchKind()).
+///
+/// Starvation override: step 3's fallback already keeps FifoSchedulingPolicy
+/// starvation-free (arrival order means a class that's repeatedly bypassed
+/// is, by construction, the oldest pending work, so it's exactly what the
+/// fallback picks first). A different, pluggable SchedulingPolicy has no
+/// such guarantee -- one that always prefers Traverse whenever any Traverse
+/// is pending, say, would never let chooseBatchKind() return Modify at all,
+/// so a Modify class could sit admissible-but-never-selected indefinitely
+/// even though nothing is actually blocking it. SchedulingConfig::
+/// starvation_threshold guards against exactly this: if the oldest pending
+/// item of *any* admissible class has waited at least that long, the
+/// planner forces that class to be scheduled next regardless of what
+/// SchedulingPolicy would have preferred. 0 (the default) disables this --
+/// matches the feature not existing, since FifoSchedulingPolicy never needs
+/// it.
 class OpScheduler {
  public:
   explicit OpScheduler(SchedulingConfig config = {},
@@ -128,15 +177,21 @@ class OpScheduler {
   /// Schedules one Traverse request. `on_complete`, if provided, runs on the
   /// worker thread that computed the result, right before the returned
   /// future is made ready -- guaranteed to have already run by the time
-  /// future.get() unblocks. Lets a caller move result-dependent bookkeeping
-  /// off of whichever (unboundedly many) thread calls future.get(), onto the
-  /// bounded worker pool instead. OpScheduler never interprets this itself.
-  std::future<TraverseResult> schedule(TraverseRequest request,
-                                        std::function<void(const TraverseResult&)> on_complete = nullptr);
+  /// future.get() unblocks (or, on failure, before future.get() rethrows).
+  /// Fires exactly once regardless of outcome (see TraverseTask::on_complete's
+  /// doc comment) -- lets a caller move result-dependent bookkeeping, or a
+  /// chained follow-up dispatch, off of whichever (unboundedly many) thread
+  /// calls future.get(), onto the bounded worker pool instead. OpScheduler
+  /// never interprets this itself.
+  std::future<TraverseResult> schedule(
+      TraverseRequest request,
+      std::function<void(std::exception_ptr, const TraverseResult&)> on_complete = nullptr);
 
   /// Schedules one Modify request. Returns a future that becomes ready once
-  /// execution finishes.
-  std::future<ModifyResult> schedule(ModifyRequest request);
+  /// execution finishes. `on_complete` has the same contract as the
+  /// TraverseRequest overload's.
+  std::future<ModifyResult> schedule(
+      ModifyRequest request, std::function<void(std::exception_ptr, const ModifyResult&)> on_complete = nullptr);
 
   /// Runtime-adjustable knobs for callers that want to tune behavior.
   void setTraverseBatchSize(std::size_t size);
@@ -173,6 +228,42 @@ private:
 	void reserveExecutionSlot(ScheduledKind kind, std::optional<ModifyOp> op);
 	void releaseExecutionSlot(ScheduledKind kind);
 
+	// One (kind, op) execution-admission class with pending work in queue_ --
+	// see class doc comment's "Choosing *which* (kind, op) class..."
+	// paragraph and admissibleClasses()/selectNextBatchKind() below. `op` is
+	// engaged only when `kind == ScheduledKind::Modify`.
+	struct PendingClass {
+		ScheduledKind kind;
+		std::optional<ModifyOp> op;
+		std::chrono::steady_clock::time_point oldest_enqueued_at;
+	};
+
+	// Scans queue_ for every (kind, op) class -- Traverse; Modify+Insert;
+	// Modify+Delete, at most three -- that currently has at least one
+	// pending op *and* passes canAdmit() right now, recording each present
+	// class's oldest (longest-waiting) member. Assumes the caller already
+	// holds mutex_, same as canAdmit()/collectBatch().
+	std::vector<PendingClass> admissibleClasses() const;
+
+	// Picks which class plannerLoop() should build its next batch from, out
+	// of `admissible` (see admissibleClasses()) -- nullopt if `admissible`
+	// is empty (nothing pending is currently safe to run at all). See class
+	// doc comment for the full preference order (starvation override,
+	// then SchedulingPolicy's own preference if admissible, then whichever
+	// other admissible class has waited longest).
+	std::optional<PendingClass> selectNextBatchKind(const std::vector<PendingClass>& admissible) const;
+
+	// Removes and returns the single oldest queue_ entry matching (kind,
+	// op) -- used to seed a new batch with exactly the class
+	// selectNextBatchKind() chose, before collectBatch() fills the rest via
+	// the normal SchedulingPolicy-driven path (canAppendToBatch()'s
+	// existing mode/op-homogeneity check against the seeded entry keeps the
+	// rest of the batch consistent with it). Only ever called immediately
+	// after admissibleClasses()/selectNextBatchKind() confirmed a matching
+	// entry exists, under the same uninterrupted mutex_ hold -- throws
+	// std::logic_error if that invariant somehow doesn't hold.
+	ScheduledOperation extractOldest(ScheduledKind kind, std::optional<ModifyOp> op);
+
 	void setBatchSizeValue(ScheduledKind kind, std::size_t size);
 	void setExecutionThreadValue(std::size_t threads);
 
@@ -185,6 +276,7 @@ private:
 	std::size_t modify_batch_size_;
 	std::size_t max_execution_threads_;
 	std::chrono::microseconds batch_wait_timeout_;
+	std::chrono::microseconds starvation_threshold_;
 
 	// Strategy
 	std::unique_ptr<SchedulingPolicy> policy_;

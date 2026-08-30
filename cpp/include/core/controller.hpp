@@ -3,6 +3,7 @@
 #include <atomic>
 #include <optional>
 #include <cstdint>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <unordered_set>
@@ -60,6 +61,13 @@ struct ControllerStats {
 	std::uint64_t regions_written_back_total = 0;   // of those, how many actually had data copied back
 	std::uint64_t anchor_evictions_total = 0;       // anchor releases that reclaimed >=1 Region
 	std::uint64_t compactions_total = 0;            // RegionManager falling back to gpu::DeviceRegionPool::compact()
+	std::uint64_t relocation_batches_total = 0;     // buildRelocationPlan()/processRelocationBatch() passes run
+	std::uint64_t candidates_requeued_total = 0;    // promotion candidates pushed back to the policy for a later pass
+																									 // (crowded out by a same-pass cap/budget, or a transient
+																									 // execution-time failure -- see region_manager.cpp's
+																									 // buildRelocationPlan()/processRelocationBatch())
+	std::uint64_t candidates_rejected_total = 0;    // promotion candidates a ReplacementPolicy permanently dropped
+																									 // via BatchAdmissionDecision::Reject
 };
 
 /// Arachne's index-agnostic control plane: decides where SEARCH/INSERT/DELETE
@@ -110,7 +118,11 @@ struct ControllerStats {
 /// on_worker_start hook); acquireRegion() picks up that stream when called
 /// from a worker thread, or DeviceContext's management stream otherwise --
 /// see gpu::DeviceContext::workerStream()/managementStream()'s own doc
-/// comments for why the two are kept physically separate.
+/// comments for why the two are kept physically separate. The same
+/// on_worker_start hook also binds thread_local g_worker_scratch to that
+/// worker's dedicated scratch buffer (gpu::DeviceContext::workerScratch()),
+/// exposed via workerScratch() below -- see IAdapter::
+/// requiredScratchBytesPerWorker()'s doc comment for what it's for.
 ///
 /// Member destruction order matters and is enforced by declaration order
 /// below: scheduler_ (whose worker threads read g_worker_stream and may
@@ -136,7 +148,16 @@ class Controller {
 			 CoordinatorConfig coordinator_config = {},
 			 gpu::AllocationPolicy allocation_policy = gpu::AllocationPolicy::Async);
 
-	SearchResult search(const Query& query);
+	/// `record_for_replacement_policy = false` runs the search exactly as
+	/// normal (routing, GpuOnly/Hybrid dispatch, adapter call) but suppresses
+	/// both RegionManager::recordTraversal() and requestPromotion() for it --
+	/// i.e. this query is invisible to promotion/eviction bookkeeping, as if
+	/// it never happened, while still returning a real result. For a
+	/// measurement-only query (e.g. computing recall against a held-out
+	/// evaluation set) that must not itself perturb which Regions later get
+	/// promoted/evicted. Defaults to true (normal behavior, matching every
+	/// existing caller).
+	SearchResult search(const Query& query, bool record_for_replacement_policy = true);
 
 	/// Fails (ok=false, nothing touched) if record.id is already live -- a
 	/// prior unremoved insert(), or a concurrent insert() for the same id.
@@ -145,6 +166,42 @@ class Controller {
 	/// the id for reuse.
 	InsertResult insert(const Record& record);
 	DeleteResult remove(VectorId id);
+
+	/// Non-blocking siblings of search()/insert()/remove(): submit the same
+	/// work, but return immediately with a future instead of waiting for it
+	/// to finish. search()/insert()/remove() are themselves now just
+	/// `submitXxx(...).get()`.
+	///
+	/// Why this exists: SchedulingConfig::traverse_batch_size/
+	/// modify_batch_size only let OpScheduler merge multiple *simultaneously
+	/// pending* requests into one adapter call -- but search()/insert()/
+	/// remove() each submit-and-immediately-block, so at most one request
+	/// per calling thread is ever pending at once, capping how much any
+	/// batch_size setting > (number of calling threads) can actually help.
+	/// A caller that wants OpScheduler's batching to matter needs to have
+	/// many requests genuinely in flight at the same time -- e.g. submit a
+	/// whole step's worth of vectors via submitInsert() into a
+	/// std::vector<std::future<...>> first, *then* call .get() on all of
+	/// them -- which these make possible without spawning a thread per
+	/// pending request.
+	///
+	/// Lifetime: unlike a synchronous call, the request may not actually run
+	/// until well after this function returns, so (unlike VectorView's
+	/// general "never assumes it outlives a single call" contract, see
+	/// types.hpp) the caller must keep `record`/`query`'s backing vector
+	/// memory valid until the returned future is ready -- not just until
+	/// this function returns.
+	///
+	/// insert() is a two-stage pipeline (a Traverse lookup, then a Modify
+	/// using what it found); submitInsert() chains the two internally via
+	/// OpScheduler's on_complete hook (see TraverseTask::on_complete's doc
+	/// comment) rather than blocking any thread on the lookup's own future,
+	/// so both stages remain individually batchable across many concurrent
+	/// submitInsert() calls. submitSearch() chains its own possible
+	/// GpuOnly-miss-then-Hybrid-retry the same way.
+	std::future<SearchResult> submitSearch(const Query& query, bool record_for_replacement_policy = true);
+	std::future<InsertResult> submitInsert(const Record& record);
+	std::future<DeleteResult> submitRemove(VectorId id);
 
 	/// Adapter opt-in (see RegionManager::registerRegion()'s doc comment):
 	/// declares `id` promotion/eviction-eligible and records where its host
@@ -156,6 +213,27 @@ class Controller {
 	/// doc comment for how a caller is meant to use the result. Throws
 	/// std::invalid_argument if `region` was never registered.
 	RegionAccess acquireRegion(RegionId region);
+
+	/// Persistent, worker-affine GPU scratch buffer for the calling
+	/// OpScheduler execution worker thread -- see IAdapter::
+	/// requiredScratchBytesPerWorker()'s doc comment for the contract (size
+	/// fixed once at this Controller's construction; the same buffer is
+	/// reused across every call/hop that worker thread ever makes, never
+	/// individually allocated/freed). Returns nullptr if called from a
+	/// non-worker thread, or if the adapter's requiredScratchBytesPerWorker()
+	/// returned 0 -- a caller must treat either case as "no scratch
+	/// available" and fall back to its own allocation, not as an error.
+	void* workerScratch() const;
+
+	/// The calling OpScheduler execution worker thread's own dedicated CUDA
+	/// stream (gpu::DeviceContext::workerStream()) -- the same stream
+	/// acquireRegion() itself picks up internally, exposed directly for a
+	/// caller that needs a stream *before* knowing whether any particular
+	/// Region is resident (e.g. HnswlibIndexGpu's device_query setup, which no
+	/// longer depends on its entry point being resident -- see
+	/// hnswlib_index_gpu.cpp). Falls back to DeviceContext's management stream
+	/// when called from a non-worker thread, same as acquireRegion().
+	cudaStream_t workerStream() const;
 
 	/// See ControllerStats' own doc comment. Cheap: the counters are
 	/// independent relaxed atomics, and gpu_bytes_allocated delegates to
@@ -204,13 +282,43 @@ class Controller {
 		InsertPlan routeInsert(const Record& record, TraverseResult candidates);
 		RemovePlan routeRemove(VectorId id);
 
+	// Mints a fresh Anchor id, used whenever routing didn't already find an
+	// existing Anchor to attach to (both search()'s and insert()'s own
+	// lookup traversal need this) -- see next_anchor_id_'s own doc comment
+	// for why this replaced insert()'s previous "just reuse record.id"
+	// shortcut, and index_adapter.hpp's TraverseRequest::anchor_id doc
+	// comment for the opaque-id contract this now upholds unconditionally
+	// rather than only for the search() path. Guaranteed collision-free with
+	// every id minted so far unless next_anchor_id_ has completed a full
+	// 64-bit lap -- see this method's own definition (controller.cpp) for
+	// how that residual case is detected and handled rather than merely
+	// documented away.
+	VectorId MintAnchorId();
+
 	// `promotion_anchor_id`, when nonzero, is offered to RegionManager::
 	// requestPromotion() as a promotion candidate for whatever Regions this
 	// traversal touches; that call and recordTraversal() both run on the
 	// worker thread via on_complete (see class doc comment), not here.
 	// Defaults to 0 (no promotion request) -- e.g. verify()'s traversal.
-	TraverseResult dispatch(const TraverseRequest& request, VectorId promotion_anchor_id = 0);
+	// `record_traversal = false` additionally suppresses recordTraversal()
+	// itself (so promotion_anchor_id is moot regardless of its value) -- see
+	// search()'s `record_for_replacement_policy` doc comment for why a caller
+	// would want this.
+	TraverseResult dispatch(const TraverseRequest& request, VectorId promotion_anchor_id = 0,
+			bool record_traversal = true);
 	ModifyResult dispatch(const ModifyRequest& request);
+
+	// Non-blocking sibling dispatch() is now a thin wrapper over: schedules
+	// `request`, wires up the same recordTraversal()/requestPromotion()
+	// on_complete bookkeeping, but returns the future as-is instead of
+	// calling .get() on it. submitSearch()/submitInsert() do *not* go
+	// through this: their retry/chaining on_complete needs to do more than
+	// just this bookkeeping (schedule a follow-up request, resolve an outer
+	// promise), which a plain returned future can't have attached after the
+	// fact -- they call scheduler_.schedule() directly instead, inlining the
+	// same two bookkeeping lines themselves.
+	std::future<TraverseResult> dispatchAsync(
+			const TraverseRequest& request, VectorId promotion_anchor_id = 0, bool record_traversal = true);
 
 	// RegionManager owns RoutingCache registration/erasure itself now, at
 	// actual promotion-grant/eviction time -- these just shape each
@@ -242,10 +350,28 @@ class Controller {
 	// adapter calling acquireRegion() from traverseDevice()/modifyDevice()
 	// would otherwise touch already-destroyed GPU state.
 	OpScheduler scheduler_;
-	// Minted from search()'s calling thread whenever a query needs a Hybrid
-	// traversal -- atomic since multiple concurrent search() calls mint from
-	// this independently, with no other lock protecting it.
+	// Backing counter for MintAnchorId() -- both search()'s and insert()'s own
+	// lookup traversal mint from this independently (atomic, no other lock
+	// protecting it) whenever routing didn't already find an existing Anchor.
+	// Anchor ids are a namespace Core manages entirely on its own, distinct
+	// from the adapter's own VectorId space (an Anchor minted here need not
+	// correspond to any real, stored element -- see index_adapter.hpp's
+	// TraverseRequest::anchor_id doc comment) -- MintAnchorId() ORs the top
+	// bit onto every value this counter produces, guaranteeing that
+	// separation by construction rather than by convention. This counter
+	// itself is a plain, unbounded 64-bit increment -- it isn't masked to 63
+	// bits, so its raw values keep climbing past 2^63 (at which point OR-ing
+	// the top bit becomes a no-op, harmlessly) all the way up to the actual
+	// std::uint64_t wraparound at 2^64. See MintAnchorId()'s own doc comment
+	// for what happens on that wraparound (astronomically unlikely on its
+	// own terms, not merely "unlikely at today's scale").
 	std::atomic<VectorId> next_anchor_id_{1};
+	// Sticky "has next_anchor_id_ ever completed a full lap" flag --
+	// MintAnchorId() only pays isKnownAnchor()'s mutex-guarded collision
+	// check once this is true, keeping every mint before the first (if
+	// ever) wraparound completely lock-free on this member. See
+	// MintAnchorId()'s own doc comment for the full reasoning.
+	std::atomic<bool> next_anchor_id_wrapped_{false};
 
 	// Which VectorIds insert() currently considers live (see its doc
 	// comment) -- independent of region_manager_, since an id can be live

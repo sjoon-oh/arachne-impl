@@ -78,6 +78,11 @@ std::vector<RegionId> RegionManager::regionsOf(VectorId anchor_id) const {
 }
 
 std::vector<RegionResidencyHint> RegionManager::residencyHints(VectorId anchor_id) const {
+	// Diagnostic-only trace scope (ARACHNE_ENABLE_TRACING, zero-cost otherwise
+	// -- see telemetry/trace.hpp): added to profile a timing gap between raw
+	// hnswlib and Arachne's Controller stack, to check whether this
+	// mutex-protected hot-path call is contributing. No behavior change.
+	ARACHNE_TRACE_SCOPE("RegionManager", "residencyHints");
 	std::lock_guard<RegionManagerMutex> lock(mutex_);
 	auto dependency_it = dependencies_.find(anchor_id);
 	if (dependency_it == dependencies_.end() || dependency_it->second.empty()) return {};
@@ -180,6 +185,23 @@ std::vector<RegionId> RegionManager::forget(VectorId anchor_id) {
 		}
 	}
 	dependencies_.erase(dep_it);
+	for (RegionId region_id : orphaned) region_group_.erase(region_id);
+
+	// Leave anchor_id's group too, if it had one -- keeps group_members_ (and
+	// therefore every remaining member's EvictionCandidate::group_members)
+	// accurate immediately, rather than pointing at an Anchor that no longer
+	// depends on anything. Reached both from releaseAnchor() (any
+	// Controller-calling thread, via commitRemove()) and from group-based
+	// eviction's own retireAnchorsNow() call (Coordinator thread only) --
+	// already safe under mutex_, same as dependents_/dependencies_ above.
+	if (auto group_it = anchor_group_.find(anchor_id); group_it != anchor_group_.end()) {
+		GroupId group_id = group_it->second;
+		anchor_group_.erase(group_it);
+		if (auto members_it = group_members_.find(group_id); members_it != group_members_.end()) {
+			members_it->second.erase(anchor_id);
+			if (members_it->second.empty()) group_members_.erase(members_it);
+		}
+	}
 	return orphaned;
 }
 
@@ -318,6 +340,12 @@ void RegionManager::releaseAnchor(VectorId anchor_id) {
 	coordinator_cv_.notify_one();
 }
 
+bool RegionManager::isKnownAnchor(VectorId anchor_id) const {
+	ARACHNE_TRACE_SCOPE("RegionManager", "isKnownAnchor");
+	std::lock_guard<RegionManagerMutex> lock(mutex_);
+	return dependencies_.contains(anchor_id) || anchor_epoch_.contains(anchor_id);
+}
+
 void RegionManager::recordTraversal(const RegionFootprint& touched) {
 	ARACHNE_TRACE_SCOPE("RegionManager", "recordTraversal");
 	std::unordered_set<VectorId> anchors;
@@ -359,6 +387,7 @@ RegionManager::Stats RegionManager::stats() const {
 	result.relocation_batches_total = stat_relocation_batches_.load(std::memory_order_relaxed);
 	result.candidates_requeued_total = stat_candidates_requeued_.load(std::memory_order_relaxed);
 	result.near_fit_reuses_total = stat_near_fit_reuses_.load(std::memory_order_relaxed);
+	result.candidates_rejected_total = stat_candidates_rejected_.load(std::memory_order_relaxed);
 	std::lock_guard<RegionManagerMutex> lock(mutex_);
 	if (device_region_pool_ != nullptr) result.gpu_bytes_allocated = device_region_pool_->bytesAllocated();
 	return result;
@@ -567,12 +596,34 @@ std::size_t RegionManager::reservedRegionBytes(const Region& region) const {
 }
 
 std::vector<EvictionCandidate> RegionManager::buildEvictionCandidates() const {
+	// Diagnostic-only (ARACHNE_ENABLE_TRACING build) -- see the latency-
+	// tracing report entry this was added for.
+	ARACHNE_TRACE_SCOPE("RegionManager", "buildEvictionCandidates");
 	std::vector<EvictionCandidate> candidates;
 	std::lock_guard<RegionManagerMutex> lock(mutex_);
 	candidates.reserve(dependencies_.size());
 	for (const auto& [anchor_id, region_ids] : dependencies_) {
 		EvictionCandidate candidate;
 		candidate.anchor_id = anchor_id;
+
+		// This Anchor's group (see assignAnchorToGroup()'s doc comment) --
+		// falls back to a solo {anchor_id} set for an Anchor that was never
+		// assigned one (predates group tracking, or simply hasn't been through
+		// a promotion commit yet), which reproduces the original
+		// sole-ownership-only rule below exactly.
+		const std::unordered_set<VectorId>* members = nullptr;
+		std::unordered_set<VectorId> solo;
+		if (auto group_it = anchor_group_.find(anchor_id); group_it != anchor_group_.end()) {
+			if (auto members_it = group_members_.find(group_it->second); members_it != group_members_.end()) {
+				members = &members_it->second;
+			}
+		}
+		if (members == nullptr) {
+			solo.insert(anchor_id);
+			members = &solo;
+		}
+		candidate.group_members.assign(members->begin(), members->end());
+
 		for (RegionId region_id : region_ids) {
 			auto region_it = regions_.find(region_id);
 			if (region_it == regions_.end() || !region_it->second.device.valid()) continue;
@@ -581,7 +632,15 @@ std::vector<EvictionCandidate> RegionManager::buildEvictionCandidates() const {
 			candidate.resident_bytes += bytes;
 			++candidate.resident_regions;
 			auto dependents_it = dependents_.find(region_id);
-			if (dependents_it != dependents_.end() && dependents_it->second.size() == 1) {
+			// Reclaimable by evicting this Anchor's whole *group* together --
+			// every current dependent of the Region must be a group member, not
+			// just anchor_id itself (the group_merge_overlap_threshold==1-member
+			// default makes this identical to the original "exactly one
+			// dependent" check).
+			bool reclaimable_by_group = dependents_it != dependents_.end() &&
+					std::all_of(dependents_it->second.begin(), dependents_it->second.end(),
+							[members](VectorId a) { return members->count(a) != 0; });
+			if (reclaimable_by_group) {
 				candidate.reclaimable_bytes += bytes;
 				if (region.residency_state == RegionResidencyState::Resident && region.residency_pins == 0) {
 					candidate.reclaimable_now_bytes += bytes;
@@ -590,12 +649,54 @@ std::vector<EvictionCandidate> RegionManager::buildEvictionCandidates() const {
 				++candidate.reclaimable_regions;
 			}
 		}
-		if (candidate.resident_regions != 0) candidates.push_back(candidate);
+		if (candidate.resident_regions != 0) candidates.push_back(std::move(candidate));
 	}
 	return candidates;
 }
 
-AdmissionContext RegionManager::buildAdmissionContext(const PromotionCandidate& candidate) const {
+void RegionManager::assignAnchorToGroup(VectorId anchor_id, const std::vector<RegionId>& footprint_regions) {
+	std::lock_guard<RegionManagerMutex> lock(mutex_);
+	if (auto existing = anchor_group_.find(anchor_id); existing != anchor_group_.end()) {
+		// Already grouped (e.g. a re-promotion re-confirming residency) --
+		// leave it in place, just extend the group's region tags so a *future*
+		// candidate's overlap computation sees this footprint too.
+		for (RegionId region_id : footprint_regions) region_group_[region_id] = existing->second;
+		return;
+	}
+
+	std::unordered_map<GroupId, std::size_t> overlap_count;
+	for (RegionId region_id : footprint_regions) {
+		if (auto it = region_group_.find(region_id); it != region_group_.end()) ++overlap_count[it->second];
+	}
+	GroupId best_group = 0;
+	std::size_t best_overlap = 0;
+	for (const auto& [group_id, count] : overlap_count) {
+		if (count > best_overlap) {
+			best_overlap = count;
+			best_group = group_id;
+		}
+	}
+	double overlap_ratio = footprint_regions.empty()
+			? 0.0
+			: static_cast<double>(best_overlap) / static_cast<double>(footprint_regions.size());
+
+	GroupId assigned;
+	auto best_members_it = best_group != 0 ? group_members_.find(best_group) : group_members_.end();
+	bool can_join = best_group != 0 && overlap_ratio >= coordinator_config_.group_merge_overlap_threshold &&
+			best_members_it != group_members_.end() &&
+			best_members_it->second.size() < coordinator_config_.max_eviction_group_size;
+	if (can_join) {
+		assigned = best_group;
+	} else {
+		assigned = next_group_id_++;
+	}
+	group_members_[assigned].insert(anchor_id);
+	anchor_group_[anchor_id] = assigned;
+	for (RegionId region_id : footprint_regions) region_group_[region_id] = assigned;
+}
+
+AdmissionContext RegionManager::buildAdmissionContext(
+		const PromotionCandidate& candidate, std::optional<std::vector<EvictionCandidate>>& eviction_candidates_cache) const {
 	AdmissionContext context;
 	context.allocation_unit_bytes = device_region_pool_->allocationUnitBytes(gpu::MemoryKind::Data);
 	std::unordered_set<RegionId> unique_regions;
@@ -616,7 +717,26 @@ AdmissionContext RegionManager::buildAdmissionContext(const PromotionCandidate& 
 	}
 	context.gpu_bytes_allocated = device_region_pool_->bytesReserved(gpu::MemoryKind::Data);
 	context.gpu_budget_bytes = device_region_pool_->budgetBytes(gpu::MemoryKind::Data);
-	context.eviction_candidates = buildEvictionCandidates();
+
+	// buildEvictionCandidates() is a real cost (scans every tracked Anchor's
+	// dependencies while holding mutex_ -- the same mutex_ hot-path calls
+	// like tryPinResidency() need, so an unnecessary scan here is contended
+	// lock time for search()/insert() callers, not just wasted Coordinator-
+	// thread work). Skip it entirely when there's already enough free
+	// capacity to admit this candidate without evicting anything -- no
+	// policy's evaluateAdmission()/evaluateBatchAdmission() can act on
+	// eviction_candidates before checking that anyway (see AdmissionContext's
+	// own doc comment). When eviction info *is* needed, compute it at most
+	// once per buildRelocationPlan() pass and reuse the cached result for
+	// every other candidate examined in that same pass -- see this method's
+	// declaration (region_manager.hpp) for why that's always exactly as
+	// fresh as recomputing it every time.
+	std::size_t available =
+			context.gpu_budget_bytes > context.gpu_bytes_allocated ? context.gpu_budget_bytes - context.gpu_bytes_allocated : 0;
+	if (available < context.incremental_bytes) {
+		if (!eviction_candidates_cache.has_value()) eviction_candidates_cache = buildEvictionCandidates();
+		context.eviction_candidates = *eviction_candidates_cache;
+	}
 	return context;
 }
 
@@ -689,8 +809,22 @@ std::optional<RegionManager::RelocationPlan> RegionManager::buildRelocationPlan(
 	const std::size_t reserved = device_region_pool_->bytesReserved(gpu::MemoryKind::Data);
 	const std::size_t available = budget > reserved ? budget - reserved : 0;
 	std::size_t selected_incremental = 0;
+	// Populated lazily by buildAdmissionContext() the first time any
+	// candidate in this pass actually needs eviction info, then reused for
+	// every other candidate examined here and for the victim-selection loop
+	// below -- see buildAdmissionContext()'s own comment for why recomputing
+	// it more than once per pass is always redundant.
+	std::optional<std::vector<EvictionCandidate>> eviction_candidates_cache;
 
-	while (std::optional<PromotionCandidate> candidate = replacement_policy_->selectNextPromotionCandidate()) {
+	// Diagnostic-only (ARACHNE_ENABLE_TRACING build): brace-scoped so the
+	// timer covers exactly the promotion-collection loop below, distinct
+	// from the victim-selection loop further down -- see the latency-tracing
+	// report entry this was added for.
+	{
+	ARACHNE_TRACE_SCOPE("RegionManager", "buildRelocationPlan_collect");
+	while (true) {
+		std::optional<PromotionCandidate> candidate = replacement_policy_->selectNextPromotionCandidate();
+		if (!candidate.has_value()) break;
 		{
 			std::lock_guard<RegionManagerMutex> lock(mutex_);
 			if (currentEpochLocked(candidate->anchor_id) != candidate->epoch) continue;
@@ -699,7 +833,7 @@ std::optional<RegionManager::RelocationPlan> RegionManager::buildRelocationPlan(
 		candidate->last_batch_sequence = batch_sequence;
 		if (candidate->first_batch_sequence == 0) candidate->first_batch_sequence = batch_sequence;
 
-		AdmissionContext admission = buildAdmissionContext(*candidate);
+		AdmissionContext admission = buildAdmissionContext(*candidate, eviction_candidates_cache);
 		RelocationBatchContext batch_context{batch_sequence, plan.promotions.size(), selected_incremental,
 				available, budget, coordinator_config_.max_promotion_bytes_per_pass};
 		BatchAdmissionDecision decision =
@@ -712,7 +846,10 @@ std::optional<RegionManager::RelocationPlan> RegionManager::buildRelocationPlan(
 				: decision == BatchAdmissionDecision::Defer ? "Defer"
 																										 : "Reject",
 				plan.promotions.size(), selected_incremental, retain_failed_candidates);
-		if (decision == BatchAdmissionDecision::Reject) continue;
+		if (decision == BatchAdmissionDecision::Reject) {
+			stat_candidates_rejected_.fetch_add(1, std::memory_order_relaxed);
+			continue;
+		}
 		if (decision == BatchAdmissionDecision::Defer) {
 			if (retain_failed_candidates) deferred.push_back(std::move(*candidate));
 			break;
@@ -721,7 +858,16 @@ std::optional<RegionManager::RelocationPlan> RegionManager::buildRelocationPlan(
 		if (coordinator_config_.max_promotion_bytes_per_pass != 0 && !plan.promotions.empty() &&
 				(admission.incremental_bytes > coordinator_config_.max_promotion_bytes_per_pass ||
 				 selected_incremental > coordinator_config_.max_promotion_bytes_per_pass - admission.incremental_bytes)) {
-			if (retain_failed_candidates) deferred.push_back(std::move(*candidate));
+			// Always requeue here, independent of retain_failed_candidates -- see
+			// the hard-budget branch below for the termination argument this
+			// relies on (plan.promotions non-empty here is exactly the condition
+			// that makes it safe): this pass already admitted at least one
+			// candidate before this one hit the cap, so retrying it on a later
+			// pass can only make progress, never spin. Matches CoordinatorConfig::
+			// max_promotion_bytes_per_pass's own doc comment ("subsequent work is
+			// returned to the policy for a later pass") -- that was always the
+			// intent, not something conditional on how the pass was triggered.
+			deferred.push_back(std::move(*candidate));
 			break;
 		}
 
@@ -731,19 +877,36 @@ std::optional<RegionManager::RelocationPlan> RegionManager::buildRelocationPlan(
 			VectorId dropped_anchor = plan.promotions.back().candidate.anchor_id;
 			PromotionCandidate over_budget = std::move(plan.promotions.back().candidate);
 			plan.promotions.pop_back();
-			bool requeued = !plan.promotions.empty() && retain_failed_candidates;
+			// Requeue whenever something else already claimed room in this same
+			// pass (plan.promotions non-empty after the pop) -- independent of
+			// retain_failed_candidates, and safe even during a forced/stop drain:
+			// every pass's *first* offered candidate is admitted unconditionally
+			// (this branch can only fire once plan.promotions already holds an
+			// earlier admission, or this candidate stands entirely alone -- see
+			// below), so replacement_policy_'s pending set shrinks by at least
+			// one candidate every coordinatorLoop() do-while iteration regardless
+			// of which case fires -- the loop still terminates in a bounded
+			// number of passes (at most the number of distinct candidates
+			// pending when the drain started).
+			//
+			// A candidate that's over budget entirely *by itself* (plan.promotions
+			// empty here -- it was this pass's first and only entry) is a
+			// genuinely different, permanent case: no amount of eviction could
+			// ever make a single candidate larger than the whole budget fit, so
+			// it's dropped for good rather than requeued, regardless of
+			// retain_failed_candidates -- retrying it would just spin forever.
+			bool requeued = !plan.promotions.empty();
 			ARACHNE_LOG_INFO(
 					"buildRelocationPlan[{}]: anchor {} pushed cumulative required={} over budget={} with {} other "
-					"promotion(s) already in this batch -- {} (retain_failed_candidates={})",
+					"promotion(s) already in this batch -- {}",
 					batch_sequence, dropped_anchor, required, budget, plan.promotions.size(),
-					requeued ? "requeued for a later pass" : "DROPPED PERMANENTLY (not requeued)", retain_failed_candidates);
+					requeued ? "requeued for a later pass" : "DROPPED PERMANENTLY (infeasible alone, not requeued)");
 			if (requeued) deferred.push_back(std::move(over_budget));
-			// A single candidate larger than the entire budget is permanently
-			// infeasible and intentionally rejected rather than retried forever.
 			break;
 		}
 		selected_incremental += plan.promotions.back().admission.incremental_bytes;
 	}
+	}  // end buildRelocationPlan_collect trace scope
 
 	if (!deferred.empty()) requeueCandidates(std::move(deferred));
 	if (plan.promotions.empty()) return std::nullopt;
@@ -754,7 +917,11 @@ std::optional<RegionManager::RelocationPlan> RegionManager::buildRelocationPlan(
 	for (const PlannedPromotion& promotion : plan.promotions) {
 		promoted_anchors.insert(promotion.candidate.anchor_id);
 	}
-	std::vector<EvictionCandidate> candidates = buildEvictionCandidates();
+	// Reuses eviction_candidates_cache if some candidate above already
+	// populated it -- same "static for the whole pass" reasoning as
+	// buildAdmissionContext()'s own use of it.
+	if (!eviction_candidates_cache.has_value()) eviction_candidates_cache = buildEvictionCandidates();
+	std::vector<EvictionCandidate> candidates = *eviction_candidates_cache;
 	candidates.erase(std::remove_if(candidates.begin(), candidates.end(),
 			[&promoted_anchors](const EvictionCandidate& candidate) {
 				return promoted_anchors.contains(candidate.anchor_id);
@@ -763,6 +930,11 @@ std::optional<RegionManager::RelocationPlan> RegionManager::buildRelocationPlan(
 			"buildRelocationPlan[{}]: required={} available={} eviction_candidates={} -- entering victim-selection loop",
 			batch_sequence, plan.required_incremental_bytes, available, candidates.size());
 
+	// Diagnostic-only (ARACHNE_ENABLE_TRACING build): see the
+	// buildRelocationPlan_collect scope above -- this one covers only the
+	// victim-selection loop, so the two phases show up as separate CSVs.
+	{
+	ARACHNE_TRACE_SCOPE("RegionManager", "buildRelocationPlan_evict");
 	while (available + plan.immediately_reclaimable_bytes < plan.required_incremental_bytes) {
 		std::size_t remaining = plan.required_incremental_bytes -
 				(available + plan.immediately_reclaimable_bytes);
@@ -784,25 +956,43 @@ std::optional<RegionManager::RelocationPlan> RegionManager::buildRelocationPlan(
 					batch_sequence, victim.value());
 			break;
 		}
-		plan.evictions.push_back(*victim);
+		// Evicting *any* member of found's group without the rest would not
+		// actually free found->reclaimable_bytes -- see EvictionCandidate::
+		// group_members's doc comment -- so the whole named group goes into
+		// plan.evictions together, in one step, not just *victim alone.
+		bool is_first_group = plan.evictions.empty();
+		std::vector<VectorId> group_to_evict = found->group_members;
+		std::size_t evictions_size_before = plan.evictions.size();
+		plan.evictions.insert(plan.evictions.end(), group_to_evict.begin(), group_to_evict.end());
 		std::size_t projected = projectedReclaimableBytes(plan.evictions, /*require_unpinned=*/true);
 		ARACHNE_LOG_INFO(
-				"buildRelocationPlan[{}]: selected victim anchor {} (resident_bytes={} reclaimable_bytes={} "
-				"reclaimable_now_bytes={}) -- plan.evictions now {} anchor(s), projected reclaimable {} -> {}",
-				batch_sequence, *victim, found->resident_bytes, found->reclaimable_bytes, found->reclaimable_now_bytes,
-				plan.evictions.size(), plan.immediately_reclaimable_bytes, projected);
-		if (coordinator_config_.max_eviction_bytes_per_pass != 0 && plan.evictions.size() > 1 &&
+				"buildRelocationPlan[{}]: selected victim anchor {} and its {} group member(s) (resident_bytes={} "
+				"reclaimable_bytes={} reclaimable_now_bytes={}) -- plan.evictions now {} anchor(s), projected "
+				"reclaimable {} -> {}",
+				batch_sequence, *victim, group_to_evict.size(), found->resident_bytes, found->reclaimable_bytes,
+				found->reclaimable_now_bytes, plan.evictions.size(), plan.immediately_reclaimable_bytes, projected);
+		if (coordinator_config_.max_eviction_bytes_per_pass != 0 && !is_first_group &&
 				projected > coordinator_config_.max_eviction_bytes_per_pass) {
 			ARACHNE_LOG_INFO(
 					"buildRelocationPlan[{}]: projected {} exceeds max_eviction_bytes_per_pass={} with {} victims "
-					"already selected -- dropping the just-added victim and stopping",
+					"already selected -- dropping the just-added group and stopping",
 					batch_sequence, projected, coordinator_config_.max_eviction_bytes_per_pass, plan.evictions.size());
-			plan.evictions.pop_back();
+			plan.evictions.resize(evictions_size_before);
 			break;
 		}
 		plan.immediately_reclaimable_bytes = projected;
-		candidates.erase(found);
+		// Every group member has its own EvictionCandidate entry (see
+		// buildEvictionCandidates()'s doc comment) -- all of them just got
+		// committed to plan.evictions together, so none should be offered
+		// again as a separate, redundant selection.
+		candidates.erase(std::remove_if(candidates.begin(), candidates.end(),
+				[&group_to_evict](const EvictionCandidate& candidate) {
+					return std::find(group_to_evict.begin(), group_to_evict.end(), candidate.anchor_id) !=
+							group_to_evict.end();
+				}),
+				candidates.end());
 	}
+	}  // end buildRelocationPlan_evict trace scope
 
 	if (available + plan.immediately_reclaimable_bytes < plan.required_incremental_bytes) {
 		ARACHNE_LOG_INFO(
@@ -925,13 +1115,19 @@ void RegionManager::processRelocationBatch(bool retain_failed_candidates) {
 	std::vector<PromotionCandidate> retry_candidates;
 	for (std::size_t i = 0; i < plan.promotions.size(); ++i) {
 		PlannedPromotion& promotion = plan.promotions[i];
-		bool resident = !regionsOf(promotion.candidate.anchor_id).empty();
+		std::vector<RegionId> resident_regions = regionsOf(promotion.candidate.anchor_id);
+		bool resident = !resident_regions.empty();
 		if (resident) {
 			replacement_policy_->onPromotionCommitted(promotion.candidate.anchor_id, promotion.admission);
 			if (routing_cache_ != nullptr) {
 				routing_cache_->ensure(promotion.candidate.anchor_id, promotion.candidate.vectorView(),
 						kDefaultAnchorMaxDistance);
 			}
+			// Group assignment uses this Anchor's final, actually-committed
+			// footprint (not the originally-requested one -- some Regions in
+			// the original footprint may have come back NotEligible/Deferred
+			// above and simply aren't part of resident_regions).
+			assignAnchorToGroup(promotion.candidate.anchor_id, resident_regions);
 		}
 		if (retry[i] && retain_failed_candidates) {
 			retry_candidates.push_back(std::move(promotion.candidate));

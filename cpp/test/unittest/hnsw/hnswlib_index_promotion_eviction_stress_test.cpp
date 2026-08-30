@@ -1,14 +1,15 @@
 // "Hard" stress tests for the HNSW port under promotion/eviction churn --
-// distinct from hnsw_index_dist_test.cpp/hnsw_index_anchor_entry_dist_test.cpp
-// (which use a generous GPU budget so nothing ever gets evicted mid-test).
+// distinct from hnswlib_index_gpu_test.cpp (which uses a generous GPU
+// budget so nothing ever gets evicted mid-test).
 // Here the GPU budget is deliberately too small for the whole dataset, and
 // many threads hammer Controller::search() concurrently, so RegionManager's
 // Coordinator is under constant promotion/eviction pressure the whole run.
 //
-// Also covers two specific risks this port's existing tests never exercised
-// (identified by reading Controller::dispatch(const ModifyRequest&) and
-// RegionManager::clearResidency()'s call sites -- see this file's own
-// comments below for what was actually found):
+// Also covers three specific risks this port's existing tests never
+// exercised (identified by reading Controller::dispatch(const
+// ModifyRequest&) and RegionManager::clearResidency()'s call sites, plus (for
+// the third) hnswlib_index.cpp's TypedHnswEngine -- see this file's own comments
+// below for what was actually found):
 //   - Whether heavy concurrent promotion/eviction churn alone can corrupt
 //     results or crash the process (thread-safety of the coarse mutex_ +
 //     Lease/pin machinery under real contention, not just sequential calls).
@@ -20,8 +21,17 @@
 //     all (unlike the TraverseRequest overload) -- nothing in Core ever
 //     calls RegionManager::clearResidency() in reaction to a completed
 //     Insert/Delete.
+//   - Whether concurrent same-op Insert (OpScheduler's traverse/modify
+//     isolation gate, core/op_scheduler.hpp, admits this by design) actually
+//     corrupts the graph now that HnswlibIndex::mutex_ no longer serializes
+//     modifyHost() at all -- TypedHnswEngine's label_lookup_/level0Neighors()
+//     accesses take hnswlib's own public label_lookup_lock/link_list_locks_
+//     instead (see hnswlib_index.cpp), matching hnswlib's own internal
+//     convention; this is the test that actually exercises those locks under
+//     real contention rather than just arguing they're correct by
+//     inspection.
 
-#include "hnsw_index_anchor_entry.hpp"
+#include "hnswlib_index_gpu.hpp"
 
 #include <gtest/gtest.h>
 
@@ -59,7 +69,7 @@ using arachne::VectorBatchView;
 using arachne::VectorDType;
 using arachne::VectorId;
 using arachne::VectorView;
-using arachne::index::hnsw::HnswIndexAnchorEntry;
+using arachne::index::hnsw::HnswlibIndexGpu;
 using arachne::stress::testsupport::GenerateVectors;
 
 constexpr std::uint32_t kDim = 16;
@@ -100,7 +110,7 @@ void RunConcurrently(std::size_t num_threads, const std::function<void(std::size
 	if (!exceptions.empty()) std::rethrow_exception(exceptions.front());
 }
 
-class HnswIndexPromotionEvictionStressTest : public testing::Test {
+class HnswlibIndexPromotionEvictionStressTest : public testing::Test {
  protected:
 	static constexpr std::size_t kNumVectors = 3000;
 	static constexpr std::size_t kCapacity = 3500;  // headroom for inserts in later tests
@@ -109,7 +119,7 @@ class HnswIndexPromotionEvictionStressTest : public testing::Test {
 		std::mt19937 rng(101);
 		vectors_ = GenerateVectors(VectorDType::Float32, kDim, kNumVectors, rng);
 
-		index_ = std::make_unique<HnswIndexAnchorEntry>(kDim, VectorDType::Float32, DistanceMetric::L2, kCapacity,
+		index_ = std::make_unique<HnswlibIndexGpu>(kDim, VectorDType::Float32, DistanceMetric::L2, kCapacity,
 																										 kVectorsPerRegion, kM, kEfConstruction);
 
 		std::vector<std::byte> bytes(vectors_.front().size() * vectors_.size());
@@ -125,7 +135,7 @@ class HnswIndexPromotionEvictionStressTest : public testing::Test {
 	}
 
 	std::vector<std::vector<std::byte>> vectors_;
-	std::unique_ptr<HnswIndexAnchorEntry> index_;
+	std::unique_ptr<HnswlibIndexGpu> index_;
 	std::size_t total_host_bytes_ = 0;
 };
 
@@ -135,7 +145,7 @@ class HnswIndexPromotionEvictionStressTest : public testing::Test {
 // dataset able to fit on GPU at once, the replacement policy is forced to
 // evict continuously to make room for newer localities -- this is the
 // "excessive promotion/eviction" scenario, not just a one-time settle.
-TEST_F(HnswIndexPromotionEvictionStressTest, SurvivesHeavyConcurrentChurnAndStaysAccurate) {
+TEST_F(HnswlibIndexPromotionEvictionStressTest, SurvivesHeavyConcurrentChurnAndStaysAccurate) {
 	ASRoutingCacheHnsw routing_cache(kDim, /*initial_capacity=*/256, /*max_tombstone_ratio=*/0.2, /*M=*/16,
 																	 /*ef_construction=*/100, DistanceMetric::L2, VectorDType::Float32);
 	SchedulingConfig scheduling_config;
@@ -200,7 +210,7 @@ TEST_F(HnswIndexPromotionEvictionStressTest, SurvivesHeavyConcurrentChurnAndStay
 // Controller::insert() for brand-new vectors while others keep searching --
 // exercises the coarse mutex_ under real concurrent Insert+Search+
 // promotion/eviction, not just concurrent Search alone above.
-TEST_F(HnswIndexPromotionEvictionStressTest, ConcurrentInsertDuringChurnDoesNotCorruptOrCrash) {
+TEST_F(HnswlibIndexPromotionEvictionStressTest, ConcurrentInsertDuringChurnDoesNotCorruptOrCrash) {
 	ASRoutingCacheHnsw routing_cache(kDim, /*initial_capacity=*/256, /*max_tombstone_ratio=*/0.2, /*M=*/16,
 																	 /*ef_construction=*/100, DistanceMetric::L2, VectorDType::Float32);
 	SchedulingConfig scheduling_config;
@@ -269,19 +279,122 @@ TEST_F(HnswIndexPromotionEvictionStressTest, ConcurrentInsertDuringChurnDoesNotC
 	EXPECT_GE(static_cast<double>(found_self) / static_cast<double>(checked), 0.5);
 }
 
+// Targeted concurrent Insert-vs-Insert stress test for the fine-grained
+// hnswlib locking added to TypedHnswEngine (hnswlib_index.cpp): globalEntryPoint()/
+// level0Neighbors()/internalIdFor()/insertOne() now take hnswlib's own public
+// global/link_list_locks_[id]/label_lookup_lock directly, instead of relying
+// on HnswlibIndex::mutex_ -- which traverseHost()/modifyHost()/
+// TraverseBatchOnDevice() no longer take at all (see hnswlib_index.hpp's class doc
+// comment). OpScheduler's traverse/modify isolation gate admits same-op
+// Modify batches (Insert-vs-Insert here) concurrently by design (see
+// core/op_scheduler.hpp), so this is the one combination that genuinely
+// relies on the new fine-grained locks rather than on the gate alone.
+//
+// Deliberately clusters every inserted vector as a tiny jittered
+// near-duplicate of one of a small number of "hub" points, spread across
+// threads round-robin, so that many concurrently-running addPoint() calls
+// are very likely to pick each other's brand-new nodes as level-0 neighbors
+// -- i.e. thread A reading back its own new node's neighbor list
+// (level0Neighbors() in modifyHost()'s `modified` footprint bookkeeping)
+// while thread B is concurrently mid-rewrite of that same list
+// (mutuallyConnectNewElement() picking A's node as one of B's own
+// neighbors) -- exactly the race link_list_locks_[id] is meant to prevent.
+// Random (unclustered) inserts would rarely land in the same neighborhood at
+// the same time and could pass even with the race still present.
+TEST_F(HnswlibIndexPromotionEvictionStressTest, ConcurrentSameOpInsertNeverCorruptsTheGraph) {
+	ASRoutingCacheHnsw routing_cache(kDim, /*initial_capacity=*/256, /*max_tombstone_ratio=*/0.2, /*M=*/16,
+																	 /*ef_construction=*/100, DistanceMetric::L2, VectorDType::Float32);
+	SchedulingConfig scheduling_config;
+	scheduling_config.max_execution_threads = 8;
+	// Generous budget: this test is about host-side graph integrity under
+	// concurrent Insert, not promotion/eviction (the other two tests in this
+	// fixture already cover that combination).
+	Controller controller(*index_, routing_cache, scheduling_config, nullptr, total_host_bytes_ * 4);
+	index_->registerAllRegions(controller);
+	index_->attachController(controller);
+
+	// kHubs < kInsertThreads on purpose -- multiple threads share each hub
+	// (thread_index % kHubs below), so concurrently-running inserts are very
+	// likely to be near-duplicates of *each other*, not just of their hub.
+	// Total inserts (kInsertThreads * kInsertsPerThread) must stay within
+	// kCapacity - kNumVectors (this fixture's headroom, see kCapacity's own
+	// comment) -- hnswlib's max_elements_ is fixed at construction, so
+	// exceeding it makes addPoint() fail, which would otherwise be
+	// mis-attributed to the race this test is actually looking for.
+	constexpr std::size_t kHubs = 4;
+	constexpr std::size_t kInsertThreads = 8;
+	constexpr std::size_t kInsertsPerThread = 60;
+	static_assert(kInsertThreads * kInsertsPerThread <= kCapacity - kNumVectors, "must fit this fixture's insert headroom");
+
+	std::mt19937 hub_rng(404);
+	std::vector<std::vector<std::byte>> hubs = GenerateVectors(VectorDType::Float32, kDim, kHubs, hub_rng);
+
+	std::vector<VectorId> all_inserted_ids(kInsertThreads * kInsertsPerThread);
+	std::vector<std::vector<float>> all_inserted_vectors(kInsertThreads * kInsertsPerThread);
+	std::atomic<std::size_t> inserts_ok{0};
+
+	RunConcurrently(kInsertThreads, [&](std::size_t thread_index) {
+		std::mt19937 rng(5000 + static_cast<unsigned>(thread_index));
+		std::uniform_real_distribution<float> jitter(-0.01f, 0.01f);
+		const auto* hub_base = reinterpret_cast<const float*>(hubs[thread_index % kHubs].data());
+		for (std::size_t i = 0; i < kInsertsPerThread; ++i) {
+			std::size_t slot = thread_index * kInsertsPerThread + i;
+			std::vector<float> near(kDim);
+			for (std::uint32_t d = 0; d < kDim; ++d) near[d] = hub_base[d] + jitter(rng);
+			VectorId new_id = static_cast<VectorId>(kNumVectors) + static_cast<VectorId>(slot) + 1;
+
+			Record record{new_id, VectorView{near.data(), kDim, VectorDType::Float32}};
+			auto result = controller.insert(record);
+			if (result.ok) inserts_ok.fetch_add(1, std::memory_order_relaxed);
+
+			all_inserted_ids[slot] = new_id;
+			all_inserted_vectors[slot] = std::move(near);
+		}
+	});
+	controller.waitIdle();
+
+	ARACHNE_LOG_INFO("ConcurrentSameOpInsertNeverCorruptsTheGraph: inserts_ok={}/{}", inserts_ok.load(),
+										all_inserted_ids.size());
+	ASSERT_EQ(inserts_ok.load(), all_inserted_ids.size()) << "one or more concurrent same-op inserts failed/threw";
+	EXPECT_EQ(index_->liveCount(), kNumVectors + inserts_ok.load())
+			<< "live count mismatch -- label_lookup_/cur_element_count bookkeeping may have been corrupted under "
+				 "concurrent insert";
+
+	// Every inserted vector should be self-findable via a fresh host search --
+	// hnswlib's own greedy search, not the device approximation, so this is a
+	// direct graph-integrity check (a torn/corrupted link list or a mangled
+	// label_lookup_ entry would show up here as a missing or wrong self-hit),
+	// not a test of GPU beam-search recall.
+	std::size_t self_hits = 0;
+	for (std::size_t slot = 0; slot < all_inserted_ids.size(); ++slot) {
+		TraverseRequest request;
+		request.query.vector = VectorView{all_inserted_vectors[slot].data(), kDim, VectorDType::Float32};
+		request.query.top_k = 1;
+		TraverseResult result = index_->traverseHost({request}).front();
+		ASSERT_FALSE(result.result.neighbors.empty()) << "slot " << slot << " (id=" << all_inserted_ids[slot] << ")";
+		if (result.result.neighbors.front().id == all_inserted_ids[slot]) ++self_hits;
+	}
+	double self_recall = static_cast<double>(self_hits) / static_cast<double>(all_inserted_ids.size());
+	ARACHNE_LOG_INFO("ConcurrentSameOpInsertNeverCorruptsTheGraph: post-concurrency self-recall {}/{} ({:.3f})",
+										self_hits, all_inserted_ids.size(), self_recall);
+	EXPECT_GE(self_recall, 0.95) << "self-recall dropped to " << self_recall
+																<< " -- well below what clustered near-duplicates on a clean host search "
+																	 "should give; suggests graph corruption, not ordinary approximation";
+}
+
 // Targeted, deterministic (not relying on concurrent timing) check for the
 // specific risk flagged in this file's overview: does a host-side Insert
 // into an already-GPU-resident Region leave traverseDevice() serving stale
 // data for that Region afterward? Generous GPU budget (nothing gets evicted
 // mid-test) isolates this from the churn/eviction scenarios above.
-TEST(HnswIndexInsertAfterPromotionTest, DeviceSearchReflectsPostPromotionInsertsOrExplainsWhyNot) {
+TEST(HnswlibIndexInsertAfterPromotionTest, DeviceSearchReflectsPostPromotionInsertsOrExplainsWhyNot) {
 	constexpr std::size_t kBaseCount = 300;
 	constexpr std::size_t kCapacity = 800;
 
 	std::mt19937 rng(303);
 	std::vector<std::vector<std::byte>> vectors = GenerateVectors(VectorDType::Float32, kDim, kBaseCount, rng);
 
-	HnswIndexAnchorEntry index(kDim, VectorDType::Float32, DistanceMetric::L2, kCapacity, kVectorsPerRegion, kM,
+	HnswlibIndexGpu index(kDim, VectorDType::Float32, DistanceMetric::L2, kCapacity, kVectorsPerRegion, kM,
 														 kEfConstruction);
 	std::vector<std::byte> bytes(vectors.front().size() * vectors.size());
 	std::vector<VectorId> ids(vectors.size());
@@ -404,7 +517,7 @@ TEST(HnswIndexInsertAfterPromotionTest, DeviceSearchReflectsPostPromotionInserts
 	// port happens to rely on (engineLevel0Neighbors()/engineIsMarkedDeleted()
 	// always reading *host* memory regardless of residency, and pre-existing
 	// nodes' own vector bytes never being mutated in place by insert) is
-	// what saves it in practice -- see hnsw_index_dist.hpp's own doc comment
+	// what saves it in practice -- see hnswlib_index_gpu.hpp's own doc comment
 	// on that host-read behavior.
 	EXPECT_EQ(device_found_inserted.size(), host_found_inserted.size())
 			<< "traverseDevice() and traverseHost() disagree on how many newly-inserted near-duplicates they found "

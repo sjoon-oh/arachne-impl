@@ -1,6 +1,6 @@
 # Arachne C++ Implementation Documentation v3
 
-> Current implementation reference: 2026-08-06  
+> Current implementation reference: 2026-08-24  
 > Scope: `cpp/include`, `cpp/src`, `cpp/test`
 
 이 문서는 Arachne C++ 구현의 현재 동작을 설명하는 reference다. 설계 변경 이력이나 향후
@@ -230,23 +230,105 @@ struct SchedulingConfig {
     std::size_t modify_batch_size = 1;
     std::size_t max_execution_threads = 1;
     std::chrono::microseconds batch_wait_timeout{0};
+    std::chrono::microseconds starvation_threshold{0};
 };
 ```
 
-Scheduler는 한 planner와 여러 execution worker를 사용한다. 현재 FIFO scheduling policy는
-queue에서 같은 operation kind와 같은 execution mode인 요청을 모은다.
+Scheduler는 한 planner thread와 여러 execution worker thread를 사용한다. `queue_`(들어온
+순서대로 쌓이는 pending operation)와 `dispatch_queue_`(worker가 소비할 완성된 batch)를
+연결한다. 현재 FIFO `SchedulingPolicy`는 `queue_`에서 같은 operation kind, 같은 execution
+mode, (Modify라면) 같은 `ModifyOp`인 요청을 모은다.
 
 ```text
 Traverse + Hybrid
 Traverse + GpuOnly
-Modify   + Hybrid
-Modify   + GpuOnly
+Modify Insert + Hybrid
+Modify Insert + GpuOnly
+Modify Delete + Hybrid
+Modify Delete + GpuOnly
 ```
 
 같은 class 안에서는 queue order를 유지하지만, 다른 class의 operation을 건너뛰어 batch를
-채울 수 있으므로 strict global FIFO는 아니다.
+채울 수 있으므로 strict global FIFO는 아니다. 어떤 (kind, op) class가 다음 batch로
+선택되는지는 6.3에서 설명하는 admission gate와 fairness 로직의 영향을 받는다.
 
-### 6.2 Search
+### 6.2 Traverse/Modify execution-admission gate
+
+Planner는 `SchedulingPolicy`가 batch 구성(composition)을 결정한 직후, `collectBatch()`를
+부르기 전에 한 번 더 admission을 확인한다. `SchedulingPolicy`는 `queue_` 안에서 진행 중인
+batch 하나만 보고 결정하므로, 이미 worker에서 실행 중인 다른 batch와의 충돌은
+`SchedulingPolicy`가 아니라 이 별도 gate가 책임진다.
+
+`IAdapter::requiresTraverseModifyIsolation()`이 기본값 `true`를 반환하는 adapter에는 다음
+규칙이 적용된다.
+
+```text
+Traverse batch      <-> 다른 Traverse batch                 동시 실행 허용
+Modify batch (op=X)  <-> 다른 Modify batch (op=X, 같은 op)   동시 실행 허용
+Modify batch (op=X)  <-> Modify batch (op=Y, 다른 op)        서로 배타적
+Modify batch (아무 op) <-> Traverse batch                    서로 배타적
+```
+
+`requiresTraverseModifyIsolation()`이 `false`를 반환하면 gate는 이 기능이 아예 없는 것처럼
+항상 admit한다.
+
+```cpp
+bool canAdmit(kind, op) const;              // mutex_ 보유 상태에서만 호출
+void reserveExecutionSlot(kind, op);        // mutex_ 보유 상태에서만 호출 (planner thread)
+void releaseExecutionSlot(kind);            // 자체적으로 mutex_ 획득 (worker thread, executeBatch() 이후)
+```
+
+Gate는 planner thread에서 확인한다 — worker thread 안(`workerLoop()`/`executeBatch()`)에서
+확인하면, 이미 뽑아온 batch를 실행 못 해 worker가 아무 일도 못 하고 막히기 때문이다.
+Planner에서 admission이 안 되면 그 batch는 아직 `queue_`의 평범한 pending operation으로
+남고, 충돌하지 않는 다른 batch는 계속 worker로 흘러간다.
+
+### 6.3 Batch-kind 선택과 starvation override
+
+Planner가 매 iteration마다 다음 batch를 어떤 (kind, op) class로 만들지 정하는 절차는
+"`SchedulingPolicy`에게 한 번 묻고 그대로 따른다"가 아니다. 그렇게 하면
+`SchedulingPolicy`가 선호하는 class가 마침 지금 admission이 안 되는 상황일 때, worker가
+남아 있고 다른 class는 실행 가능한데도 전체 파이프라인이 멈춰버릴 수 있다.
+
+```text
+1. admissibleClasses(): queue_를 훑어서 "pending이 있고 지금 canAdmit()도 통과하는"
+   (kind, op) class를 전부 찾는다 -- 최대 3개(Traverse, Modify+Insert, Modify+Delete).
+2. 하나도 없으면 planner는 정말로 지금 안전하게 실행할 게 없는 것이므로 대기한다
+   (isolation 규칙이 허용하는 대안이 없는 상태 -- 스케줄링 결함이 아니라 실제 하한선).
+3. 하나 이상 있으면 SchedulingPolicy::chooseBatchKind()의 선호를 여전히 먼저 묻는다.
+   그 선호가 admissible하면 그대로 채택한다.
+4. 선호하는 class가 admissible하지 않으면, admissible한 다른 class 중 가장 오래
+   기다린 것으로 대체한다 (selectNextBatchKind()) -- 실행 가능한 작업을 억지로
+   막지 않는다.
+```
+
+FIFO `SchedulingPolicy`는 이 fallback만으로 이미 starvation-free다 — 계속 건너뛰인
+class는 정의상 가장 오래된 pending work이므로 fallback이 항상 그것부터 고른다. 하지만
+FIFO가 아닌 다른 `SchedulingPolicy`(예: Traverse가 있으면 항상 Traverse를 선호하는
+정책)라면 어떤 Modify class가 admissible한데도 영원히 선택되지 않을 수 있다.
+`SchedulingConfig::starvation_threshold`가 이 경우의 안전장치다 — 어떤 admissible
+class의 가장 오래된 pending item이 이 시간 이상 기다렸다면, `SchedulingPolicy`의
+선호와 무관하게 planner가 그 class를 강제로 다음 batch로 선택한다. 기본값 0은 이
+기능이 꺼진 것과 동일하다(FIFO에는 애초에 필요 없음).
+
+```cpp
+struct PendingClass {
+    ScheduledKind kind;
+    std::optional<ModifyOp> op;
+    std::chrono::steady_clock::time_point oldest_enqueued_at;
+};
+
+std::vector<PendingClass> admissibleClasses() const;
+std::optional<PendingClass> selectNextBatchKind(const std::vector<PendingClass>& admissible) const;
+ScheduledOperation extractOldest(ScheduledKind kind, std::optional<ModifyOp> op);
+```
+
+`selectNextBatchKind()`가 고른 class는 `extractOldest()`가 `queue_`에서 그 class의
+가장 오래된 항목 하나를 꺼내 새 batch의 첫 entry로 삼고, 이후 `collectBatch()`가
+`SchedulingPolicy::canAppendToBatch()`의 기존 동질성 검사를 그대로 이용해 나머지를
+채운다.
+
+### 6.4 Search
 
 ```mermaid
 sequenceDiagram
@@ -276,7 +358,7 @@ sequenceDiagram
     W-->>U: promise completion
 ```
 
-### 6.3 Insert와 remove
+### 6.5 Insert와 remove
 
 ```text
 Insert
@@ -664,6 +746,23 @@ Final victim batch: X, Y
 
 A의 plan이 transient하게 실패하면 sequence 10을 유지한 채 requeue된다.
 
+### 13.4 Aging/starvation opt-in helper
+
+`PromotionCandidate::planning_attempts`는 requeue를 거쳐도 보존되므로(11절), policy가
+"이 candidate가 몇 번이나 plan 대상으로 검토됐는지"를 항상 알 수 있다. 기반 클래스는 이
+값을 이용하는 protected static helper를 제공한다.
+
+```cpp
+static bool HasExceededPlanningAttempts(const PromotionCandidate& candidate,
+                                         std::uint64_t max_attempts);
+```
+
+`max_attempts == 0`이면 항상 false를 반환한다(기본 비활성, `CoordinatorConfig`의 byte
+cap 필드들과 같은 관례). 이 helper를 부를지, 어떤 threshold로 부를지, 아예 다른 기준을
+쓸지는 전적으로 각 concrete policy의 선택이다 — RegionManager나 기반 클래스가 자동으로
+호출하지 않으며, 현재 built-in 6개 policy(FIFO/LRU/LFU/Clock/2Q/CostAware) 중 이 helper를
+실제로 사용하는 policy는 없다.
+
 ---
 
 ## 14. Relocation plan
@@ -734,6 +833,20 @@ struct EvictionCandidate {
 Victim을 여러 개 선택하면 선택 집합의 모든 Anchor를 제거했을 때 orphan이 되는 Region을
 다시 계산한다.
 
+`buildEvictionCandidates()`는 이 snapshot을 만들 때 `dependencies_`/`regions_`/
+`dependents_`를 전부 훑으므로 비용이 있고, 이때 잡는 lock은 hot-path의
+`tryPinResidency()`도 필요로 하는 것과 동일한 RegionManager mutex다. `buildRelocationPlan()`
+한 pass 동안은 promote/evict가 실제로 실행되지 않아 residency snapshot이 변하지 않으므로
+(실제 실행은 이후 `processRelocationBatch()`가 한다), 이 snapshot은 다음 두 지점에서
+lazy하게 최대 한 번만 계산되어 재사용된다.
+
+- 어떤 candidate의 `available bytes < incremental bytes`(즉 eviction 도움이 실제로
+  필요한 첫 순간) `buildAdmissionContext()`가 처음 계산
+- 같은 pass의 victim-선택 루프(14.3)가 이미 계산된 값이 있으면 그대로 재사용
+
+`available >= incremental bytes`인 candidate(여유 공간으로 충분한 흔한 경우)는 이 계산
+자체를 아예 건너뛴다 -- `AdmissionContext::eviction_candidates`는 이때 빈 상태로 남는다.
+
 ### 14.3 Strict byte safety
 
 현재 batch가 실행되려면 다음 조건이 성립해야 한다.
@@ -752,17 +865,39 @@ Promotion 대상 Anchor는 victim 후보에서 제외된다. Planner가 충분�
 pin 상태가 바뀌어 실행 직전 재검증에 실패하면 eviction state를 변경하기 전에 candidate를
 requeue한다.
 
-### 14.4 Per-pass limit
+### 14.4 Per-pass limit과 admission 중 requeue 여부
 
 `CoordinatorConfig`의 다음 값은 0일 때 제한이 없다.
 
 ```cpp
-max_promotion_bytes_per_pass
-max_eviction_bytes_per_pass
+std::size_t max_promotion_bytes_per_pass = 0;
+std::size_t max_eviction_bytes_per_pass = 0;
 ```
 
-첫 oversized item은 progress를 위해 허용할 수 있지만, 이후 item 때문에 limit를 넘으면 남은
-candidate를 다음 batch로 defer한다.
+한 pass가 이번 batch에 이미 최소 하나의 candidate를 admit한 뒤(`plan.promotions`가
+비어있지 않은 뒤) 새로 검토하는 candidate가 다음 둘 중 하나로 이 batch에 못 들어가면 --
+
+- `max_promotion_bytes_per_pass`를 초과
+- 이 batch의 전체 promotion 요구량이 물리적 `budget`을 초과
+
+-- 해당 candidate는 **항상 policy로 requeue된다**, force drain(`waitIdle()`/`shutdown()`)
+여부와 무관하게. 이게 안전한 이유는: 한 pass의 *첫 번째로* 검토되는 candidate는 이 두
+제한을 모두 무조건 통과하도록 admit되므로(그렇지 않으면 progress가 아예 안 남),
+policy의 pending 집합은 매 pass마다 최소 하나씩 줄어드는 게 보장된다 -- 그래서 force
+drain 안에서 이런 candidate를 다시 시도해도 유한한 pass 안에 반드시 끝난다.
+
+반대로, candidate가 **혼자서도**(이 batch에 다른 누구도 없는 상태에서, 즉
+`plan.promotions`가 비어있는 상태에서) 저 두 제한 중 하나를 넘으면 -- 즉 몇 번을 다시
+시도해도 절대 들어갈 수 없는 경우 -- 이 candidate는 **영구적으로 폐기되고 requeue되지
+않는다**, force drain 여부와도 무관하게. 다시 시도해도 결과가 달라질 수 없는 candidate를
+무한정 requeue하면 force drain이 끝나지 않을 위험이 있기 때문이다.
+
+정리하면 이 두 제한이 만드는 drop은 항상 다음 둘 중 하나다.
+
+| 상황 | `plan.promotions` 상태 | 결과 |
+| --- | --- | --- |
+| 같은 batch 안의 다른 candidate 때문에 밀림 | 비어있지 않음 | 항상 requeue (다음 pass에서 재시도) |
+| 이 candidate 혼자서도 불가능 | 비어있음 (이 pass의 첫 항목) | 영구 폐기, requeue 없음 |
 
 ---
 
@@ -1017,13 +1152,13 @@ Unrelated Region worker는 영향을 받지 않는다.
 
 ### 21.2 Normal background plan 실패
 
-다음은 transient failure로 취급할 수 있다.
+다음은 transient failure로 취급되어 requeue될 수 있다.
 
-- 실행 직전 pin/state snapshot 변화
-- 즉시 reclaim capacity 부족
+- 같은 batch 안에서 다른 candidate에게 자리를 뺏김 (per-pass limit 또는 batch 전체 byte
+  초과 -- 14.4, `plan.promotions`가 비어있지 않은 경우)
+- 실행 직전 pin/state snapshot 변화 (execution-time re-validation 실패)
+- 즉시 reclaim capacity 부족 (eviction까지 다 해봐도 여전히 부족)
 - 다른 transition이 같은 Region을 소유
-- strict byte validation 실패
-- per-pass limit 도달
 
 유효 candidate는 다음 값을 보존해 policy queue로 돌아간다.
 
@@ -1035,19 +1170,40 @@ planning attempt count
 observations
 ```
 
-### 21.3 Policy Reject
+### 21.3 영구 폐기 (requeue되지 않음)
 
-Admission policy가 가치가 없다고 판단한 candidate는 requeue하지 않는다. 이는 mechanical
-validation 실패와 구분되는 의도적 admission decision이다.
+다음 두 경우는 다시 시도해도 결과가 달라지지 않으므로 requeue하지 않고 그 자리에서
+폐기한다.
+
+- **Policy Reject**: admission policy(`evaluateBatchAdmission()`)가 가치가 없다고
+  명시적으로 판단한 candidate. Mechanical validation 실패와 구분되는 의도적 결정이다.
+  `RegionManager::Stats::candidates_rejected_total`로 집계된다 (24절).
+- **혼자서도 불가능한 candidate**: 같은 batch의 다른 candidate 없이 이 candidate
+  하나만으로도 per-pass limit 또는 물리적 budget을 넘는 경우 (14.4) -- 어떤 eviction을
+  해도 채울 수 없는 근본적으로 불가능한 요청이다.
 
 ### 21.4 Force drain
 
-`waitIdle()`과 shutdown은 종료 가능성을 보장해야 한다. Force drain에서는 pending
-candidate를 즉시 시도하며 transient failure를 무기한 requeue하지 않고 최종 시도 후
-폐기한다.
+`waitIdle()`과 shutdown은 종료 가능성을 보장해야 한다. 그래서 다음 실패는 force drain
+중에도 **여전히 requeue되지 않는다** -- 무한정 재시도하면 drain이 안 끝날 위험이 있어서다.
+
+- execution-time re-validation 실패
+- eviction까지 다 해봐도 batch 전체가 부족한 경우 (plan 전체를 포기)
+- `SchedulingPolicy`의 `Defer` 결정
+
+반면 21.2의 첫 항목("같은 batch 안에서 다른 candidate에게 자리를 뺏김")은 force drain
+중에도 **requeue된다**. 이 pass에서 이미 최소 하나(자신을 밀어낸 candidate)는 admit에
+성공했다는 사실 자체가, requeue된 candidate가 다음 pass에서 진전을 볼 수 있음을
+보장하기 때문이다 (한 pass의 첫 candidate는 항상 admit되므로 pending 집합이 pass마다
+최소 하나씩 줄어들고, 유한한 pass 안에 반드시 끝난다 -- 14.4). 이 구분 덕분에, 여러
+candidate가 중간 `waitIdle()` 없이 한꺼번에 도착해도(예: capacity가 3개짜리 Region만
+담을 수 있는데 Region 4개를 연달아 요청) 한 번의 `waitIdle()` 호출 안에서 여러 pass가
+연달아 돌면서 결국 전부 올바르게 처리된다 -- 21.3의 "혼자서도 불가능한" 경우만
+영구적으로 남는다.
 
 따라서 background mode의 retry semantics와 operator/test barrier의 drain semantics는
-의도적으로 다르다.
+"같은 batch 안에서 밀린 경우"에 한해 이제 동일하게 동작하고, 그 외의 transient failure에
+대해서는 여전히 의도적으로 다르다.
 
 ---
 
@@ -1058,6 +1214,8 @@ struct CoordinatorConfig {
     std::chrono::milliseconds trigger_interval{100};
     std::size_t max_promotion_bytes_per_pass = 0;
     std::size_t max_eviction_bytes_per_pass = 0;
+    std::optional<double> max_promotion_fraction_of_budget;
+    std::optional<double> max_eviction_fraction_of_budget;
     std::uint8_t near_fit_min_utilization_percent = 90;
 };
 ```
@@ -1076,6 +1234,29 @@ manager.start(adapter, device_region_pool, routing_cache, config);
 ```
 
 위 예의 `256_MiB` 표기는 설명용이며 실제 코드에서는 `std::size_t` byte 값을 전달한다.
+
+### 22.1 비율(fraction) 기반 per-pass limit
+
+`max_promotion_bytes_per_pass`/`max_eviction_bytes_per_pass`를 절대 byte 대신 GPU data
+budget의 비율로 지정하고 싶다면 `max_promotion_fraction_of_budget`/
+`max_eviction_fraction_of_budget`를 설정한다. 이 두 필드는 `RegionManager`가 직접 읽지
+않는다 -- `Controller`의 생성자가 `DeviceContext` 구성이 끝난 직후(즉 `Pooled` 정책의
+unit 반올림까지 반영된 실제 budget, `DeviceContext::budgetBytes()`이 확정된 시점)에 이
+비율을 절대 byte로 변환해서 대응하는 `max_*_bytes_per_pass` 필드를 덮어쓴 뒤
+`RegionManager::start()`에 넘긴다.
+
+```cpp
+CoordinatorConfig config;
+config.max_promotion_fraction_of_budget = 0.2;  // budget의 20%
+Controller controller(adapter, routing_cache, {}, nullptr,
+    /*gpu_data_budget_bytes=*/some_bytes, ..., config, AllocationPolicy::Pooled);
+// Controller 내부에서 config.max_promotion_bytes_per_pass가
+// DeviceContext::budgetBytes(Data) * 0.2 값으로 해석되어 RegionManager에 전달된다.
+```
+
+`std::nullopt`(기본값)이면 대응하는 `max_*_bytes_per_pass` 필드가 설정한 값 그대로
+유지된다. `RegionManager`를 `Controller` 없이 직접 생성해서 쓰는 경우, 이 두 비율 필드는
+해석되지 않으므로 `max_*_bytes_per_pass`에 절대 byte 값을 직접 넣어야 한다.
 
 ---
 
@@ -1122,13 +1303,24 @@ struct Stats {
     std::uint64_t relocation_batches_total;
     std::uint64_t candidates_requeued_total;
     std::uint64_t near_fit_reuses_total;
+    std::uint64_t candidates_rejected_total;
 };
 ```
 
 - GPU byte 값은 현재 pool snapshot이다.
 - 나머지는 RegionManager lifetime 동안 단조 증가한다.
 - `near_fit_reuses_total`은 실제 `tryReuse()`가 성공한 handle 수다.
-- `candidates_requeued_total`은 transient plan/execution failure로 policy에 반환된 횟수다.
+- `candidates_requeued_total`은 transient plan/execution failure로 policy에 반환된 횟수다
+  (21.2).
+- `candidates_rejected_total`은 `BatchAdmissionDecision::Reject`로 영구 폐기된 횟수다
+  (21.3) -- 어떤 `ReplacementPolicy`를 꽂아도 `RegionManager`가 중앙에서 집계하므로 policy
+  쪽에 별도 counter가 없어도 관찰 가능하다.
+
+`Controller::stats()`가 반환하는 `ControllerStats`는 이 중 `gpu_bytes_allocated`,
+`regions_promoted_total`, `regions_evicted_total`, `regions_written_back_total`,
+`anchor_evictions_total`, `compactions_total`, `relocation_batches_total`,
+`candidates_requeued_total`, `candidates_rejected_total`을 그대로 얇게 복사해 노출한다
+(`near_fit_reuses_total`은 `ControllerStats`에는 없다).
 
 ---
 
@@ -1275,6 +1467,12 @@ Near-fit threshold + 51% GPU:    3 / 3 passed
 - `finishTransfers()` 동안 Coordinator thread는 completion event를 기다린다.
 - Pooled compaction은 DeviceRegionPool mutex 아래에서 plan을 실행한다.
 - RegionManager state transition은 RegionManager mutex로 직렬화된다.
+- `buildEvictionCandidates()`(eviction 후보 snapshot 구축, 14.2)가 RegionManager mutex를
+  잡고 있는 동안, 같은 mutex를 필요로 하는 hot-path의 `tryPinResidency()`/
+  `residencyHints()` 호출은 Coordinator thread와 무관하게 그 lock을 기다린다 -- eviction
+  후보 계산이 별도 스레드(Coordinator)에서 돈다는 사실이 이 lock 경합 자체를 없애주지는
+  않는다. 14.2의 lazy caching은 한 pass 안에서 이 계산이 몇 번 반복되는지만 줄이며, 한
+  번 호출될 때 lock을 쥐는 시간 자체는 줄이지 않는다.
 
 ### 27.3 Notify storm
 

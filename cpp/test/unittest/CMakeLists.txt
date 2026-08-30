@@ -9,6 +9,7 @@ set(ARACHNE_UNITTEST_SOURCES
 	op_scheduler_worker_start_test.cpp
 	op_scheduler_modify_op_batching_test.cpp
 	op_scheduler_traverse_modify_isolation_test.cpp
+	op_scheduler_fairness_test.cpp
 	replacement_policy_test.cpp
 	gpu/dirty_header_test.cpp
 	util/distance_test.cpp
@@ -24,12 +25,11 @@ set(ARACHNE_UNITTEST_SOURCES
 	stress/stress_index_stage3_test.cpp
 	stress/stress_index_export_load_test.cpp
 	stress/region_residency_concurrency_test.cpp
-	# HnswIndex (index/hnsw, the real IAdapter over thirdparty/hnswlib --
+	# HnswlibIndex (index/hnsw, the real IAdapter over thirdparty/hnswlib --
 	# distinct from StressIndex's brute-force test double above).
-	hnsw/hnsw_index_test.cpp
-	hnsw/hnsw_index_dist_test.cpp
-	hnsw/hnsw_index_anchor_entry_dist_test.cpp
-	hnsw/hnsw_index_promotion_eviction_stress_test.cpp
+	hnsw/hnswlib_index_test.cpp
+	hnsw/hnswlib_index_gpu_test.cpp
+	hnsw/hnswlib_index_promotion_eviction_stress_test.cpp
 )
 
 add_executable(arachne_tests ${ARACHNE_UNITTEST_SOURCES})

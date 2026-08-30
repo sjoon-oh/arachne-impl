@@ -3,6 +3,7 @@
 #include <cuda_runtime.h>
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <cstring>
 #include <optional>
 #include <unordered_map>
@@ -122,6 +123,67 @@ class FakeRoutingCache : public RoutingCache {
 	void erase(VectorId) override {}
 };
 
+// FakeRoutingCache plus bookkeeping of exactly which ids Controller registered
+// (ensure()) or released (erase()) an Anchor under -- lets a test inspect the
+// actual anchor_id Controller minted/used, not just the resulting residency.
+class RecordingRoutingCache : public FakeRoutingCache {
+ public:
+	VectorId ensure(VectorId id, const VectorView& vector, float max_distance) override {
+		ensured_ids.push_back(id);
+		return FakeRoutingCache::ensure(id, vector, max_distance);
+	}
+	void erase(VectorId id) override {
+		erased_ids.push_back(id);
+		FakeRoutingCache::erase(id);
+	}
+
+	std::vector<VectorId> ensured_ids;
+	std::vector<VectorId> erased_ids;
+};
+
+// Delegates every call to a real FifoReplacementPolicy, counting
+// onAnchorEvicted() calls along the way -- lets a test assert a code path
+// did (or, per the fix this file is testing, deliberately does *not*)
+// reach the ReplacementPolicy at all. Can't just subclass
+// FifoReplacementPolicy and override one method: it's declared `final`.
+class EvictionCountingReplacementPolicy : public ReplacementPolicy {
+ public:
+	void enqueueCandidate(PromotionCandidate candidate) override { inner_.enqueueCandidate(std::move(candidate)); }
+	void requeueCandidate(PromotionCandidate candidate) override { inner_.requeueCandidate(std::move(candidate)); }
+	void onAnchorEvicted(VectorId anchor_id) override {
+		++eviction_calls;
+		inner_.onAnchorEvicted(anchor_id);
+	}
+	void onAnchorTouched(VectorId anchor_id) override { inner_.onAnchorTouched(anchor_id); }
+	bool onRelocationTrigger() override { return inner_.onRelocationTrigger(); }
+	bool hasPendingCandidates() const override { return inner_.hasPendingCandidates(); }
+	std::optional<PromotionCandidate> selectNextPromotionCandidate() override {
+		return inner_.selectNextPromotionCandidate();
+	}
+	std::optional<VectorId> selectNextEvictionCandidate(VectorId excluded) override {
+		return inner_.selectNextEvictionCandidate(excluded);
+	}
+	std::optional<VectorId> selectEvictionCandidate(VectorId excluded, std::size_t required_bytes,
+																									 const std::vector<EvictionCandidate>& candidates) override {
+		return inner_.selectEvictionCandidate(excluded, required_bytes, candidates);
+	}
+
+	int eviction_calls = 0;
+
+ private:
+	FifoReplacementPolicy inner_;
+};
+
+// Mirrors controller.cpp's own kAnchorIdBit -- the top bit of VectorId,
+// reserved by MintAnchorId() so a minted Anchor id can never numerically
+// collide with a real data-vector id (see MintAnchorId()'s and
+// next_anchor_id_'s doc comments in controller.hpp). Redeclared here
+// deliberately rather than exposed from controller.cpp: it's the public
+// contract TraverseRequest::anchor_id's doc comment already promises
+// (index_adapter.hpp) -- "not guaranteed to be a real element" -- and these
+// tests are checking that promise holds, not reaching into an internal.
+constexpr VectorId kAnchorIdTopBit = VectorId{1} << 63;
+
 // Builds a Record whose vector points at `value` -- callers must keep
 // `value` alive for the duration of the Controller::insert() call, which is
 // synchronous, so a stack float held by the test body is enough.
@@ -215,20 +277,72 @@ TEST(ControllerGpuResidencyTest, PromoteEvictsMultipleVictimsWhenOneIsNotEnoughC
 	float v1 = 1.0f, v2 = 2.0f, v3 = 3.0f, v4 = 4.0f;
 
 	adapter.next_touched = RegionFootprint{{1}};
-	ASSERT_TRUE(controller.insert(MakeRecord(101, v1)).ok);  // anchor 101 -> region 1 (oldest)
+	ASSERT_TRUE(controller.insert(MakeRecord(101, v1)).ok);  // record 101's insert-traverse anchor -> region 1 (oldest)
 	adapter.next_touched = RegionFootprint{{2}};
-	ASSERT_TRUE(controller.insert(MakeRecord(102, v2)).ok);  // anchor 102 -> region 2
+	ASSERT_TRUE(controller.insert(MakeRecord(102, v2)).ok);  // record 102's insert-traverse anchor -> region 2
 	adapter.next_touched = RegionFootprint{{3}};
-	ASSERT_TRUE(controller.insert(MakeRecord(103, v3)).ok);  // anchor 103 -> region 3 -- budget now full
+	ASSERT_TRUE(controller.insert(MakeRecord(103, v3)).ok);  // record 103's insert-traverse anchor -> region 3 -- budget now full
 
 	adapter.next_touched = RegionFootprint{{4}};
-	ASSERT_TRUE(controller.insert(MakeRecord(104, v4)).ok);  // anchor 104 -> region 4, needs 2 evictions
+	ASSERT_TRUE(controller.insert(MakeRecord(104, v4)).ok);  // record 104's insert-traverse anchor -> region 4, needs 2 evictions
 	controller.waitIdle();  // promotion/eviction is now lazy -- wait for the Coordinator to catch up
 
 	EXPECT_FALSE(controller.acquireRegion(1).on_device);  // evicted (oldest, FIFO)
 	EXPECT_FALSE(controller.acquireRegion(2).on_device);  // evicted (second-oldest)
 	EXPECT_TRUE(controller.acquireRegion(3).on_device);   // untouched -- one eviction wasn't enough, but two was
 	EXPECT_TRUE(controller.acquireRegion(4).on_device);   // newly promoted
+}
+
+// End-to-end proof that CoordinatorConfig::max_promotion_fraction_of_budget
+// (region_manager.hpp) is correctly resolved by Controller's constructor --
+// not just stored, but actually converted into the real byte cap
+// RegionManager's Coordinator enforces. Four candidates that would otherwise
+// all fit in the budget with room to spare (so this isn't testing eviction
+// at all, unlike the test above) are forced across multiple relocation
+// passes within one waitIdle() call purely by the resolved promotion cap.
+TEST(ControllerGpuResidencyTest, MaxPromotionFractionOfBudgetResolvesAndSplitsAPass) {
+	FakeAdapter adapter;
+	FakeRoutingCache routing_cache;
+	constexpr std::size_t kSmallBytes = 256;
+
+	CoordinatorConfig config;
+	config.trigger_interval = std::chrono::milliseconds(200);
+	// budget = 4*256 = 1024B; 0.26 resolves to ~266B -- barely over one
+	// region, so a second same-sized candidate can never join the same pass.
+	config.max_promotion_fraction_of_budget = 0.26;
+
+	Controller controller(adapter, routing_cache, SchedulingConfig{}, std::make_unique<FifoReplacementPolicy>(),
+			/*gpu_data_budget_bytes=*/4 * kSmallBytes, gpu::kDefaultMetadataPoolBytes,
+			/*gpu_unit_bytes=*/kSmallBytes, /*compaction_policy=*/nullptr, config, gpu::AllocationPolicy::Pooled);
+
+	std::vector<std::vector<std::byte>> buffers(4, std::vector<std::byte>(kSmallBytes, std::byte{0}));
+	for (RegionId id = 1; id <= 4; ++id) {
+		HostRegionView host{buffers[id - 1].data(), kSmallBytes, 0};
+		adapter.addRegion(id, host);
+		controller.registerRegion(id, host);
+	}
+
+	float v1 = 1.0f, v2 = 2.0f, v3 = 3.0f, v4 = 4.0f;
+	adapter.next_touched = RegionFootprint{{1}};
+	ASSERT_TRUE(controller.insert(MakeRecord(401, v1)).ok);
+	adapter.next_touched = RegionFootprint{{2}};
+	ASSERT_TRUE(controller.insert(MakeRecord(402, v2)).ok);
+	adapter.next_touched = RegionFootprint{{3}};
+	ASSERT_TRUE(controller.insert(MakeRecord(403, v3)).ok);
+	adapter.next_touched = RegionFootprint{{4}};
+	ASSERT_TRUE(controller.insert(MakeRecord(404, v4)).ok);
+	// No intermediate waitIdle() -- all four requests reach the Coordinator's
+	// pending set before it wakes up, same as the multi-victim test above.
+	controller.waitIdle();
+
+	EXPECT_TRUE(controller.acquireRegion(1).on_device);
+	EXPECT_TRUE(controller.acquireRegion(2).on_device);
+	EXPECT_TRUE(controller.acquireRegion(3).on_device);
+	EXPECT_TRUE(controller.acquireRegion(4).on_device);
+	EXPECT_GT(controller.stats().relocation_batches_total, 1u)
+			<< "the resolved ~266B cap should have forced more than one Coordinator pass for 4*256B of candidates";
+	EXPECT_GT(controller.stats().candidates_requeued_total, 0u)
+			<< "at least one candidate should have been bumped by the cap and requeued rather than lost";
 }
 
 TEST(ControllerGpuResidencyTest, EvictionWritesBackOnlyWhenDirty) {
@@ -348,10 +462,12 @@ TEST(ControllerGpuResidencyTest, EvictionAlwaysWritesBackWhenNoHeaderExists) {
 }
 
 TEST(ControllerGpuResidencyTest, EvictionBatchesMultipleRegionsFromOneAnchorInOneCall) {
-	// One anchor depends on two regions at once; evicting it reclaims both
-	// in a single evictAnchor() call, exercising writeBackDirtyRegions()'s
-	// n > 1 batched-gather path. Region 1 is dirty, region 2 is clean --
-	// both must still be correctly distinguished within the same batch.
+	// One anchor (minted fresh for record 401's insert-traverse -- see
+	// MintAnchorId(), not id 401 itself) depends on two regions at once;
+	// evicting it reclaims both in a single evictAnchor() call, exercising
+	// writeBackDirtyRegions()'s n > 1 batched-gather path. Region 1 is dirty,
+	// region 2 is clean -- both must still be correctly distinguished within
+	// the same batch.
 	FakeAdapter adapter;
 	FakeRoutingCache routing_cache;
 	constexpr std::size_t kPayloadBytes = 248;
@@ -381,8 +497,8 @@ TEST(ControllerGpuResidencyTest, EvictionBatchesMultipleRegionsFromOneAnchorInOn
 	controller.registerRegion(2, host_clean);
 	controller.registerRegion(3, host_c);
 
-	// A single insert whose footprint covers both regions 1 and 2 --
-	// anchor 401 now depends on both at once.
+	// A single insert whose footprint covers both regions 1 and 2 -- record
+	// 401's insert-traverse anchor now depends on both at once.
 	float v1 = 1.0f, v3 = 3.0f;
 	adapter.next_touched = RegionFootprint{{1, 2}};
 	ASSERT_TRUE(controller.insert(MakeRecord(401, v1)).ok);
@@ -397,8 +513,8 @@ TEST(ControllerGpuResidencyTest, EvictionBatchesMultipleRegionsFromOneAnchorInOn
 	dirty_word[0] = std::byte{0x01};
 	PokeDevice(controller, /*region=*/1, /*offset=*/0, dirty_word);  // only region 1 marked dirty
 
-	// Region 3 forces evicting anchor 401 -- both region 1 and region 2 are
-	// reclaimed together, in one evictAnchor() call.
+	// Region 3 forces evicting record 401's anchor -- both region 1 and
+	// region 2 are reclaimed together, in one evictAnchor() call.
 	adapter.next_touched = RegionFootprint{{3}};
 	ASSERT_TRUE(controller.insert(MakeRecord(402, v3)).ok);
 	controller.waitIdle();  // eviction is now lazy -- wait for the Coordinator to catch up
@@ -441,6 +557,107 @@ TEST(ControllerGpuResidencyTest, InsertRejectsDuplicateIdWithoutTouchingExisting
 	controller.waitIdle();  // release is now lazy -- wait for the Coordinator to catch up
 	adapter.next_touched = RegionFootprint{{1}};
 	EXPECT_TRUE(controller.insert(MakeRecord(501, v2)).ok);
+}
+
+// -----------------------------------------------------------------------------
+// Tests for the Anchor-id/VectorId decoupling: MintAnchorId() gives every
+// Anchor -- whether traversed-to from insert()'s own lookup or from
+// search()'s Hybrid routing -- a fresh id carrying the reserved top bit,
+// rather than insert() reusing the about-to-be-inserted record's own id (the
+// previous behavior this replaces). And remove() no longer assumes the
+// deleted VectorId doubles as some Anchor's id, so it must not reach into
+// RegionManager/ReplacementPolicy/RoutingCache at all anymore. See
+// MintAnchorId()'s and next_anchor_id_'s doc comments (controller.hpp),
+// commitRemove()'s doc comment (controller.cpp), and
+// cpp/test/index/report/ for the investigation this closes out.
+// -----------------------------------------------------------------------------
+
+TEST(ControllerAnchorIdentityTest, InsertMintsAFreshAnchorIdInsteadOfReusingTheRecordId) {
+	FakeAdapter adapter;
+	RecordingRoutingCache routing_cache;
+	Controller controller(adapter, routing_cache);
+
+	constexpr std::size_t kBytes = 64;
+	std::vector<std::byte> host_data(kBytes, std::byte{0x42});
+	HostRegionView host{host_data.data(), kBytes, 0};
+	adapter.addRegion(1, host);
+	controller.registerRegion(1, host);
+
+	adapter.next_touched = RegionFootprint{{1}};
+	float v1 = 1.0f;
+	constexpr VectorId kRecordId = 100;
+	ASSERT_TRUE(controller.insert(MakeRecord(kRecordId, v1)).ok);
+	controller.waitIdle();  // promotion (and the routing_cache.ensure() it drives) is lazy
+
+	// requestPromotion() -> RoutingCache::ensure() is where the actual anchor
+	// id used for this insert's lookup-traverse becomes observable.
+	ASSERT_FALSE(routing_cache.ensured_ids.empty());
+	for (VectorId anchor_id : routing_cache.ensured_ids) {
+		EXPECT_NE(anchor_id, kRecordId) << "insert() must not reuse the inserted record's own id as its Anchor id";
+		EXPECT_EQ(anchor_id & kAnchorIdTopBit, kAnchorIdTopBit)
+				<< "every minted Anchor id must carry the reserved top bit";
+	}
+}
+
+TEST(ControllerAnchorIdentityTest, SearchMintsAnAnchorIdWithTheSameReservedTopBitAsInsert) {
+	FakeAdapter adapter;
+	RecordingRoutingCache routing_cache;
+	Controller controller(adapter, routing_cache);
+
+	constexpr std::size_t kBytes = 64;
+	std::vector<std::byte> host_data(kBytes, std::byte{0x99});
+	HostRegionView host{host_data.data(), kBytes, 0};
+	adapter.addRegion(1, host);
+	controller.registerRegion(1, host);
+
+	adapter.next_touched = RegionFootprint{{1}};
+	float query_value = 7.0f;
+	Query query{VectorView{&query_value, /*dim=*/1, VectorDType::Float32}, /*top_k=*/1};
+	controller.search(query);
+	controller.waitIdle();  // requestPromotion() (and its routing_cache.ensure()) is driven off the same worker
+
+	ASSERT_FALSE(routing_cache.ensured_ids.empty());
+	for (VectorId anchor_id : routing_cache.ensured_ids) {
+		EXPECT_EQ(anchor_id & kAnchorIdTopBit, kAnchorIdTopBit)
+				<< "search()'s minted Anchor id must carry the same reserved top bit insert()'s does";
+	}
+}
+
+TEST(ControllerAnchorIdentityTest, RemoveNeverTouchesReplacementPolicyOrRoutingCacheAnymore) {
+	FakeAdapter adapter;
+	RecordingRoutingCache routing_cache;
+	auto policy = std::make_unique<EvictionCountingReplacementPolicy>();
+	EvictionCountingReplacementPolicy* policy_ptr = policy.get();
+	// Generous budget -- nothing should ever be evicted here for capacity
+	// reasons, so any onAnchorEvicted() call observed can only be explained
+	// by remove() itself still reaching into the ReplacementPolicy.
+	Controller controller(adapter, routing_cache, SchedulingConfig{}, std::move(policy));
+
+	constexpr std::size_t kBytes = 64;
+	std::vector<std::byte> host_data(kBytes, std::byte{0x11});
+	HostRegionView host{host_data.data(), kBytes, 0};
+	adapter.addRegion(1, host);
+	controller.registerRegion(1, host);
+
+	adapter.next_touched = RegionFootprint{{1}};
+	float v1 = 1.0f;
+	constexpr VectorId kRecordId = 900;
+	ASSERT_TRUE(controller.insert(MakeRecord(kRecordId, v1)).ok);
+	controller.waitIdle();
+	ASSERT_TRUE(controller.acquireRegion(1).on_device);
+	routing_cache.erased_ids.clear();  // only care about what remove() itself does below
+
+	ASSERT_TRUE(controller.remove(kRecordId).ok);
+	controller.waitIdle();  // release, if any happened, is lazy -- wait for the Coordinator to catch up
+
+	EXPECT_EQ(policy_ptr->eviction_calls, 0)
+			<< "commitRemove() must not call region_manager_.releaseAnchor() anymore -- deleting a data vector no "
+				 "longer assumes it doubles as some Anchor's id (see commitRemove()'s doc comment)";
+	EXPECT_TRUE(routing_cache.erased_ids.empty()) << "remove() must not erase anything from the RoutingCache either";
+	// The Region the insert promoted is untouched by the delete -- its
+	// Anchor's own lifecycle (heat/capacity-driven) is unaffected by whether
+	// the data vector that originally caused it to exist is still live.
+	EXPECT_TRUE(controller.acquireRegion(1).on_device);
 }
 
 }  // namespace

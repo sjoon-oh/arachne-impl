@@ -15,9 +15,28 @@
 #include <vector>
 
 #include "adapter/region.hpp"
+#include "telemetry/instrumented_mutex.hpp"
 #include "types.hpp"
 
 namespace arachne {
+
+// Diagnostic-only (ARACHNE_ENABLE_TRACING build): same pattern as
+// RegionManagerMutex (see core/region_manager.hpp) -- swaps
+// CostAwareReplacementPolicy::mutex_ for a lock-contention-measuring wrapper
+// when tracing is on, plain std::mutex otherwise. No condition_variable use
+// here, so (unlike RegionManagerMutex) there's no matching CondVar alias to
+// switch. Added for the latency-tracing report entry investigating whether
+// contention on this specific mutex (distinct from RegionManager::mutex_,
+// already covered) explains RegionManager::recordTraversal()'s heavy-tailed
+// latency.
+#ifdef ARACHNE_ENABLE_TRACING
+class CostAwareReplacementMutex : public telemetry::InstrumentedMutex {
+ public:
+	CostAwareReplacementMutex() : InstrumentedMutex("CostAwareReplacementPolicy") {}
+};
+#else
+using CostAwareReplacementMutex = std::mutex;
+#endif
 
 // ReplacementPolicy is Arachne's pluggable strategy (Quick Summary design
 // point 4) for deciding, per Anchor, which Region dependencies to promote
@@ -132,6 +151,18 @@ struct EvictionCandidate {
 	std::size_t potential_writeback_bytes = 0;
 	std::size_t resident_regions = 0;
 	std::size_t reclaimable_regions = 0;
+	/// Every Anchor that must be evicted *together* with anchor_id for
+	/// reclaimable_bytes to actually be freed (see RegionManager::
+	/// assignAnchorToGroup()'s doc comment) -- always includes anchor_id
+	/// itself, at minimum as the sole element of a singleton group (the
+	/// default CoordinatorConfig::max_eviction_group_size=1 keeps every group
+	/// a singleton, reproducing this port's original sole-ownership-only
+	/// reclaimability rule exactly). A ReplacementPolicy that scores/selects
+	/// purely by anchor_id (every built-in policy except CostAwareReplacement
+	/// Policy) can ignore this field entirely and keeps working exactly as
+	/// before -- RegionManager, not the policy, is responsible for actually
+	/// evicting every named member once a candidate is selected.
+	std::vector<VectorId> group_members;
 };
 
 /// Cost snapshot supplied immediately before RegionManager attempts a
@@ -145,6 +176,14 @@ struct AdmissionContext {
 	std::size_t allocation_unit_bytes = 1;
 	std::size_t gpu_bytes_allocated = 0;
 	std::size_t gpu_budget_bytes = 0;
+	/// Left empty whenever gpu_budget_bytes - gpu_bytes_allocated already
+	/// covers incremental_bytes -- i.e. this candidate doesn't need eviction
+	/// help to fit, so RegionManager doesn't bother building the list at all
+	/// (see buildAdmissionContext()'s own comment, region_manager.hpp). A
+	/// policy that only consults this field once it has independently
+	/// confirmed eviction is actually needed is unaffected; one that reads it
+	/// unconditionally must treat empty as "nothing needed evicting", not as
+	/// "nothing is evictable".
 	std::vector<EvictionCandidate> eviction_candidates;
 };
 
@@ -257,6 +296,24 @@ class ReplacementPolicy {
 	virtual std::optional<VectorId> selectEvictionCandidate(
 			VectorId excluded, std::size_t, const std::vector<EvictionCandidate>&) {
 		return selectNextEvictionCandidate(excluded);
+	}
+
+ protected:
+	/// Opt-in aging/starvation check a concrete policy's own
+	/// evaluateBatchAdmission() override may call to decide whether to give
+	/// up on a candidate that keeps getting offered without ever being
+	/// admitted -- using PromotionCandidate::planning_attempts, which every
+	/// policy already receives on every enqueueCandidate()/requeueCandidate()/
+	/// evaluateBatchAdmission() call (it survives requeue -- see that field's
+	/// own doc comment) without any extra plumbing. Not called by this base
+	/// class, by RegionManager, or by any policy in this file: whether to use
+	/// it at all, with what threshold, or to build a different give-up signal
+	/// entirely, is each concrete policy's own choice, matching every other
+	/// hook here. `max_attempts == 0` always returns false (disabled) --
+	/// matches the off-by-default convention CoordinatorConfig's own
+	/// byte-cap fields use.
+	static bool HasExceededPlanningAttempts(const PromotionCandidate& candidate, std::uint64_t max_attempts) {
+		return max_attempts != 0 && candidate.planning_attempts > max_attempts;
 	}
 };
 
@@ -564,6 +621,26 @@ class CostAwareReplacementPolicy final : public ReplacementPolicy {
 
 	void enqueueCandidate(PromotionCandidate candidate) override;
 	void onAnchorEvicted(VectorId anchor_id) override;
+	/// Deliberately *not* a direct heat update -- see the base interface's
+	/// own doc comment for why onAnchorTouched() is safe to treat as a lossy
+	/// hint (a policy "may ignore" it). Real-time freshness of heat isn't
+	/// actually required for that reason -- resident_'s heat already decays
+	/// on a heat_half_life timescale (milliseconds of staleness are noise
+	/// next to that), so this just appends `anchor_id` to touch_queue_ (its
+	/// own, separately-locked queue -- never touches mutex_) and returns.
+	/// The actual heat update happens later, in drainTouchQueueLocked(),
+	/// called from the Coordinator thread wherever resident_'s heat is about
+	/// to be read (evaluateAdmission(), selectEvictionCandidate(),
+	/// selectNextEvictionCandidate()) -- unlike this call, always from the
+	/// Coordinator thread and always while mutex_ is already held, so it
+	/// adds no new lock acquisition on that side either. See the latency-
+	/// tracing report entry this was added for: mutex_ is also what
+	/// evaluateAdmission()'s own O(eviction_candidates) scan holds for the
+	/// scan's whole duration, and a worker thread's onAnchorTouched() used to
+	/// have to queue up behind however many times the Coordinator
+	/// re-acquired mutex_ during one long admission pass -- moving this call
+	/// off of mutex_ entirely removes that contention regardless of how the
+	/// Coordinator paces its own passes.
 	void onAnchorTouched(VectorId anchor_id) override;
 	bool onRelocationTrigger() override;
 	bool hasPendingCandidates() const override;
@@ -588,12 +665,45 @@ class CostAwareReplacementPolicy final : public ReplacementPolicy {
 	double decayedHeat(const ResidentEntry& entry, Clock::time_point now) const;
 	double victimRetentionDensity(const ResidentEntry& entry, const EvictionCandidate& candidate,
 														 Clock::time_point now) const;
+	/// Group-aware wrapper over victimRetentionDensity(): `candidate`'s
+	/// retention density is the *worst* (highest, i.e. most-worth-keeping) of
+	/// its group_members' own individual densities, not an average -- since
+	/// evicting the candidate means evicting every named member together (see
+	/// EvictionCandidate::group_members's doc comment), a group is only ever
+	/// worth evicting once every one of its members individually looks that
+	/// cold, so one still-useful member is enough to protect the whole group.
+	/// Returns nullopt if the group has no member this policy is actually
+	/// tracking yet, or any tracked member hasn't cleared minimum_residency --
+	/// both cases the caller should treat as "not an eligible victim", the
+	/// same as std::isfinite()'s role in the old single-Anchor callers this
+	/// replaces. Caller must already hold mutex_ (same convention as
+	/// victimRetentionDensity() itself).
+	std::optional<double> groupRetentionDensity(const EvictionCandidate& candidate, Clock::time_point now) const;
 	static std::size_t roundedUnits(std::size_t bytes, std::size_t unit_bytes);
 
+	/// Applies every touch_queue_ entry accumulated since the last drain to
+	/// resident_'s heat, then clears touch_queue_ -- see onAnchorTouched()'s
+	/// own doc comment for why this exists (moving the *frequent, worker-
+	/// thread, advisory* touch signal off of mutex_ entirely, so it can never
+	/// contend with the *infrequent-but-sometimes-long, Coordinator-thread*
+	/// admission/eviction scans that also need mutex_). Caller must already
+	/// hold mutex_ (drainTouchQueueLocked() only ever touches touch_queue_
+	/// itself under the separate, short-lived touch_queue_mutex_ below, never
+	/// mutex_ -- see the latency-tracing report entry this was added for).
+	void drainTouchQueueLocked();
+
 	CostAwareReplacementConfig config_;
-	mutable std::mutex mutex_;
+	mutable CostAwareReplacementMutex mutex_;
 	std::deque<PromotionCandidate> pending_candidates_;
 	std::unordered_map<VectorId, ResidentEntry> resident_;
+
+	/// MPSC touch-event queue -- see onAnchorTouched()'s own doc comment.
+	/// Deliberately a *separate* mutex from mutex_ above: onAnchorTouched()
+	/// (called synchronously from a worker thread, once per search/insert via
+	/// RegionManager::recordTraversal()) must never wait on whatever the
+	/// Coordinator thread is doing with mutex_, however long that takes.
+	mutable std::mutex touch_queue_mutex_;
+	std::vector<VectorId> touch_queue_;
 };
 
 }  // namespace arachne

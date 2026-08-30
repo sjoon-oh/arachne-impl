@@ -1,4 +1,4 @@
-#include "hnsw_index.hpp"
+#include "hnswlib_index.hpp"
 
 #include <algorithm>
 #include <stdexcept>
@@ -10,7 +10,7 @@
 #include "core/controller.hpp"
 #include "logging.hpp"
 
-// Implementation of HnswRegion/HnswEngine/HnswIndex -- see hnsw_index.hpp's
+// Implementation of HnswRegion/HnswEngine/HnswlibIndex -- see hnswlib_index.hpp's
 // file-level overview for the adapter's role and Region layout.
 
 namespace arachne::index::hnsw {
@@ -26,19 +26,19 @@ HnswRegion::HnswRegion(RegionId id, void* ptr, std::size_t bytes, std::size_t su
 // HnswEngine -- type-erased hnswlib::HierarchicalNSW<DistT> holder. Defined
 // here (not in the public header) so hnswlib stays a PRIVATE, impl-only
 // dependency of this adapter -- same reasoning as core/routing_cache_hnsw.hpp's
-// own forward-declared Instance type. This *is* the class hnsw_index.hpp
+// own forward-declared Instance type. This *is* the class hnswlib_index.hpp
 // forward-declares.
 // ---------------------------------------------------------------------------
 
-/// Surface HnswIndex (and, via its forwarding helpers, HnswIndexAnchorEntry/
-/// HnswIndexDist) drive the concrete engine through. Every method here is a
+/// Surface HnswlibIndex (and, via its forwarding helpers, HnswlibIndexGpu)
+/// drive the concrete engine through. Every method here is a
 /// direct, thin call into hnswlib's own public API/public member state --
-/// see hnsw_index.hpp's file overview for the "used as-is" guarantee.
+/// see hnswlib_index.hpp's file overview for the "used as-is" guarantee.
 class HnswEngine {
  public:
 	virtual ~HnswEngine() = default;
 
-	// -- Structural: used by HnswIndex's constructor/loadFrom() to slice Regions.
+	// -- Structural: used by HnswlibIndex's constructor/loadFrom() to slice Regions.
 	virtual void* dataLevel0Memory() const = 0;
 	virtual std::size_t sizeDataPerElement() const = 0;
 	virtual std::size_t maxElements() const = 0;
@@ -46,14 +46,15 @@ class HnswEngine {
 	virtual std::size_t efConstruction() const = 0;
 
 	// -- Level-0 graph accessors (raw, hnswlib-internal-id-addressed) -- what
-	// HnswIndexDist's copied search loop (hnsw_index_dist.cpp) needs; also
-	// used by HnswIndex::modifyHost()'s own `modified` footprint computation.
+	// HnswlibIndexGpu's copied search loop (hnswlib_index_gpu.cpp) needs; also
+	// used by HnswlibIndex::modifyHost()'s own `modified` footprint computation.
 	virtual std::uint32_t globalEntryPoint() const = 0;
 	virtual const void* dataPointerFor(std::uint32_t internal_id) const = 0;
 	virtual std::vector<std::uint32_t> level0Neighbors(std::uint32_t internal_id) const = 0;
 	virtual bool isMarkedDeleted(std::uint32_t internal_id) const = 0;
 	virtual std::optional<std::uint32_t> internalIdFor(VectorId external_id) const = 0;
 	virtual VectorId externalLabel(std::uint32_t internal_id) const = 0;
+	virtual float hostDistance(const void* a, const void* b) const = 0;
 
 	// -- Algorithm bridge (label-addressed, i.e. the public-facing shape).
 	virtual TraverseResult traverseOne(const TraverseRequest& request) const = 0;
@@ -64,6 +65,14 @@ class HnswEngine {
 	virtual std::size_t liveCount() const = 0;
 
 	virtual void build(const VectorBatchView& dataset) = 0;
+
+	// hnswlib's own HierarchicalNSW ctor hardcodes ef_=10 internally and
+	// nothing else in this file has ever called setEf() -- every search so
+	// far has silently run at that fixed ef_search. Exposed here so a caller
+	// that actually cares about recall (e.g. a benchmark comparing against
+	// raw hnswlib at a chosen ef_search) can change it; leaving it unset
+	// preserves today's exact behavior.
+	virtual void setEfSearch(std::size_t ef_search) = 0;
 };
 
 namespace {
@@ -84,13 +93,28 @@ class TypedHnswEngine final : public HnswEngine {
 	std::size_t maxElements() const override { return index_.max_elements_; }
 	std::size_t maxM() const override { return index_.M_; }
 	std::size_t efConstruction() const override { return index_.ef_construction_; }
-	std::uint32_t globalEntryPoint() const override { return static_cast<std::uint32_t>(index_.enterpoint_node_); }
+	// index_.global is what hnswlib's own addPoint() holds while it may be
+	// about to update enterpoint_node_ (hnswalg.h's addPoint(), the `templock`
+	// acquisition) -- taking the same mutex here for the read gives this call
+	// the same consistency hnswlib's own internal readers get, without a
+	// source patch (see hnswlib_index.hpp's "used as-is" guarantee; index_.global
+	// is a public member of the vendored HierarchicalNSW, see hnswalg.h).
+	std::uint32_t globalEntryPoint() const override {
+		std::lock_guard<std::mutex> lock(index_.global);
+		return static_cast<std::uint32_t>(index_.enterpoint_node_);
+	}
 
 	const void* dataPointerFor(std::uint32_t internal_id) const override {
 		return index_.getDataByInternalId(internal_id);
 	}
 
+	// index_.link_list_locks_[internal_id] is the exact lock hnswlib's own
+	// getConnectionsWithLock() takes around this same read (hnswalg.h) --
+	// without it, a concurrent addPoint() elsewhere that picks internal_id as
+	// one of *its* neighbors could be mid-rewrite of this list via the same
+	// lock while we read it unsynchronized.
 	std::vector<std::uint32_t> level0Neighbors(std::uint32_t internal_id) const override {
+		std::lock_guard<std::mutex> lock(index_.link_list_locks_[internal_id]);
 		hnswlib::linklistsizeint* ll = index_.get_linklist0(internal_id);
 		std::size_t count = index_.getListCount(ll);
 		hnswlib::tableint* neighbors = reinterpret_cast<hnswlib::tableint*>(ll + 1);
@@ -106,7 +130,23 @@ class TypedHnswEngine final : public HnswEngine {
 		return static_cast<VectorId>(index_.getExternalLabel(internal_id));
 	}
 
+	// index_.fstdistfunc_/dist_func_param_ are hnswlib's own already-selected
+	// distance function (set once from the Space at construction, see the
+	// HierarchicalNSW ctor) -- calling it directly, the same way hnswlib's
+	// own internal search/insert code does (hnswalg.h), rather than
+	// re-deriving the formula, is what guarantees this matches
+	// traverseOne()/searchKnnCloserFirst() exactly.
+	float hostDistance(const void* a, const void* b) const override {
+		return static_cast<float>(index_.fstdistfunc_(a, b, index_.dist_func_param_));
+	}
+
+	// index_.label_lookup_lock is the exact lock hnswlib's own addPoint()/
+	// markDelete() take around every label_lookup_ touch (hnswalg.h) -- taking
+	// it here too protects this read against a concurrent insert's rehash of
+	// the *same* std::unordered_map (a different key than external_id, but
+	// still the same underlying table).
 	std::optional<std::uint32_t> internalIdFor(VectorId external_id) const override {
+		std::lock_guard<std::mutex> lock(index_.label_lookup_lock);
 		auto it = index_.label_lookup_.find(static_cast<hnswlib::labeltype>(external_id));
 		if (it == index_.label_lookup_.end()) return std::nullopt;
 		return static_cast<std::uint32_t>(it->second);
@@ -140,6 +180,12 @@ class TypedHnswEngine final : public HnswEngine {
 			ARACHNE_LOG_WARN("HnswEngine::insertOne: addPoint(label={}) threw: {}", request.record.id, e.what());
 			return std::nullopt;
 		}
+		// Same label_lookup_lock as internalIdFor() above -- addPoint() already
+		// released it once this call returns, so re-acquiring it here is a
+		// standard read-after-writer-releases pattern (this label's entry is
+		// already committed); the lock is only needed against a *different*
+		// concurrent insert's write to the same map, not against this one.
+		std::lock_guard<std::mutex> lock(index_.label_lookup_lock);
 		auto it = index_.label_lookup_.find(label);
 		if (it == index_.label_lookup_.end()) return std::nullopt;  // shouldn't happen -- addPoint() just set it
 		return static_cast<std::uint32_t>(it->second);
@@ -164,10 +210,12 @@ class TypedHnswEngine final : public HnswEngine {
 
 	std::size_t liveCount() const override { return index_.getCurrentElementCount() - index_.getDeletedCount(); }
 
+	void setEfSearch(std::size_t ef_search) override { index_.setEf(ef_search); }
+
 	// TEMPORARY: goes straight through hnswlib's own public addPoint(), one
-	// vector at a time -- see HnswIndex::build()'s doc comment in
-	// hnsw_index.hpp for why this is a placeholder rather than the "real"
-	// path. `dataset`'s dtype/dim are validated by HnswIndex::build() before
+	// vector at a time -- see HnswlibIndex::build()'s doc comment in
+	// hnswlib_index.hpp for why this is a placeholder rather than the "real"
+	// path. `dataset`'s dtype/dim are validated by HnswlibIndex::build() before
 	// this is reached, so ElemT below is already known to match
 	// dataset.data's actual encoding.
 	void build(const VectorBatchView& dataset) override {
@@ -185,7 +233,7 @@ class TypedHnswEngine final : public HnswEngine {
 	// mutable: several of hnswlib's own methods (getCurrentElementCount(),
 	// saveIndex(), searchKnnCloserFirst() is const but getCurrentElementCount()
 	// isn't, ...) aren't const-qualified even though they're logically
-	// read-only -- not something to fix by patching hnswlib (see hnsw_index.hpp's
+	// read-only -- not something to fix by patching hnswlib (see hnswlib_index.hpp's
 	// "used as-is" guarantee), so this wrapper absorbs it here instead.
 	mutable SpaceT space_;
 	mutable hnswlib::HierarchicalNSW<DistT> index_;
@@ -196,14 +244,14 @@ class TypedHnswEngine final : public HnswEngine {
 ///
 /// TODO(Cosine): as_routing_cache_hnsw.cpp's CosineInstance normalizes
 /// vectors around a plain InnerProductSpace<float> since hnswlib has no
-/// dedicated Cosine space; HnswIndex needs the same wrapper before it can
+/// dedicated Cosine space; HnswlibIndex needs the same wrapper before it can
 /// support DistanceMetric::Cosine. Rejected here for now rather than
 /// silently mishandled.
 std::unique_ptr<HnswEngine> makeEngine(std::uint32_t dim, VectorDType dtype, DistanceMetric metric,
 																				std::size_t capacity, std::size_t M, std::size_t ef_construction) {
 	if (metric == DistanceMetric::Cosine) {
 		throw std::invalid_argument(
-				"HnswIndex: DistanceMetric::Cosine not yet supported (skeleton, see makeEngine()'s TODO)");
+				"HnswlibIndex: DistanceMetric::Cosine not yet supported (skeleton, see makeEngine()'s TODO)");
 	}
 
 	switch (dtype) {
@@ -236,16 +284,16 @@ std::unique_ptr<HnswEngine> makeEngine(std::uint32_t dim, VectorDType dtype, Dis
 			return std::make_unique<TypedHnswEngine<hnswlib::InnerProductSpaceInt8, std::int8_t, int>>(
 					dim, capacity, M, ef_construction);
 	}
-	throw std::invalid_argument("HnswIndex: unknown VectorDType");
+	throw std::invalid_argument("HnswlibIndex: unknown VectorDType");
 }
 
 }  // namespace
 
 // ---------------------------------------------------------------------------
-// HnswIndex
+// HnswlibIndex
 // ---------------------------------------------------------------------------
 
-HnswIndex::HnswIndex(std::uint32_t dim, VectorDType dtype, DistanceMetric metric, std::size_t capacity,
+HnswlibIndex::HnswlibIndex(std::uint32_t dim, VectorDType dtype, DistanceMetric metric, std::size_t capacity,
 											std::size_t vectors_per_region, std::size_t M, std::size_t ef_construction)
 		: dim_(dim),
 			dtype_(dtype),
@@ -255,22 +303,22 @@ HnswIndex::HnswIndex(std::uint32_t dim, VectorDType dtype, DistanceMetric metric
 			M_(M),
 			ef_construction_(ef_construction) {
 	if (vectors_per_region_ == 0) {
-		throw std::invalid_argument("HnswIndex: vectors_per_region must be > 0");
+		throw std::invalid_argument("HnswlibIndex: vectors_per_region must be > 0");
 	}
 
 	engine_ = makeEngine(dim_, dtype_, metric_, capacity_, M_, ef_construction_);
 	BuildRegions();
 
 	ARACHNE_LOG_INFO(
-			"HnswIndex: constructed (dim={} dtype={} metric={} capacity={} vectors_per_region={} regions={} M={} "
+			"HnswlibIndex: constructed (dim={} dtype={} metric={} capacity={} vectors_per_region={} regions={} M={} "
 			"ef_construction={})",
 			dim_, static_cast<int>(dtype_), static_cast<int>(metric_), capacity_, vectors_per_region_, regions_.size(),
 			M_, ef_construction_);
 }
 
-HnswIndex::~HnswIndex() = default;
+HnswlibIndex::~HnswlibIndex() = default;
 
-void HnswIndex::BuildRegions() {
+void HnswlibIndex::BuildRegions() {
 	regions_.clear();
 	char* base = static_cast<char*>(engine_->dataLevel0Memory());
 	std::size_t record_bytes = engine_->sizeDataPerElement();
@@ -282,29 +330,35 @@ void HnswIndex::BuildRegions() {
 	}
 }
 
-std::uint32_t HnswIndex::resolveEntryPoint(const TraverseRequest& /*request*/) const {
+std::uint32_t HnswlibIndex::resolveEntryPoint(const TraverseRequest& /*request*/) const {
 	std::uint32_t entry = engineGlobalEntryPoint();
-	ARACHNE_LOG_DEBUG("HnswIndex::resolveEntryPoint: global entry point {} (default strategy)", entry);
+	ARACHNE_LOG_DEBUG("HnswlibIndex::resolveEntryPoint: global entry point {} (default strategy)", entry);
 	return entry;
 }
 
-std::vector<TraverseResult> HnswIndex::traverseHost(const std::vector<TraverseRequest>& requests) {
+std::vector<TraverseResult> HnswlibIndex::traverseHost(const std::vector<TraverseRequest>& requests) {
 	std::vector<TraverseResult> results;
 	results.reserve(requests.size());
-	std::lock_guard<std::mutex> lock(mutex_);
+	// No mutex_ here (see hnswlib_index.hpp's class doc comment): engine_->
+	// traverseOne() calls only hnswlib's own searchKnnCloserFirst(), which
+	// hnswlib's README documents as thread-safe with concurrent search calls;
+	// engine_->internalIdFor() below takes hnswlib's own label_lookup_lock
+	// itself (see TypedHnswEngine::internalIdFor(), hnswlib_index.cpp). Safety
+	// against a concurrently-running Modify is OpScheduler's job (see
+	// IAdapter::requiresTraverseModifyIsolation()), not this function's.
 	for (const TraverseRequest& request : requests) {
 		TraverseResult result = engine_->traverseOne(request);
 		// touched (report.md §7.2 decision (a)): approximated as only the
 		// top-k results' own Regions -- hnswlib doesn't expose the full
 		// visited-node set through its public API without a source patch,
-		// which this class deliberately avoids (see hnsw_index.hpp overview).
+		// which this class deliberately avoids (see hnswlib_index.hpp overview).
 		std::unordered_set<RegionId> touched;
 		for (const Neighbor& neighbor : result.result.neighbors) {
 			if (auto internal_id = engine_->internalIdFor(neighbor.id)) touched.insert(RegionForInternalId(*internal_id));
 		}
 		result.touched.regions.assign(touched.begin(), touched.end());
 		ARACHNE_LOG_DEBUG(
-				"HnswIndex::traverseHost: top_k={} found={} touched_regions={} completed_within_scope={}",
+				"HnswlibIndex::traverseHost: top_k={} found={} touched_regions={} completed_within_scope={}",
 				request.query.top_k, result.result.neighbors.size(), result.touched.regions.size(),
 				result.completed_within_scope);
 		results.push_back(std::move(result));
@@ -312,10 +366,18 @@ std::vector<TraverseResult> HnswIndex::traverseHost(const std::vector<TraverseRe
 	return results;
 }
 
-std::vector<ModifyResult> HnswIndex::modifyHost(const std::vector<ModifyRequest>& requests) {
+std::vector<ModifyResult> HnswlibIndex::modifyHost(const std::vector<ModifyRequest>& requests) {
 	std::vector<ModifyResult> results;
 	results.reserve(requests.size());
-	std::lock_guard<std::mutex> lock(mutex_);
+	// No mutex_ here (see hnswlib_index.hpp's class doc comment): engine_->
+	// insertOne()/deleteOne() call only hnswlib's own addPoint()/markDelete(),
+	// which hnswlib's README documents as thread-safe with other such calls;
+	// the label_lookup_/level0Neighbors reads used for `modified` footprint
+	// bookkeeping below take hnswlib's own locks themselves (see
+	// TypedHnswEngine::insertOne()/level0Neighbors(), hnswlib_index.cpp).
+	// Same-op concurrency (Insert-vs-Insert, Delete-vs-Delete) is therefore
+	// safe; cross-op and Modify-vs-Traverse safety is OpScheduler's job (see
+	// IAdapter::requiresTraverseModifyIsolation()), not this function's.
 	for (const ModifyRequest& request : requests) {
 		ModifyResult result;
 		result.execution_mode = ExecutionMode::Hybrid;
@@ -325,7 +387,7 @@ std::vector<ModifyResult> HnswIndex::modifyHost(const std::vector<ModifyRequest>
 			if (new_id) {
 				// Conservative over-approximation: the new node's own Region plus
 				// its immediate level-0 neighbors' Regions -- see modifyHost()'s
-				// doc comment in hnsw_index.hpp for why this may under-count what
+				// doc comment in hnswlib_index.hpp for why this may under-count what
 				// mutuallyConnectNewElement() actually rewired.
 				std::unordered_set<RegionId> regions{RegionForInternalId(*new_id)};
 				for (std::uint32_t neighbor : engine_->level0Neighbors(*new_id)) regions.insert(RegionForInternalId(neighbor));
@@ -340,18 +402,18 @@ std::vector<ModifyResult> HnswIndex::modifyHost(const std::vector<ModifyRequest>
 				// invalidates it. Surfaced at DEBUG for exactly this kind of
 				// diagnosis.
 				ARACHNE_LOG_DEBUG(
-						"HnswIndex::modifyHost: Insert id={} -> internal_id={} modified_regions={} "
+						"HnswlibIndex::modifyHost: Insert id={} -> internal_id={} modified_regions={} "
 						"(caller is responsible for noticing if any of these are GPU-resident)",
 						request.record.id, *new_id, result.modified.regions.size());
 			} else {
-				ARACHNE_LOG_DEBUG("HnswIndex::modifyHost: Insert id={} failed (addPoint() threw, see prior WARN)",
+				ARACHNE_LOG_DEBUG("HnswlibIndex::modifyHost: Insert id={} failed (addPoint() threw, see prior WARN)",
 													 request.record.id);
 			}
 		} else {
 			result.ok = engine_->deleteOne(request);
 			// markDelete() only flips a bit in the target's own record -- no
 			// graph rewiring, so nothing else is touched/modified.
-			ARACHNE_LOG_DEBUG("HnswIndex::modifyHost: Delete id={} ok={} (tombstone bit only, region byte-identical "
+			ARACHNE_LOG_DEBUG("HnswlibIndex::modifyHost: Delete id={} ok={} (tombstone bit only, region byte-identical "
 												 "except that bit -- a GPU-resident copy is stale by exactly one bit until re-synced)",
 												 request.target, result.ok);
 		}
@@ -360,55 +422,57 @@ std::vector<ModifyResult> HnswIndex::modifyHost(const std::vector<ModifyRequest>
 	return results;
 }
 
-IRegion* HnswIndex::resolveRegion(RegionId id) {
+IRegion* HnswlibIndex::resolveRegion(RegionId id) {
 	if (id >= regions_.size()) {
-		ARACHNE_LOG_WARN("HnswIndex::resolveRegion: unknown region {}", id);
+		ARACHNE_LOG_WARN("HnswlibIndex::resolveRegion: unknown region {}", id);
 		return nullptr;
 	}
 	return regions_[id].get();
 }
 
-std::vector<RegionId> HnswIndex::allRegions() const {
+std::vector<RegionId> HnswlibIndex::allRegions() const {
 	std::vector<RegionId> ids;
 	ids.reserve(regions_.size());
 	for (const auto& region : regions_) ids.push_back(region->id());
 	return ids;
 }
 
-void HnswIndex::build(const VectorBatchView& dataset) {
+void HnswlibIndex::build(const VectorBatchView& dataset) {
 	if (dataset.dtype != dtype_) {
-		throw std::invalid_argument("HnswIndex::build: dataset dtype does not match this adapter's dtype");
+		throw std::invalid_argument("HnswlibIndex::build: dataset dtype does not match this adapter's dtype");
 	}
 	if (dataset.dim != dim_) {
-		throw std::invalid_argument("HnswIndex::build: dataset dim does not match this adapter's dim");
+		throw std::invalid_argument("HnswlibIndex::build: dataset dim does not match this adapter's dim");
 	}
 	if (dataset.count > capacity_) {
-		throw std::invalid_argument("HnswIndex::build: dataset count exceeds capacity");
+		throw std::invalid_argument("HnswlibIndex::build: dataset count exceeds capacity");
 	}
 
 	ARACHNE_LOG_INFO(
-			"HnswIndex::build: building from {} vector(s) via hnswlib addPoint() (TEMPORARY -- see build()'s doc "
+			"HnswlibIndex::build: building from {} vector(s) via hnswlib addPoint() (TEMPORARY -- see build()'s doc "
 			"comment)",
 			dataset.count);
 	{
 		std::lock_guard<std::mutex> lock(mutex_);
 		engine_->build(dataset);
 	}
-	ARACHNE_LOG_INFO("HnswIndex::build: done ({} live)", liveCount());
+	ARACHNE_LOG_INFO("HnswlibIndex::build: done ({} live)", liveCount());
 }
 
-void HnswIndex::registerAllRegions(Controller& controller) {
+void HnswlibIndex::registerAllRegions(Controller& controller) {
 	for (const auto& region : regions_) controller.registerRegion(region->id(), region->hostView());
-	ARACHNE_LOG_INFO("HnswIndex::registerAllRegions: registered {} region(s)", regions_.size());
+	ARACHNE_LOG_INFO("HnswlibIndex::registerAllRegions: registered {} region(s)", regions_.size());
 }
 
-void HnswIndex::exportTo(const std::string& path) const {
+void HnswlibIndex::setEfSearch(std::size_t ef_search) { engine_->setEfSearch(ef_search); }
+
+void HnswlibIndex::exportTo(const std::string& path) const {
 	std::lock_guard<std::mutex> lock(mutex_);
 	engine_->exportTo(path);
-	ARACHNE_LOG_INFO("HnswIndex::exportTo: wrote '{}'", path);
+	ARACHNE_LOG_INFO("HnswlibIndex::exportTo: wrote '{}'", path);
 }
 
-void HnswIndex::loadFrom(const std::string& path) {
+void HnswlibIndex::loadFrom(const std::string& path) {
 	std::lock_guard<std::mutex> lock(mutex_);
 	// max_elements_hint=0, not capacity_: hnswlib's own loadIndex() only
 	// falls back to the *file's* saved max_elements_ when what we pass is
@@ -438,47 +502,49 @@ void HnswIndex::loadFrom(const std::string& path) {
 	// solved (would need reading the file's own vector bytes and cross
 	// checking, or a source patch this directory otherwise avoids).
 	if (engine_->maxElements() != capacity_) {
-		throw std::invalid_argument("HnswIndex::loadFrom: file's max_elements does not match this adapter's capacity");
+		throw std::invalid_argument("HnswlibIndex::loadFrom: file's max_elements does not match this adapter's capacity");
 	}
 	if (engine_->maxM() != M_) {
-		throw std::invalid_argument("HnswIndex::loadFrom: file's M does not match this adapter's M");
+		throw std::invalid_argument("HnswlibIndex::loadFrom: file's M does not match this adapter's M");
 	}
 	if (engine_->efConstruction() != ef_construction_) {
-		throw std::invalid_argument("HnswIndex::loadFrom: file's ef_construction does not match this adapter's");
+		throw std::invalid_argument("HnswlibIndex::loadFrom: file's ef_construction does not match this adapter's");
 	}
 
 	BuildRegions();  // data_level0_memory_ was realloc'd by loadIndex() -- every old HnswRegion pointer is stale
 	// engine_->liveCount() directly (not liveCount()) -- mutex_ is already
 	// held by this function, and it's a plain std::mutex, not recursive.
-	ARACHNE_LOG_INFO("HnswIndex::loadFrom: loaded '{}' ({} live, {} region(s) rebuilt)", path, engine_->liveCount(),
+	ARACHNE_LOG_INFO("HnswlibIndex::loadFrom: loaded '{}' ({} live, {} region(s) rebuilt)", path, engine_->liveCount(),
 										regions_.size());
 }
 
-std::size_t HnswIndex::liveCount() const {
+std::size_t HnswlibIndex::liveCount() const {
 	std::lock_guard<std::mutex> lock(mutex_);
 	return engine_->liveCount();
 }
 
-RegionId HnswIndex::RegionForInternalId(std::size_t internal_id) const {
+RegionId HnswlibIndex::RegionForInternalId(std::size_t internal_id) const {
 	return static_cast<RegionId>(internal_id / vectors_per_region_);
 }
 
-std::uint32_t HnswIndex::engineGlobalEntryPoint() const { return engine_->globalEntryPoint(); }
+std::uint32_t HnswlibIndex::engineGlobalEntryPoint() const { return engine_->globalEntryPoint(); }
 
-const void* HnswIndex::engineDataPointerFor(std::uint32_t internal_id) const {
+const void* HnswlibIndex::engineDataPointerFor(std::uint32_t internal_id) const {
 	return engine_->dataPointerFor(internal_id);
 }
 
-std::vector<std::uint32_t> HnswIndex::engineLevel0Neighbors(std::uint32_t internal_id) const {
+std::vector<std::uint32_t> HnswlibIndex::engineLevel0Neighbors(std::uint32_t internal_id) const {
 	return engine_->level0Neighbors(internal_id);
 }
 
-bool HnswIndex::engineIsMarkedDeleted(std::uint32_t internal_id) const { return engine_->isMarkedDeleted(internal_id); }
+bool HnswlibIndex::engineIsMarkedDeleted(std::uint32_t internal_id) const { return engine_->isMarkedDeleted(internal_id); }
 
-VectorId HnswIndex::engineExternalLabel(std::uint32_t internal_id) const { return engine_->externalLabel(internal_id); }
+VectorId HnswlibIndex::engineExternalLabel(std::uint32_t internal_id) const { return engine_->externalLabel(internal_id); }
 
-std::optional<std::uint32_t> HnswIndex::engineInternalIdFor(VectorId external_id) const {
+std::optional<std::uint32_t> HnswlibIndex::engineInternalIdFor(VectorId external_id) const {
 	return engine_->internalIdFor(external_id);
 }
+
+float HnswlibIndex::engineHostDistance(const void* a, const void* b) const { return engine_->hostDistance(a, b); }
 
 }  // namespace arachne::index::hnsw

@@ -13,6 +13,7 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <chrono>
 #include <condition_variable>
 #include <cstring>
@@ -263,6 +264,80 @@ TEST(RegionManagerCoordinatorTest, ReleaseAnchorBookkeepingIsImmediateButReclaim
 	manager.shutdown();
 }
 
+// isKnownAnchor() exists purely for Controller::MintAnchorId()'s wraparound-
+// collision guard (controller.cpp) -- these three cover the three states an
+// Anchor id can be in relative to it: never seen, currently resident, and
+// released-but-permanently-remembered. The guard's own retry-on-collision
+// loop isn't separately exercised here -- doing so would mean actually
+// driving a 64-bit counter to its limit, which isn't practical; this is the
+// primitive it's built on, tested directly instead.
+TEST(RegionManagerCoordinatorTest, IsKnownAnchorIsFalseForAnIdThatWasNeverAssigned) {
+	FakeAdapter adapter;
+	FakeRoutingCache routing_cache;
+	gpu::DeviceContext device;
+	gpu::DeviceRegionPool pool(device);
+	RegionManager manager;
+	manager.start(adapter, pool, routing_cache, CoordinatorConfig{kLongInterval});
+
+	EXPECT_FALSE(manager.isKnownAnchor(999));
+
+	manager.shutdown();
+}
+
+TEST(RegionManagerCoordinatorTest, IsKnownAnchorIsTrueWhileAnAnchorCurrentlyDependsOnARegion) {
+	FakeAdapter adapter;
+	FakeRoutingCache routing_cache;
+	constexpr std::size_t kBytes = 256;
+	gpu::DeviceContext device(/*device_id=*/0, gpu::AllocationPolicy::Pooled, kBytes, gpu::kDefaultMetadataPoolBytes,
+														 /*worker_stream_count=*/1, /*unit_bytes=*/kBytes);
+	gpu::DeviceRegionPool pool(device);
+	RegionManager manager;
+	manager.start(adapter, pool, routing_cache, CoordinatorConfig{kLongInterval});
+
+	std::vector<std::byte> host_data(kBytes, std::byte{0x7});
+	HostRegionView host{host_data.data(), kBytes, 0};
+	adapter.addRegion(1, host);
+	manager.registerRegion(1, host);
+
+	EXPECT_FALSE(manager.isKnownAnchor(100)) << "not yet requested -- must not already read as known";
+	manager.requestPromotion(100, RegionFootprint{{1}});
+	manager.waitIdle();
+	EXPECT_TRUE(manager.isKnownAnchor(100));
+
+	manager.shutdown();
+}
+
+TEST(RegionManagerCoordinatorTest, IsKnownAnchorStaysTrueAfterReleaseEvenThoughNoLongerResident) {
+	// The property Controller::MintAnchorId()'s wraparound guard actually
+	// depends on: an Anchor id must never look "free" again just because
+	// it's no longer resident -- anchor_epoch_'s entries are never removed
+	// (see that member's own doc comment) specifically so this stays true
+	// forever, not just while the Anchor is still alive.
+	FakeAdapter adapter;
+	FakeRoutingCache routing_cache;
+	constexpr std::size_t kBytes = 256;
+	gpu::DeviceContext device(/*device_id=*/0, gpu::AllocationPolicy::Pooled, kBytes, gpu::kDefaultMetadataPoolBytes,
+														 /*worker_stream_count=*/1, /*unit_bytes=*/kBytes);
+	gpu::DeviceRegionPool pool(device);
+	RegionManager manager;
+	manager.start(adapter, pool, routing_cache, CoordinatorConfig{kLongInterval});
+
+	std::vector<std::byte> host_data(kBytes, std::byte{0x7});
+	HostRegionView host{host_data.data(), kBytes, 0};
+	adapter.addRegion(1, host);
+	manager.registerRegion(1, host);
+
+	manager.requestPromotion(100, RegionFootprint{{1}});
+	manager.waitIdle();
+	ASSERT_TRUE(manager.isKnownAnchor(100));
+
+	manager.releaseAnchor(100);
+	ASSERT_TRUE(manager.regionsOf(100).empty()) << "no longer depends on anything -- the dependencies_ half is gone";
+	EXPECT_TRUE(manager.isKnownAnchor(100)) << "must still read as known via anchor_epoch_";
+
+	manager.shutdown();
+}
+
 TEST(RegionManagerCoordinatorTest, TimelyTriggerProcessesWithoutExplicitWaitIdle) {
 	// "Timely event triggering": the Coordinator's own periodic tick, with no
 	// caller ever calling waitIdle(), must eventually catch up on its own.
@@ -349,6 +424,404 @@ TEST(RegionManagerCoordinatorTest, CapacityPressureEvictsOldestViaReplacementPol
 	EXPECT_EQ(routing_cache.erased, std::vector<VectorId>{101});
 	EXPECT_EQ(routing_cache.ensured, (std::vector<VectorId>{101, 102, 103}));
 	EXPECT_EQ(manager.stats().near_fit_reuses_total, 1u);
+
+	manager.shutdown();
+}
+
+// Two Anchors sharing the exact same Region -- with the default
+// max_eviction_group_size=1, that Region becomes permanently unreclaimable
+// the moment a second Anchor depends on it (dependents_[region].size() == 2,
+// so neither Anchor's own EvictionCandidate::reclaimable_bytes ever counts
+// it -- see buildEvictionCandidates()'s doc comment). This is exactly what a
+// heavily fan-in "hub" Region hits in a read-heavy production workload.
+// Raising max_eviction_group_size (and configuring a lenient
+// admission_hysteresis so this test's outcome doesn't hinge on a
+// close-to-tied heat comparison between two Anchors promoted milliseconds
+// apart) lets the two Anchors be grouped together, so the shared Region
+// becomes reclaimable by evicting the whole group jointly.
+TEST(RegionManagerCoordinatorTest, GroupEvictionReclaimsRegionSharedByMultipleAnchorsWhenCapAllowsIt) {
+	FakeAdapter adapter;
+	FakeRoutingCache routing_cache;
+	constexpr std::size_t kBytes = 256;
+	gpu::DeviceContext device(/*device_id=*/0, gpu::AllocationPolicy::Pooled, kBytes,
+														 gpu::kDefaultMetadataPoolBytes, /*worker_stream_count=*/1, /*unit_bytes=*/kBytes);
+	gpu::DeviceRegionPool pool(device);
+	CostAwareReplacementConfig policy_config;
+	policy_config.admission_hysteresis = 0.1;  // comfortably admit once *any* victim is found
+	RegionManager manager(std::make_unique<CostAwareReplacementPolicy>(policy_config));
+	CoordinatorConfig config{kShortInterval};
+	config.group_merge_overlap_threshold = 0.5;
+	config.max_eviction_group_size = 2;
+	manager.start(adapter, pool, routing_cache, config);
+
+	std::vector<std::vector<std::byte>> buffers(2, std::vector<std::byte>(kBytes, std::byte{0}));
+	for (RegionId id = 1; id <= 2; ++id) {
+		HostRegionView host{buffers[id - 1].data(), kBytes, 0};
+		adapter.addRegion(id, host);
+		manager.registerRegion(id, host);
+	}
+
+	manager.requestPromotion(201, RegionFootprint{{1}});
+	manager.waitIdle();
+	manager.requestPromotion(202, RegionFootprint{{1}});  // same Region, already resident -- free to join
+	manager.waitIdle();
+	ASSERT_TRUE(manager.regionOf(1).device.valid());
+	ASSERT_FALSE(manager.regionOf(2).device.valid());
+
+	// Budget (256B) is already full with Region 1 alone; promoting 203's
+	// Region 2 needs eviction. Region 1 has two dependents (201, 202) -- under
+	// the default sole-ownership rule this would have zero eligible victims.
+	manager.requestPromotion(203, RegionFootprint{{2}});
+	manager.waitIdle();
+
+	EXPECT_FALSE(manager.regionOf(1).device.valid());  // whole group evicted together
+	EXPECT_TRUE(manager.regionOf(2).device.valid());   // newly promoted
+	EXPECT_TRUE(manager.regionsOf(201).empty());
+	EXPECT_TRUE(manager.regionsOf(202).empty());
+	EXPECT_GE(manager.stats().anchor_evictions_total, 2u);  // both group members evicted
+	EXPECT_NE(std::find(routing_cache.erased.begin(), routing_cache.erased.end(), 201), routing_cache.erased.end());
+	EXPECT_NE(std::find(routing_cache.erased.begin(), routing_cache.erased.end(), 202), routing_cache.erased.end());
+
+	manager.shutdown();
+}
+
+// Same setup as above, but with the *default* max_eviction_group_size (1) --
+// every Anchor is always its own singleton group, so a Region with more than
+// one dependent is never reclaimable, exactly reproducing this port's
+// original sole-ownership-only rule. Confirms the new grouping machinery is
+// fully opt-in: leaving CoordinatorConfig untouched changes nothing.
+TEST(RegionManagerCoordinatorTest, SharedRegionStaysUnreclaimableWithDefaultGroupCap) {
+	FakeAdapter adapter;
+	FakeRoutingCache routing_cache;
+	constexpr std::size_t kBytes = 256;
+	gpu::DeviceContext device(/*device_id=*/0, gpu::AllocationPolicy::Pooled, kBytes,
+														 gpu::kDefaultMetadataPoolBytes, /*worker_stream_count=*/1, /*unit_bytes=*/kBytes);
+	gpu::DeviceRegionPool pool(device);
+	RegionManager manager(std::make_unique<CostAwareReplacementPolicy>());
+	manager.start(adapter, pool, routing_cache, CoordinatorConfig{kShortInterval});  // group cap defaults to 1
+
+	std::vector<std::vector<std::byte>> buffers(2, std::vector<std::byte>(kBytes, std::byte{0}));
+	for (RegionId id = 1; id <= 2; ++id) {
+		HostRegionView host{buffers[id - 1].data(), kBytes, 0};
+		adapter.addRegion(id, host);
+		manager.registerRegion(id, host);
+	}
+
+	manager.requestPromotion(301, RegionFootprint{{1}});
+	manager.waitIdle();
+	manager.requestPromotion(302, RegionFootprint{{1}});
+	manager.waitIdle();
+	ASSERT_TRUE(manager.regionOf(1).device.valid());
+
+	manager.requestPromotion(303, RegionFootprint{{2}});
+	manager.waitIdle();
+
+	EXPECT_TRUE(manager.regionOf(1).device.valid());   // still shared by 301+302, never reclaimed
+	EXPECT_FALSE(manager.regionOf(2).device.valid());  // 303 never got a chance to promote
+	EXPECT_FALSE(manager.regionsOf(301).empty());
+	EXPECT_FALSE(manager.regionsOf(302).empty());
+	EXPECT_TRUE(manager.regionsOf(303).empty());
+	EXPECT_GE(manager.stats().candidates_rejected_total, 1u);
+
+	manager.shutdown();
+}
+
+// Direct RegionManager-level reproduction of the requeue bug this session's
+// fix (buildRelocationPlan(), region_manager.cpp) addresses: four promotions
+// submitted back-to-back with no intermediate waitIdle() all land in the
+// Coordinator's very first (forced) pass together. 101/102/103 (256B each)
+// fill the 768B budget exactly; 104 (512B) can't join that same pass. Before
+// the fix, 104 was dropped permanently instead of requeued, because
+// forced/stop drains suppressed retry unconditionally, regardless of whether
+// retrying was actually safe. See buildRelocationPlan()'s own comment for
+// why requeuing it here is provably safe (a bounded number of passes, since
+// plan.promotions is non-empty at drop time -- 101/102/103 already claimed
+// room in this exact pass) even though this whole thing runs inside one
+// forced waitIdle() call.
+TEST(RegionManagerCoordinatorTest, SameBatchOverflowRequeuesWithoutIntermediateWaitIdle) {
+	FakeAdapter adapter;
+	FakeRoutingCache routing_cache;
+	constexpr std::size_t kSmallBytes = 256;
+	constexpr std::size_t kBigBytes = 512;
+	gpu::DeviceContext device(/*device_id=*/0, gpu::AllocationPolicy::Pooled, 3 * kSmallBytes,
+			gpu::kDefaultMetadataPoolBytes, /*worker_stream_count=*/1, /*unit_bytes=*/kSmallBytes);
+	gpu::DeviceRegionPool pool(device);
+	RegionManager manager(std::make_unique<FifoReplacementPolicy>());
+	manager.start(adapter, pool, routing_cache, CoordinatorConfig{kLongInterval});
+
+	std::vector<std::byte> data_a(kSmallBytes, std::byte{0xA});
+	std::vector<std::byte> data_b(kSmallBytes, std::byte{0xB});
+	std::vector<std::byte> data_c(kSmallBytes, std::byte{0xC});
+	std::vector<std::byte> data_d(kBigBytes, std::byte{0xD});
+	HostRegionView host_a{data_a.data(), kSmallBytes, 0};
+	HostRegionView host_b{data_b.data(), kSmallBytes, 0};
+	HostRegionView host_c{data_c.data(), kSmallBytes, 0};
+	HostRegionView host_d{data_d.data(), kBigBytes, 0};
+	adapter.addRegion(1, host_a);
+	adapter.addRegion(2, host_b);
+	adapter.addRegion(3, host_c);
+	adapter.addRegion(4, host_d);
+	manager.registerRegion(1, host_a);
+	manager.registerRegion(2, host_b);
+	manager.registerRegion(3, host_c);
+	manager.registerRegion(4, host_d);
+
+	manager.requestPromotion(101, RegionFootprint{{1}});
+	manager.requestPromotion(102, RegionFootprint{{2}});
+	manager.requestPromotion(103, RegionFootprint{{3}});
+	manager.requestPromotion(104, RegionFootprint{{4}});
+	// Deliberately no waitIdle() between requests -- all four sit pending
+	// before the Coordinator ever wakes up.
+
+	manager.waitIdle();
+
+	EXPECT_FALSE(manager.regionOf(1).device.valid());  // evicted to make room for 104
+	EXPECT_FALSE(manager.regionOf(2).device.valid());  // evicted to make room for 104
+	EXPECT_TRUE(manager.regionOf(3).device.valid());   // untouched -- one eviction wasn't enough, two was
+	EXPECT_TRUE(manager.regionOf(4).device.valid());   // eventually promoted, not lost
+	EXPECT_GT(manager.stats().relocation_batches_total, 1u)
+			<< "104 should have needed a second Coordinator pass within this one waitIdle() call";
+	EXPECT_GE(manager.stats().candidates_requeued_total, 1u)
+			<< "104 should have been requeued at least once instead of dropped permanently";
+
+	manager.shutdown();
+}
+
+// Termination-safety companion to the test above: a candidate that cannot
+// fit even *alone* (bigger than the entire budget, not just crowded out by
+// same-pass siblings) must still be dropped for good on its very first
+// standalone attempt, never requeued -- otherwise a forced drain
+// (waitIdle()/shutdown()) could spin forever requeuing something that will
+// never succeed. See buildRelocationPlan()'s own comment for why
+// plan.promotions being empty at drop time is exactly the condition that
+// distinguishes this permanent case from the requeueable one above.
+TEST(RegionManagerCoordinatorTest, SoloOversizedCandidateIsDroppedPermanentlyNotRequeued) {
+	FakeAdapter adapter;
+	FakeRoutingCache routing_cache;
+	constexpr std::size_t kSmallBytes = 256;
+	constexpr std::size_t kHugeBytes = 4 * kSmallBytes;  // bigger than the whole budget below
+	gpu::DeviceContext device(/*device_id=*/0, gpu::AllocationPolicy::Pooled, 3 * kSmallBytes,
+			gpu::kDefaultMetadataPoolBytes, /*worker_stream_count=*/1, /*unit_bytes=*/kSmallBytes);
+	gpu::DeviceRegionPool pool(device);
+	RegionManager manager(std::make_unique<FifoReplacementPolicy>());
+	manager.start(adapter, pool, routing_cache, CoordinatorConfig{kLongInterval});
+
+	std::vector<std::byte> data_huge(kHugeBytes, std::byte{0xE});
+	HostRegionView host_huge{data_huge.data(), kHugeBytes, 0};
+	adapter.addRegion(1, host_huge);
+	manager.registerRegion(1, host_huge);
+
+	manager.requestPromotion(201, RegionFootprint{{1}});
+	manager.waitIdle();  // must return promptly -- not hang retrying forever
+
+	EXPECT_FALSE(manager.regionOf(1).device.valid());  // never fits, dropped for good
+	EXPECT_TRUE(manager.regionsOf(201).empty());
+	EXPECT_EQ(manager.stats().candidates_requeued_total, 0u)
+			<< "a candidate bigger than the whole budget must never be requeued";
+
+	manager.shutdown();
+}
+
+// max_promotion_bytes_per_pass caps how much one Coordinator pass promotes
+// (see CoordinatorConfig's own doc comment) -- proven here by giving the
+// Coordinator four individually-fitting candidates (the budget below fits
+// all four with no eviction needed at all) but a cap tight enough that only
+// one can join any single pass, then checking relocation_batches_total/
+// candidates_requeued_total reflect that one waitIdle() call actually took
+// multiple passes to drain, not one. Depends on the fix above -- before it,
+// the cap already existed but bumped candidates were dropped instead of
+// requeued during this forced waitIdle() drain.
+TEST(RegionManagerCoordinatorTest, MaxPromotionBytesPerPassSplitsOneWaitIdleIntoMultiplePasses) {
+	FakeAdapter adapter;
+	FakeRoutingCache routing_cache;
+	constexpr std::size_t kSmallBytes = 256;
+	gpu::DeviceContext device(/*device_id=*/0, gpu::AllocationPolicy::Pooled, 4 * kSmallBytes,
+			gpu::kDefaultMetadataPoolBytes, /*worker_stream_count=*/1, /*unit_bytes=*/kSmallBytes);
+	gpu::DeviceRegionPool pool(device);
+	RegionManager manager(std::make_unique<FifoReplacementPolicy>());
+	CoordinatorConfig config{kLongInterval};
+	config.max_promotion_bytes_per_pass = kSmallBytes;  // exactly one region's worth per pass
+	manager.start(adapter, pool, routing_cache, config);
+
+	std::vector<std::byte> data_1(kSmallBytes, std::byte{1});
+	std::vector<std::byte> data_2(kSmallBytes, std::byte{2});
+	std::vector<std::byte> data_3(kSmallBytes, std::byte{3});
+	std::vector<std::byte> data_4(kSmallBytes, std::byte{4});
+	HostRegionView host_1{data_1.data(), kSmallBytes, 0};
+	HostRegionView host_2{data_2.data(), kSmallBytes, 0};
+	HostRegionView host_3{data_3.data(), kSmallBytes, 0};
+	HostRegionView host_4{data_4.data(), kSmallBytes, 0};
+	adapter.addRegion(1, host_1);
+	adapter.addRegion(2, host_2);
+	adapter.addRegion(3, host_3);
+	adapter.addRegion(4, host_4);
+	manager.registerRegion(1, host_1);
+	manager.registerRegion(2, host_2);
+	manager.registerRegion(3, host_3);
+	manager.registerRegion(4, host_4);
+
+	manager.requestPromotion(301, RegionFootprint{{1}});
+	manager.requestPromotion(302, RegionFootprint{{2}});
+	manager.requestPromotion(303, RegionFootprint{{3}});
+	manager.requestPromotion(304, RegionFootprint{{4}});
+	// All 4 submitted before any waitIdle() -- budget (4*256=1024) already
+	// fits all of them with zero eviction, so this is purely about how many
+	// passes the promotion-side cap forces within one waitIdle() call, not
+	// about capacity pressure.
+	manager.waitIdle();
+
+	EXPECT_TRUE(manager.regionOf(1).device.valid());
+	EXPECT_TRUE(manager.regionOf(2).device.valid());
+	EXPECT_TRUE(manager.regionOf(3).device.valid());
+	EXPECT_TRUE(manager.regionOf(4).device.valid());
+	// Exact counts (not just "more than one"): each pass admits its first
+	// candidate unconditionally, then defers everything else that would push
+	// this pass over the 256B cap -- so 4 candidates, capped at 1 per pass,
+	// take exactly 4 passes, requeuing each of the 3 non-first candidates
+	// exactly once.
+	EXPECT_EQ(manager.stats().relocation_batches_total, 4u);
+	EXPECT_EQ(manager.stats().candidates_requeued_total, 3u);
+
+	manager.shutdown();
+}
+
+// A custom policy exercising ReplacementPolicy::HasExceededPlanningAttempts()
+// (the opt-in aging/give-up helper added to the base class this session) --
+// proves it's reachable from a subclass and behaves correctly against real
+// PromotionCandidate::planning_attempts values RegionManager increments on
+// every examination (buildRelocationPlan(), region_manager.cpp), not a
+// hand-rolled counter. Always Defers until max_attempts is exceeded, then
+// Rejects -- deliberately never actually admits anything, since the point is
+// isolating the give-up threshold itself, not promotion.
+class GiveUpAfterAttemptsPolicy : public ReplacementPolicy {
+ public:
+	explicit GiveUpAfterAttemptsPolicy(std::uint64_t max_attempts) : max_attempts_(max_attempts) {}
+
+	void enqueueCandidate(PromotionCandidate candidate) override {
+		std::lock_guard<std::mutex> lock(mutex_);
+		pending_.push_back(std::move(candidate));
+	}
+	void requeueCandidate(PromotionCandidate candidate) override {
+		std::lock_guard<std::mutex> lock(mutex_);
+		pending_.push_back(std::move(candidate));
+	}
+	void onAnchorEvicted(VectorId anchor_id) override {
+		std::lock_guard<std::mutex> lock(mutex_);
+		pending_.erase(std::remove_if(pending_.begin(), pending_.end(),
+														[anchor_id](const PromotionCandidate& c) { return c.anchor_id == anchor_id; }),
+				pending_.end());
+	}
+	void onAnchorTouched(VectorId) override {}
+	bool onRelocationTrigger() override {
+		std::lock_guard<std::mutex> lock(mutex_);
+		return !pending_.empty();
+	}
+	bool hasPendingCandidates() const override {
+		std::lock_guard<std::mutex> lock(mutex_);
+		return !pending_.empty();
+	}
+	std::optional<PromotionCandidate> selectNextPromotionCandidate() override {
+		std::lock_guard<std::mutex> lock(mutex_);
+		if (pending_.empty()) return std::nullopt;
+		PromotionCandidate candidate = std::move(pending_.front());
+		pending_.pop_front();
+		return candidate;
+	}
+	std::optional<VectorId> selectNextEvictionCandidate(VectorId) override { return std::nullopt; }
+
+	BatchAdmissionDecision evaluateBatchAdmission(const PromotionCandidate& candidate, const AdmissionContext&,
+			const RelocationBatchContext&) override {
+		std::lock_guard<std::mutex> lock(mutex_);
+		attempts_seen.push_back(candidate.planning_attempts);
+		if (HasExceededPlanningAttempts(candidate, max_attempts_)) {
+			gave_up.push_back(candidate.anchor_id);
+			return BatchAdmissionDecision::Reject;
+		}
+		return BatchAdmissionDecision::Defer;
+	}
+
+	mutable std::mutex mutex_;
+	std::vector<std::uint64_t> attempts_seen;
+	std::vector<VectorId> gave_up;
+
+ private:
+	std::uint64_t max_attempts_;
+	std::deque<PromotionCandidate> pending_;
+};
+
+TEST(RegionManagerCoordinatorTest, HasExceededPlanningAttemptsGivesUpAfterConfiguredThreshold) {
+	FakeAdapter adapter;
+	FakeRoutingCache routing_cache;
+	gpu::DeviceContext device;
+	gpu::DeviceRegionPool pool(device);
+	auto policy = std::make_unique<GiveUpAfterAttemptsPolicy>(/*max_attempts=*/2);
+	GiveUpAfterAttemptsPolicy* observed = policy.get();
+	RegionManager manager(std::move(policy));
+	// Non-forced periodic ticks (not waitIdle()) -- Defer's requeue is only
+	// honored on a non-forced/non-stop pass (retain_failed_candidates), so
+	// this needs several genuinely separate Coordinator wakeups, one
+	// planning_attempts increment apiece, not one forced drain.
+	manager.start(adapter, pool, routing_cache, CoordinatorConfig{kShortInterval});
+
+	std::vector<std::byte> host_data(64, std::byte{0x7});
+	HostRegionView host{host_data.data(), 64, 0};
+	adapter.addRegion(1, host);
+	manager.registerRegion(1, host);
+
+	manager.requestPromotion(500, RegionFootprint{{1}});
+	// Margin for at least 3 separate ticks (2 Defers + 1 Reject).
+	std::this_thread::sleep_for(kShortInterval * 40);
+
+	{
+		std::lock_guard<std::mutex> lock(observed->mutex_);
+		ASSERT_GE(observed->attempts_seen.size(), 3u)
+				<< "expected at least 3 separate examinations (2 deferred, 1 rejected)";
+		EXPECT_EQ(observed->attempts_seen[0], 1u);
+		EXPECT_EQ(observed->attempts_seen[1], 2u);
+		EXPECT_EQ(observed->attempts_seen[2], 3u);  // 3 > max_attempts(2) -- this is the one that gives up
+		EXPECT_EQ(observed->gave_up, std::vector<VectorId>{500});
+	}
+	EXPECT_TRUE(manager.regionsOf(500).empty());
+	EXPECT_EQ(manager.stats().candidates_rejected_total, 1u);
+	// The policy never offers 500 again after rejecting it (see
+	// selectNextPromotionCandidate() above -- it's simply gone from
+	// pending_), so no further examinations should accumulate even with
+	// plenty of time left.
+	std::this_thread::sleep_for(kShortInterval * 10);
+	{
+		std::lock_guard<std::mutex> lock(observed->mutex_);
+		EXPECT_EQ(observed->attempts_seen.size(), 3u);
+	}
+
+	manager.shutdown();
+}
+
+// CoordinatorConfig/RegionManager::Stats::candidates_rejected_total (added
+// this session) must count every BatchAdmissionDecision::Reject regardless
+// of which policy produced it -- proven here with CostAwareReplacementPolicy
+// (the actual default policy), whose own minimum_observations admission gate
+// is a real, pre-existing source of Reject decisions, not a test-only stub.
+TEST(RegionManagerCoordinatorTest, RejectedCandidateIsCountedAndNeverPromoted) {
+	FakeAdapter adapter;
+	FakeRoutingCache routing_cache;
+	gpu::DeviceContext device;
+	gpu::DeviceRegionPool pool(device);
+	CostAwareReplacementConfig config;
+	config.minimum_observations = 5;  // a single request (observations=1) never qualifies
+	RegionManager manager(std::make_unique<CostAwareReplacementPolicy>(config));
+	manager.start(adapter, pool, routing_cache, CoordinatorConfig{kShortInterval});
+
+	std::vector<std::byte> host_data(64, std::byte{0x7});
+	HostRegionView host{host_data.data(), 64, 0};
+	adapter.addRegion(1, host);
+	manager.registerRegion(1, host);
+
+	manager.requestPromotion(600, RegionFootprint{{1}});
+	manager.waitIdle();
+
+	EXPECT_FALSE(manager.regionOf(1).device.valid());
+	EXPECT_TRUE(manager.regionsOf(600).empty());
+	EXPECT_EQ(manager.stats().candidates_rejected_total, 1u);
 
 	manager.shutdown();
 }

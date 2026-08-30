@@ -4,6 +4,7 @@
 #include <limits>
 
 #include "logging.hpp"
+#include "telemetry/trace.hpp"
 
 namespace arachne {
 
@@ -32,12 +33,12 @@ bool ContainsCandidate(const std::vector<EvictionCandidate>& candidates, VectorI
 }  // namespace
 
 void FifoReplacementPolicy::enqueueCandidate(PromotionCandidate candidate) {
-	std::lock_guard<std::mutex> lock(mutex_);
+	std::lock_guard lock(mutex_);
 	EnqueueByAge(pending_candidates_, std::move(candidate));
 }
 
 void FifoReplacementPolicy::onAnchorEvicted(VectorId anchor_id) {
-	std::lock_guard<std::mutex> lock(mutex_);
+	std::lock_guard lock(mutex_);
 
 	// May still be sitting unselected (requestPromotion() followed quickly by
 	// a delete before the Coordinator got to it) -- drop it here too, not
@@ -57,17 +58,17 @@ void FifoReplacementPolicy::onAnchorEvicted(VectorId anchor_id) {
 void FifoReplacementPolicy::onAnchorTouched(VectorId) {}
 
 bool FifoReplacementPolicy::onRelocationTrigger() {
-	std::lock_guard<std::mutex> lock(mutex_);
+	std::lock_guard lock(mutex_);
 	return !pending_candidates_.empty();
 }
 
 bool FifoReplacementPolicy::hasPendingCandidates() const {
-	std::lock_guard<std::mutex> lock(mutex_);
+	std::lock_guard lock(mutex_);
 	return !pending_candidates_.empty();
 }
 
 std::optional<PromotionCandidate> FifoReplacementPolicy::selectNextPromotionCandidate() {
-	std::lock_guard<std::mutex> lock(mutex_);
+	std::lock_guard lock(mutex_);
 	if (pending_candidates_.empty()) return std::nullopt;
 
 	PromotionCandidate candidate = std::move(pending_candidates_.front());
@@ -83,7 +84,7 @@ std::optional<PromotionCandidate> FifoReplacementPolicy::selectNextPromotionCand
 }
 
 std::optional<VectorId> FifoReplacementPolicy::selectNextEvictionCandidate(VectorId excluded) {
-	std::lock_guard<std::mutex> lock(mutex_);
+	std::lock_guard lock(mutex_);
 	for (VectorId candidate : promoted_order_) {
 		if (candidate != excluded) return candidate;
 	}
@@ -92,7 +93,7 @@ std::optional<VectorId> FifoReplacementPolicy::selectNextEvictionCandidate(Vecto
 
 std::optional<VectorId> FifoReplacementPolicy::selectEvictionCandidate(
 		VectorId excluded, std::size_t, const std::vector<EvictionCandidate>& candidates) {
-	std::lock_guard<std::mutex> lock(mutex_);
+	std::lock_guard lock(mutex_);
 	for (VectorId candidate : promoted_order_) {
 		if (candidate != excluded && ContainsCandidate(candidates, candidate)) return candidate;
 	}
@@ -100,12 +101,12 @@ std::optional<VectorId> FifoReplacementPolicy::selectEvictionCandidate(
 }
 
 void LruReplacementPolicy::enqueueCandidate(PromotionCandidate candidate) {
-	std::lock_guard<std::mutex> lock(mutex_);
+	std::lock_guard lock(mutex_);
 	EnqueueByAge(pending_candidates_, std::move(candidate));
 }
 
 void LruReplacementPolicy::onAnchorEvicted(VectorId anchor_id) {
-	std::lock_guard<std::mutex> lock(mutex_);
+	std::lock_guard lock(mutex_);
 
 	// Same reasoning as FifoReplacementPolicy::onAnchorEvicted(): a candidate
 	// may still be sitting unselected.
@@ -122,7 +123,7 @@ void LruReplacementPolicy::onAnchorEvicted(VectorId anchor_id) {
 }
 
 void LruReplacementPolicy::onAnchorTouched(VectorId anchor_id) {
-	std::lock_guard<std::mutex> lock(mutex_);
+	std::lock_guard lock(mutex_);
 	auto it = lru_position_.find(anchor_id);
 	if (it == lru_position_.end()) return;  // not currently resident -- nothing to reorder
 
@@ -132,17 +133,17 @@ void LruReplacementPolicy::onAnchorTouched(VectorId anchor_id) {
 }
 
 bool LruReplacementPolicy::onRelocationTrigger() {
-	std::lock_guard<std::mutex> lock(mutex_);
+	std::lock_guard lock(mutex_);
 	return !pending_candidates_.empty();
 }
 
 bool LruReplacementPolicy::hasPendingCandidates() const {
-	std::lock_guard<std::mutex> lock(mutex_);
+	std::lock_guard lock(mutex_);
 	return !pending_candidates_.empty();
 }
 
 std::optional<PromotionCandidate> LruReplacementPolicy::selectNextPromotionCandidate() {
-	std::lock_guard<std::mutex> lock(mutex_);
+	std::lock_guard lock(mutex_);
 	if (pending_candidates_.empty()) return std::nullopt;
 
 	PromotionCandidate candidate = std::move(pending_candidates_.front());
@@ -161,7 +162,7 @@ std::optional<PromotionCandidate> LruReplacementPolicy::selectNextPromotionCandi
 }
 
 std::optional<VectorId> LruReplacementPolicy::selectNextEvictionCandidate(VectorId excluded) {
-	std::lock_guard<std::mutex> lock(mutex_);
+	std::lock_guard lock(mutex_);
 	for (VectorId candidate : lru_order_) {
 		if (candidate != excluded) return candidate;
 	}
@@ -170,7 +171,7 @@ std::optional<VectorId> LruReplacementPolicy::selectNextEvictionCandidate(Vector
 
 std::optional<VectorId> LruReplacementPolicy::selectEvictionCandidate(
 		VectorId excluded, std::size_t, const std::vector<EvictionCandidate>& candidates) {
-	std::lock_guard<std::mutex> lock(mutex_);
+	std::lock_guard lock(mutex_);
 	for (VectorId candidate : lru_order_) {
 		if (candidate != excluded && ContainsCandidate(candidates, candidate)) return candidate;
 	}
@@ -182,12 +183,12 @@ std::optional<VectorId> LruReplacementPolicy::selectEvictionCandidate(
 // ---------------------------------------------------------------------------
 
 void LfuReplacementPolicy::enqueueCandidate(PromotionCandidate candidate) {
-	std::lock_guard<std::mutex> lock(mutex_);
+	std::lock_guard lock(mutex_);
 	EnqueueByAge(pending_candidates_, std::move(candidate));
 }
 
 void LfuReplacementPolicy::onAnchorEvicted(VectorId anchor_id) {
-	std::lock_guard<std::mutex> lock(mutex_);
+	std::lock_guard lock(mutex_);
 	pending_candidates_.erase(std::remove_if(pending_candidates_.begin(), pending_candidates_.end(),
 																						[anchor_id](const PromotionCandidate& candidate) {
 																							return candidate.anchor_id == anchor_id;
@@ -203,7 +204,7 @@ void LfuReplacementPolicy::onAnchorEvicted(VectorId anchor_id) {
 }
 
 void LfuReplacementPolicy::onAnchorTouched(VectorId anchor_id) {
-	std::lock_guard<std::mutex> lock(mutex_);
+	std::lock_guard lock(mutex_);
 	auto it = tracked_.find(anchor_id);
 	if (it == tracked_.end()) return;  // not currently resident -- nothing to bump
 
@@ -219,17 +220,17 @@ void LfuReplacementPolicy::onAnchorTouched(VectorId anchor_id) {
 }
 
 bool LfuReplacementPolicy::onRelocationTrigger() {
-	std::lock_guard<std::mutex> lock(mutex_);
+	std::lock_guard lock(mutex_);
 	return !pending_candidates_.empty();
 }
 
 bool LfuReplacementPolicy::hasPendingCandidates() const {
-	std::lock_guard<std::mutex> lock(mutex_);
+	std::lock_guard lock(mutex_);
 	return !pending_candidates_.empty();
 }
 
 std::optional<PromotionCandidate> LfuReplacementPolicy::selectNextPromotionCandidate() {
-	std::lock_guard<std::mutex> lock(mutex_);
+	std::lock_guard lock(mutex_);
 	if (pending_candidates_.empty()) return std::nullopt;
 
 	PromotionCandidate candidate = std::move(pending_candidates_.front());
@@ -249,7 +250,7 @@ std::optional<PromotionCandidate> LfuReplacementPolicy::selectNextPromotionCandi
 }
 
 std::optional<VectorId> LfuReplacementPolicy::selectNextEvictionCandidate(VectorId excluded) {
-	std::lock_guard<std::mutex> lock(mutex_);
+	std::lock_guard lock(mutex_);
 	for (const auto& [freq, bucket] : freq_buckets_) {  // ascending frequency order
 		for (VectorId candidate : bucket) {
 			if (candidate != excluded) return candidate;
@@ -260,7 +261,7 @@ std::optional<VectorId> LfuReplacementPolicy::selectNextEvictionCandidate(Vector
 
 std::optional<VectorId> LfuReplacementPolicy::selectEvictionCandidate(
 		VectorId excluded, std::size_t, const std::vector<EvictionCandidate>& candidates) {
-	std::lock_guard<std::mutex> lock(mutex_);
+	std::lock_guard lock(mutex_);
 	for (const auto& [freq, bucket] : freq_buckets_) {
 		for (VectorId candidate : bucket) {
 			if (candidate != excluded && ContainsCandidate(candidates, candidate)) return candidate;
@@ -274,12 +275,12 @@ std::optional<VectorId> LfuReplacementPolicy::selectEvictionCandidate(
 // ---------------------------------------------------------------------------
 
 void ClockReplacementPolicy::enqueueCandidate(PromotionCandidate candidate) {
-	std::lock_guard<std::mutex> lock(mutex_);
+	std::lock_guard lock(mutex_);
 	EnqueueByAge(pending_candidates_, std::move(candidate));
 }
 
 void ClockReplacementPolicy::onAnchorEvicted(VectorId anchor_id) {
-	std::lock_guard<std::mutex> lock(mutex_);
+	std::lock_guard lock(mutex_);
 	pending_candidates_.erase(std::remove_if(pending_candidates_.begin(), pending_candidates_.end(),
 																						[anchor_id](const PromotionCandidate& candidate) {
 																							return candidate.anchor_id == anchor_id;
@@ -304,24 +305,24 @@ void ClockReplacementPolicy::onAnchorEvicted(VectorId anchor_id) {
 }
 
 void ClockReplacementPolicy::onAnchorTouched(VectorId anchor_id) {
-	std::lock_guard<std::mutex> lock(mutex_);
+	std::lock_guard lock(mutex_);
 	auto it = position_.find(anchor_id);
 	if (it == position_.end()) return;  // not currently resident -- nothing to mark
 	ring_[it->second].referenced = true;
 }
 
 bool ClockReplacementPolicy::onRelocationTrigger() {
-	std::lock_guard<std::mutex> lock(mutex_);
+	std::lock_guard lock(mutex_);
 	return !pending_candidates_.empty();
 }
 
 bool ClockReplacementPolicy::hasPendingCandidates() const {
-	std::lock_guard<std::mutex> lock(mutex_);
+	std::lock_guard lock(mutex_);
 	return !pending_candidates_.empty();
 }
 
 std::optional<PromotionCandidate> ClockReplacementPolicy::selectNextPromotionCandidate() {
-	std::lock_guard<std::mutex> lock(mutex_);
+	std::lock_guard lock(mutex_);
 	if (pending_candidates_.empty()) return std::nullopt;
 
 	PromotionCandidate candidate = std::move(pending_candidates_.front());
@@ -339,7 +340,7 @@ std::optional<PromotionCandidate> ClockReplacementPolicy::selectNextPromotionCan
 }
 
 std::optional<VectorId> ClockReplacementPolicy::selectNextEvictionCandidate(VectorId excluded) {
-	std::lock_guard<std::mutex> lock(mutex_);
+	std::lock_guard lock(mutex_);
 	if (ring_.empty()) return std::nullopt;
 
 	// Bounded by two full sweeps: every entry can only be spared once (its
@@ -366,7 +367,7 @@ std::optional<VectorId> ClockReplacementPolicy::selectNextEvictionCandidate(Vect
 
 std::optional<VectorId> ClockReplacementPolicy::selectEvictionCandidate(
 		VectorId excluded, std::size_t, const std::vector<EvictionCandidate>& candidates) {
-	std::lock_guard<std::mutex> lock(mutex_);
+	std::lock_guard lock(mutex_);
 	if (ring_.empty()) return std::nullopt;
 
 	const std::size_t max_steps = ring_.size() * 2;
@@ -390,12 +391,12 @@ std::optional<VectorId> ClockReplacementPolicy::selectEvictionCandidate(
 TwoQReplacementPolicy::TwoQReplacementPolicy(std::size_t ghost_capacity) : ghost_capacity_(ghost_capacity) {}
 
 void TwoQReplacementPolicy::enqueueCandidate(PromotionCandidate candidate) {
-	std::lock_guard<std::mutex> lock(mutex_);
+	std::lock_guard lock(mutex_);
 	EnqueueByAge(pending_candidates_, std::move(candidate));
 }
 
 void TwoQReplacementPolicy::onAnchorEvicted(VectorId anchor_id) {
-	std::lock_guard<std::mutex> lock(mutex_);
+	std::lock_guard lock(mutex_);
 	pending_candidates_.erase(std::remove_if(pending_candidates_.begin(), pending_candidates_.end(),
 																						[anchor_id](const PromotionCandidate& candidate) {
 																							return candidate.anchor_id == anchor_id;
@@ -431,7 +432,7 @@ void TwoQReplacementPolicy::onAnchorEvicted(VectorId anchor_id) {
 }
 
 void TwoQReplacementPolicy::onAnchorTouched(VectorId anchor_id) {
-	std::lock_guard<std::mutex> lock(mutex_);
+	std::lock_guard lock(mutex_);
 
 	if (auto it = a1in_position_.find(anchor_id); it != a1in_position_.end()) {
 		// Touched a second time while still a first-timer -- proven itself,
@@ -452,17 +453,17 @@ void TwoQReplacementPolicy::onAnchorTouched(VectorId anchor_id) {
 }
 
 bool TwoQReplacementPolicy::onRelocationTrigger() {
-	std::lock_guard<std::mutex> lock(mutex_);
+	std::lock_guard lock(mutex_);
 	return !pending_candidates_.empty();
 }
 
 bool TwoQReplacementPolicy::hasPendingCandidates() const {
-	std::lock_guard<std::mutex> lock(mutex_);
+	std::lock_guard lock(mutex_);
 	return !pending_candidates_.empty();
 }
 
 std::optional<PromotionCandidate> TwoQReplacementPolicy::selectNextPromotionCandidate() {
-	std::lock_guard<std::mutex> lock(mutex_);
+	std::lock_guard lock(mutex_);
 	if (pending_candidates_.empty()) return std::nullopt;
 
 	PromotionCandidate candidate = std::move(pending_candidates_.front());
@@ -489,7 +490,7 @@ std::optional<PromotionCandidate> TwoQReplacementPolicy::selectNextPromotionCand
 }
 
 std::optional<VectorId> TwoQReplacementPolicy::selectNextEvictionCandidate(VectorId excluded) {
-	std::lock_guard<std::mutex> lock(mutex_);
+	std::lock_guard lock(mutex_);
 	// a1in_ first (cheapest, safest sacrifice), am_ only once a1in_ is
 	// exhausted -- see the class doc comment for why this ordering alone is
 	// what protects am_ from scan pollution.
@@ -504,7 +505,7 @@ std::optional<VectorId> TwoQReplacementPolicy::selectNextEvictionCandidate(Vecto
 
 std::optional<VectorId> TwoQReplacementPolicy::selectEvictionCandidate(
 		VectorId excluded, std::size_t, const std::vector<EvictionCandidate>& candidates) {
-	std::lock_guard<std::mutex> lock(mutex_);
+	std::lock_guard lock(mutex_);
 	for (VectorId candidate : a1in_) {
 		if (candidate != excluded && ContainsCandidate(candidates, candidate)) return candidate;
 	}
@@ -521,7 +522,7 @@ CostAwareReplacementPolicy::CostAwareReplacementPolicy(CostAwareReplacementConfi
 }
 
 void CostAwareReplacementPolicy::enqueueCandidate(PromotionCandidate candidate) {
-	std::lock_guard<std::mutex> lock(mutex_);
+	std::lock_guard lock(mutex_);
 	candidate.observations = std::max<std::uint64_t>(1, candidate.observations);
 	for (PromotionCandidate& pending : pending_candidates_) {
 		if (pending.anchor_id != candidate.anchor_id || pending.epoch != candidate.epoch) continue;
@@ -555,7 +556,7 @@ void CostAwareReplacementPolicy::enqueueCandidate(PromotionCandidate candidate) 
 }
 
 void CostAwareReplacementPolicy::onAnchorEvicted(VectorId anchor_id) {
-	std::lock_guard<std::mutex> lock(mutex_);
+	std::lock_guard lock(mutex_);
 	pending_candidates_.erase(std::remove_if(pending_candidates_.begin(), pending_candidates_.end(),
 																				[anchor_id](const PromotionCandidate& candidate) {
 																					return candidate.anchor_id == anchor_id;
@@ -572,26 +573,48 @@ double CostAwareReplacementPolicy::decayedHeat(const ResidentEntry& entry, Clock
 }
 
 void CostAwareReplacementPolicy::onAnchorTouched(VectorId anchor_id) {
-	std::lock_guard<std::mutex> lock(mutex_);
-	auto it = resident_.find(anchor_id);
-	if (it == resident_.end()) return;
+	// Diagnostic-only (ARACHNE_ENABLE_TRACING build) -- see the latency-
+	// tracing report entry this was added for. Deliberately measures only
+	// this (touch_queue_mutex_-guarded, always-cheap) push, not a
+	// resident_/mutex_ update anymore -- see the header's own doc comment
+	// on this override for why, and drainTouchQueueLocked() below for where
+	// the actual heat update now happens.
+	ARACHNE_TRACE_SCOPE("CostAwareReplacementPolicy", "onAnchorTouched");
+	std::lock_guard lock(touch_queue_mutex_);
+	touch_queue_.push_back(anchor_id);
+}
+
+void CostAwareReplacementPolicy::drainTouchQueueLocked() {
+	// Diagnostic-only (ARACHNE_ENABLE_TRACING build) -- see the latency-
+	// tracing report entry this was added for.
+	ARACHNE_TRACE_SCOPE("CostAwareReplacementPolicy", "drainTouchQueueLocked");
+	std::vector<VectorId> touched;
+	{
+		std::lock_guard lock(touch_queue_mutex_);
+		touched.swap(touch_queue_);
+	}
+	if (touched.empty()) return;
 	Clock::time_point now = Clock::now();
-	it->second.heat = decayedHeat(it->second, now) + 1.0;
-	it->second.last_update = now;
+	for (VectorId anchor_id : touched) {
+		auto it = resident_.find(anchor_id);
+		if (it == resident_.end()) continue;
+		it->second.heat = decayedHeat(it->second, now) + 1.0;
+		it->second.last_update = now;
+	}
 }
 
 bool CostAwareReplacementPolicy::onRelocationTrigger() {
-	std::lock_guard<std::mutex> lock(mutex_);
+	std::lock_guard lock(mutex_);
 	return !pending_candidates_.empty();
 }
 
 bool CostAwareReplacementPolicy::hasPendingCandidates() const {
-	std::lock_guard<std::mutex> lock(mutex_);
+	std::lock_guard lock(mutex_);
 	return !pending_candidates_.empty();
 }
 
 std::optional<PromotionCandidate> CostAwareReplacementPolicy::selectNextPromotionCandidate() {
-	std::lock_guard<std::mutex> lock(mutex_);
+	std::lock_guard lock(mutex_);
 	if (pending_candidates_.empty()) return std::nullopt;
 	PromotionCandidate candidate = std::move(pending_candidates_.front());
 	pending_candidates_.pop_front();
@@ -612,6 +635,21 @@ double CostAwareReplacementPolicy::victimRetentionDensity(const ResidentEntry& e
 																 static_cast<double>(candidate.reclaimable_bytes);
 	double cost = heat + config_.potential_writeback_weight * writeback_ratio;
 	return cost / static_cast<double>(roundedUnits(candidate.reclaimable_bytes, 1));
+}
+
+std::optional<double> CostAwareReplacementPolicy::groupRetentionDensity(
+		const EvictionCandidate& candidate, Clock::time_point now) const {
+	bool any_member_found = false;
+	double worst_density = -std::numeric_limits<double>::infinity();
+	for (VectorId member : candidate.group_members) {
+		auto it = resident_.find(member);
+		if (it == resident_.end()) continue;
+		if (now - it->second.admitted_at < config_.minimum_residency) return std::nullopt;
+		any_member_found = true;
+		worst_density = std::max(worst_density, victimRetentionDensity(it->second, candidate, now));
+	}
+	if (!any_member_found) return std::nullopt;
+	return worst_density;
 }
 
 AdmissionDecision CostAwareReplacementPolicy::evaluateAdmission(
@@ -637,14 +675,24 @@ AdmissionDecision CostAwareReplacementPolicy::evaluateAdmission(
 													 : 0;
 	if (available >= context.incremental_bytes) return AdmissionDecision::Admit;
 
-	std::lock_guard<std::mutex> lock(mutex_);
+	// Diagnostic-only (ARACHNE_ENABLE_TRACING build) -- see the latency-
+	// tracing report entry this was added for. Scoped to exactly the locked
+	// section below (not the whole function, most calls never reach here --
+	// see the early-return fast paths above), to measure how long a single
+	// evaluateAdmission() call holds mutex_ while scanning
+	// context.eviction_candidates -- the scan this investigation suspects
+	// starves RegionManager::recordTraversal() -> onAnchorTouched() calls
+	// arriving on a different thread during a large batch's admission pass.
+	ARACHNE_TRACE_SCOPE("CostAwareReplacementPolicy", "evaluateAdmission_locked");
+	std::lock_guard lock(mutex_);
+	drainTouchQueueLocked();  // apply any heat updates queued since the last drain before reading resident_ below
 	Clock::time_point now = Clock::now();
 	double best_victim_density = std::numeric_limits<double>::infinity();
 	for (const EvictionCandidate& victim : context.eviction_candidates) {
 		if (victim.anchor_id == candidate.anchor_id || victim.reclaimable_bytes == 0) continue;
-		auto it = resident_.find(victim.anchor_id);
-		if (it == resident_.end() || now - it->second.admitted_at < config_.minimum_residency) continue;
-		best_victim_density = std::min(best_victim_density, victimRetentionDensity(it->second, victim, now));
+		std::optional<double> density = groupRetentionDensity(victim, now);
+		if (!density.has_value()) continue;
+		best_victim_density = std::min(best_victim_density, *density);
 	}
 	if (!std::isfinite(best_victim_density)) {
 		ARACHNE_LOG_INFO(
@@ -671,7 +719,7 @@ AdmissionDecision CostAwareReplacementPolicy::evaluateAdmission(
 }
 
 void CostAwareReplacementPolicy::onPromotionCommitted(VectorId anchor_id, const AdmissionContext& context) {
-	std::lock_guard<std::mutex> lock(mutex_);
+	std::lock_guard lock(mutex_);
 	Clock::time_point now = Clock::now();
 	auto [it, inserted] = resident_.try_emplace(anchor_id, ResidentEntry{1.0, now, now, context.total_footprint_bytes});
 	if (!inserted) {
@@ -683,19 +731,25 @@ void CostAwareReplacementPolicy::onPromotionCommitted(VectorId anchor_id, const 
 
 std::optional<VectorId> CostAwareReplacementPolicy::selectEvictionCandidate(
 		VectorId excluded, std::size_t required_bytes, const std::vector<EvictionCandidate>& candidates) {
-	std::lock_guard<std::mutex> lock(mutex_);
+	// Diagnostic-only (ARACHNE_ENABLE_TRACING build) -- see the latency-
+	// tracing report entry this was added for; same reasoning as
+	// evaluateAdmission_locked above, for the victim-selection side of
+	// buildRelocationPlan()'s two loops.
+	ARACHNE_TRACE_SCOPE("CostAwareReplacementPolicy", "selectEvictionCandidate_locked");
+	std::lock_guard lock(mutex_);
+	drainTouchQueueLocked();  // apply any heat updates queued since the last drain before reading resident_ below
 	Clock::time_point now = Clock::now();
 	double best_score = std::numeric_limits<double>::infinity();
 	std::optional<VectorId> best;
 	for (const EvictionCandidate& candidate : candidates) {
 		if (candidate.anchor_id == excluded || candidate.reclaimable_bytes == 0) continue;
-		auto it = resident_.find(candidate.anchor_id);
-		if (it == resident_.end() || now - it->second.admitted_at < config_.minimum_residency) continue;
+		std::optional<double> density = groupRetentionDensity(candidate, now);
+		if (!density.has_value()) continue;
 		double coverage_penalty = candidate.reclaimable_bytes >= required_bytes
 														 ? 1.0
 														 : static_cast<double>(required_bytes) /
 																 static_cast<double>(candidate.reclaimable_bytes);
-		double score = victimRetentionDensity(it->second, candidate, now) * coverage_penalty;
+		double score = *density * coverage_penalty;
 		if (score < best_score) {
 			best_score = score;
 			best = candidate.anchor_id;
@@ -705,7 +759,8 @@ std::optional<VectorId> CostAwareReplacementPolicy::selectEvictionCandidate(
 }
 
 std::optional<VectorId> CostAwareReplacementPolicy::selectNextEvictionCandidate(VectorId excluded) {
-	std::lock_guard<std::mutex> lock(mutex_);
+	std::lock_guard lock(mutex_);
+	drainTouchQueueLocked();  // apply any heat updates queued since the last drain before reading resident_ below
 	Clock::time_point now = Clock::now();
 	double coldest = std::numeric_limits<double>::infinity();
 	std::optional<VectorId> best;

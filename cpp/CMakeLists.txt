@@ -1,5 +1,25 @@
 cmake_minimum_required(VERSION 3.26)
 
+# nvcc auto-detects its own host compiler (via its own internal PATH search)
+# when CMAKE_CUDA_HOST_COMPILER isn't set explicitly -- discovered the hard
+# way that in this conda environment, that auto-detected invocation fails to
+# compile *any* .cu file, even an empty one, against glibc's own <stdlib.h>
+# ("'_Float32' does not name a type" and similar, from that sysroot's newer
+# extended-float-type declarations). The exact same host compiler binary,
+# passed to nvcc explicitly via -ccbin instead of auto-detected, compiles
+# fine -- purely an nvcc auto-detection quirk in this environment, not a real
+# incompatibility with the compiler itself. Must be set before project()
+# below: CMake resolves CUDA host-compiler detection as part of enabling the
+# CUDA language there. Override with -DCMAKE_CUDA_HOST_COMPILER=... if this
+# guess is wrong for a given machine.
+if(NOT DEFINED CMAKE_CUDA_HOST_COMPILER)
+	find_program(ARACHNE_CUDA_HOST_COMPILER NAMES x86_64-conda-linux-gnu-g++ g++
+			HINTS ENV CONDA_PREFIX PATH_SUFFIXES bin)
+	if(ARACHNE_CUDA_HOST_COMPILER)
+		set(CMAKE_CUDA_HOST_COMPILER "${ARACHNE_CUDA_HOST_COMPILER}")
+	endif()
+endif()
+
 project(arachne LANGUAGES CXX CUDA)
 
 set(CMAKE_CXX_STANDARD 20)
@@ -8,10 +28,15 @@ set(CMAKE_CUDA_STANDARD 20)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
 # Blackwell: SM100 (B100/B200/GB200 data-center) + SM120 (RTX 50-series /
-# GeForce Blackwell). Override with -DCMAKE_CUDA_ARCHITECTURES=... for other
-# targets (e.g. Hopper=90).
+# GeForce Blackwell) -- the production target. 75 (Turing/RTX 20-series)
+# added alongside it so actual compiled kernels (index/hnsw/hnsw_dist_kernel.cu)
+# also run on this project's own local dev/test GPU -- discovered the hard
+# way: without it, a real kernel launch on an SM75 card doesn't error, it
+# just never executes, silently leaving its output buffer whatever cudaMalloc
+# happened to hand back. Override with -DCMAKE_CUDA_ARCHITECTURES=... for
+# other targets (e.g. Hopper=90).
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-	set(CMAKE_CUDA_ARCHITECTURES 100 120)
+	set(CMAKE_CUDA_ARCHITECTURES 75 100 120)
 endif()
 
 option(ARACHNE_BUILD_TESTS "Build unit tests (requires GTest, see conda/arachne-blackwell.yml)" ON)
@@ -61,6 +86,8 @@ set(ARACHNE_CORE_SOURCES
 	# gpu/device_context.hpp and gpu/device_region_pool.hpp.
 	src/gpu/device_context.cpp
 	src/gpu/device_region_pool.cpp
+	src/gpu/device_memory_manager.cpp
+	src/gpu/pinned_host_pool.cpp
 	src/gpu/unit_pool_arena.cpp
 	src/gpu/compaction_policy.cpp
 )
@@ -107,6 +134,14 @@ target_link_libraries(arachne_core PUBLIC Threads::Threads)
 
 find_package(raft CONFIG REQUIRED)
 target_link_libraries(arachne_core PUBLIC raft::raft)
+
+# HnswlibIndex: the real IAdapter over thirdparty/hnswlib (see
+# index/hnsw/hnswlib_index.hpp) -- currently a [SKELETON], see its own doc
+# comments. Depends on arachne::core/hnswlib, both defined above.
+option(ARACHNE_BUILD_HNSW_INDEX "Build the HNSW IAdapter (cpp/index/hnsw)" ON)
+if(ARACHNE_BUILD_HNSW_INDEX)
+	add_subdirectory(index/hnsw)
+endif()
 
 if(ARACHNE_BUILD_TESTS)
 	enable_testing()

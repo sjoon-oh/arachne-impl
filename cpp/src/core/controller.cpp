@@ -17,10 +17,23 @@ namespace {
 // TraverseResult::hint is free to reflect however it needs to.
 constexpr std::uint32_t kInsertionLookupTopK = 1;
 
+// Reserved top bit of every id MintAnchorId() hands out -- see
+// next_anchor_id_'s own doc comment (controller.hpp) for why this needs to
+// be structurally impossible to collide with, not just unlikely to: an
+// adapter's own VectorId space (base + inserted elements) would need to
+// exceed 2^63 entries to ever reach this bit on its own, which is not a
+// realistic concern for any deployment of this system.
+constexpr VectorId kAnchorIdBit = VectorId{1} << 63;
+
 // Bound once per OpScheduler execution worker thread (see class doc comment,
 // controller.hpp); null on every other thread. acquireRegion() reads this to
 // pick a worker's dedicated stream vs. the management stream.
 thread_local cudaStream_t g_worker_stream = nullptr;
+
+// Bound alongside g_worker_stream above, same lifetime/thread-affinity;
+// null on every other thread, or if the adapter requested no scratch (see
+// IAdapter::requiredScratchBytesPerWorker()). workerScratch() reads this.
+thread_local void* g_worker_scratch = nullptr;
 }  // namespace
 
 Controller::Controller(IAdapter& adapter, RoutingCache& routing_cache, SchedulingConfig scheduling_config,
@@ -35,8 +48,16 @@ Controller::Controller(IAdapter& adapter, RoutingCache& routing_cache, Schedulin
 						scheduling_config.max_execution_threads, gpu_unit_bytes),
 		device_region_pool_(device_, std::move(compaction_policy)),
 		region_manager_(std::move(replacement_policy)) {
+	// Before any worker thread starts (reserveWorkerScratch() itself throws
+	// if called any later) -- see IAdapter::requiredScratchBytesPerWorker()'s
+	// doc comment. 0 is a cheap no-op: most adapters need nothing here.
+	device_.reserveWorkerScratch(adapter_.requiredScratchBytesPerWorker());
 	scheduler_.start(
-			adapter_, [this](std::size_t worker_index) { g_worker_stream = device_.workerStream(worker_index); },
+			adapter_,
+			[this](std::size_t worker_index) {
+				g_worker_stream = device_.workerStream(worker_index);
+				g_worker_scratch = device_.workerScratch(worker_index);
+			},
 			[this](TraverseRequest& request) {
 				if (request.mode != ExecutionMode::GpuOnly) return;
 				request.residency_pin = region_manager_.tryPinResidency(request.residency_hints);
@@ -54,21 +75,110 @@ Controller::Controller(IAdapter& adapter, RoutingCache& routing_cache, Schedulin
 					request.lease = LeaseHandle{};
 				}
 			});
+	// Resolve CoordinatorConfig's fraction-of-budget convenience fields (see
+	// their own doc comment) against device_'s *actual* budget -- only
+	// reachable here, after device_ has already finished construction above,
+	// since that's the only place the real, possibly unit-rounded
+	// (AllocationPolicy::Pooled) capacity is known. Left untouched (whatever
+	// the caller set max_promotion_bytes_per_pass/max_eviction_bytes_per_pass
+	// to directly) when the corresponding fraction is std::nullopt.
+	const std::size_t data_budget_bytes = device_.budgetBytes(gpu::MemoryKind::Data);
+	if (coordinator_config.max_promotion_fraction_of_budget) {
+		coordinator_config.max_promotion_bytes_per_pass = static_cast<std::size_t>(
+				static_cast<double>(data_budget_bytes) * *coordinator_config.max_promotion_fraction_of_budget);
+	}
+	if (coordinator_config.max_eviction_fraction_of_budget) {
+		coordinator_config.max_eviction_bytes_per_pass = static_cast<std::size_t>(
+				static_cast<double>(data_budget_bytes) * *coordinator_config.max_eviction_fraction_of_budget);
+	}
 	region_manager_.start(adapter_, device_region_pool_, routing_cache_, coordinator_config);
 	ARACHNE_LOG_INFO(
 			"Controller: started (gpu_data_budget={} gpu_metadata_budget={} gpu_unit_bytes={} "
-			"max_execution_threads={})",
-			gpu_data_budget_bytes, gpu_metadata_budget_bytes, gpu_unit_bytes, scheduling_config.max_execution_threads);
+			"max_execution_threads={} max_promotion_bytes_per_pass={} max_eviction_bytes_per_pass={})",
+			gpu_data_budget_bytes, gpu_metadata_budget_bytes, gpu_unit_bytes, scheduling_config.max_execution_threads,
+			coordinator_config.max_promotion_bytes_per_pass, coordinator_config.max_eviction_bytes_per_pass);
 }
 
-SearchResult Controller::search(const Query& query) {
+SearchResult Controller::search(const Query& query, bool record_for_replacement_policy) {
 	ARACHNE_TRACE_SCOPE("Controller", "search");
+	return submitSearch(query, record_for_replacement_policy).get();
+}
+
+InsertResult Controller::insert(const Record& record) {
+	ARACHNE_TRACE_SCOPE("Controller", "insert");
+	try {
+		return submitInsert(record).get();
+	} catch (...) {
+		// submitInsert()'s own chained callbacks already released record.id
+		// back out of live_ids_ before this exception could reach here (see
+		// its doc comment) -- this catch exists purely to preserve the log
+		// message dispatch()-throwing used to produce synchronously.
+		ARACHNE_LOG_WARN("insert: id {} threw during dispatch, releasing claimed id", record.id);
+		throw;
+	}
+}
+
+DeleteResult Controller::remove(VectorId id) {
+	ARACHNE_TRACE_SCOPE("Controller", "remove");
+	return submitRemove(id).get();
+}
+
+VectorId Controller::MintAnchorId() {
+	// CAS retry rather than a bare fetch_add(): the only way this counter's
+	// raw value could ever repeat a previously-minted one is wraparound --
+	// completing a full lap of every representable std::uint64_t value
+	// (2^64 of them), not merely growing past 2^63 (OR-ing the top bit onto
+	// a payload that already has it set, once the counter itself climbs
+	// that high, is harmless -- see next_anchor_id_'s own doc comment). This
+	// loop handles two distinct things that can happen on the way to a
+	// wraparound, in order:
+	//
+	//  1. The wrap step itself lands on payload 0, which collides with 0's
+	//     reserved "no Anchor" meaning (see TraverseRequest::anchor_id /
+	//     RoutingDecision::anchor_id, both std::optional<VectorId>, and
+	//     every `anchor_id != 0`/`!lookup.anchor_id` check throughout this
+	//     file) -- rewritten to 1 unconditionally, a cheap, always-correct
+	//     guard independent of how unrealistic reaching it actually is.
+	//  2. Every payload from here on (this is the *second* lap now) is a
+	//     candidate for colliding with some Anchor id minted during the
+	//     first lap that's still meaningful to something -- still resident
+	//     (RegionManager::isKnownAnchor()'s dependencies_ check) or released
+	//     but permanently remembered anyway (its anchor_epoch_ check, see
+	//     that member's own doc comment on why it's never erased). Checked
+	//     -- and, on an actual collision, retried with the next payload
+	//     instead of reissuing it -- only once next_anchor_id_wrapped_ is
+	//     ever observed true, so every mint before the first (if ever) full
+	//     lap stays entirely lock-free on this path; RegionManager's own
+	//     mutex only gets pulled into a request this rare.
+	VectorId current = next_anchor_id_.load(std::memory_order_relaxed);
+	VectorId payload;
+	for (;;) {
+		bool wrapped_this_step;
+		do {
+			payload = current + 1;
+			wrapped_this_step = (payload == 0);
+			if (wrapped_this_step) payload = 1;
+		} while (!next_anchor_id_.compare_exchange_weak(current, payload, std::memory_order_relaxed));
+		if (wrapped_this_step) next_anchor_id_wrapped_.store(true, std::memory_order_relaxed);
+
+		if (!next_anchor_id_wrapped_.load(std::memory_order_relaxed)) return kAnchorIdBit | payload;
+		if (!region_manager_.isKnownAnchor(kAnchorIdBit | payload)) return kAnchorIdBit | payload;
+		// Collision on a second (or later) lap -- try the very next payload
+		// rather than this one. `current` already equals `payload` here
+		// (this iteration's successful CAS just set next_anchor_id_ to it),
+		// so the next do-while naturally continues counting forward from it.
+		current = payload;
+	}
+}
+
+std::future<SearchResult> Controller::submitSearch(const Query& query, bool record_for_replacement_policy) {
+	ARACHNE_TRACE_SCOPE("Controller", "submitSearch");
 	SearchPlan plan = routeSearch(query);
 	// Only mint/register an Anchor when this query needs a Hybrid
 	// (host-driven) traversal -- a GpuOnly hit means existing residency
 	// already answers it, so there's nothing for the replacement policy to
 	// usefully consider promoting.
-	VectorId anchor_id = (plan.primary.mode == ExecutionMode::Hybrid) ? next_anchor_id_.fetch_add(1) : 0;
+	VectorId anchor_id = (plan.primary.mode == ExecutionMode::Hybrid) ? MintAnchorId() : 0;
 	// If routeSearch() didn't already find an existing Anchor for this query
 	// (plan.primary.anchor_id still empty), this freshly minted id is what
 	// requestPromotion() below registers this locality under -- give the
@@ -79,27 +189,70 @@ SearchResult Controller::search(const Query& query) {
 	// Left untouched when routeSearch() already found a real Anchor (a
 	// different id would just discard it).
 	if (anchor_id != 0 && !plan.primary.anchor_id) plan.primary.anchor_id = anchor_id;
-	TraverseResult result = dispatch(plan.primary, anchor_id);
-	bool final_was_hybrid = (result.execution_mode == ExecutionMode::Hybrid);
 
-	if (plan.fallback_to_hybrid && !result.completed_within_scope) {
-		TraverseRequest fallback_request{query, ExecutionMode::Hybrid, {}};
-		anchor_id = next_anchor_id_.fetch_add(1);
-		// This fresh id is what requestPromotion() below will register `query`
-		// under if this Hybrid retry leads to a promotion -- give an adapter's
-		// own entry-point cache (see TraverseRequest::anchor_id) the same id up
-		// front so a completed traversal here can populate itself against the
-		// identity this locality will actually be known by going forward.
-		fallback_request.anchor_id = anchor_id;
-		result = dispatch(fallback_request, anchor_id);
-		final_was_hybrid = true;
-	}
+	// A shared_ptr, not a local std::promise, because it must outlive this
+	// function (which returns immediately) and be safely resolved from
+	// whichever worker thread's on_complete ends up settling it -- possibly
+	// the fallback retry's callback below, running later on a different
+	// batch than the primary dispatch.
+	auto result_promise = std::make_shared<std::promise<SearchResult>>();
+	std::future<SearchResult> result_future = result_promise->get_future();
 
-	return commitSearch(result, final_was_hybrid);
+	bool fallback_to_hybrid = plan.fallback_to_hybrid;
+	// `query` itself isn't captured (see submitSearch()'s doc comment on
+	// caller-owned vector lifetime) -- only its VectorView/top_k, exactly
+	// what a fallback retry request needs to rebuild.
+	Query query_view = query;
+
+	scheduler_.schedule(plan.primary,
+			[this, result_promise, anchor_id, record_for_replacement_policy, fallback_to_hybrid, query_view](
+					std::exception_ptr error, const TraverseResult& first_result) {
+				if (error) {
+					result_promise->set_exception(error);
+					return;
+				}
+				if (record_for_replacement_policy) {
+					region_manager_.recordTraversal(first_result.touched);
+					if (anchor_id != 0) {
+						region_manager_.requestPromotion(anchor_id, first_result.touched, query_view.vector);
+					}
+				}
+				bool first_was_hybrid = (first_result.execution_mode == ExecutionMode::Hybrid);
+
+				if (!fallback_to_hybrid || first_result.completed_within_scope) {
+					result_promise->set_value(commitSearch(first_result, first_was_hybrid));
+					return;
+				}
+
+				// GpuOnly attempt fell short of its predicted scope -- retry
+				// Hybrid, exactly like the old synchronous search() did, just
+				// chained via on_complete instead of blocking this worker thread
+				// on a second future (see TraverseTask::on_complete's doc comment
+				// on why: with a single execution worker, blocking here for the
+				// retry's own batch to be picked up would deadlock).
+				TraverseRequest fallback_request{query_view, ExecutionMode::Hybrid, {}};
+				VectorId retry_anchor_id = MintAnchorId();
+				fallback_request.anchor_id = retry_anchor_id;
+				scheduler_.schedule(fallback_request,
+						[this, result_promise, retry_anchor_id, record_for_replacement_policy, query_view](
+								std::exception_ptr retry_error, const TraverseResult& retry_result) {
+							if (retry_error) {
+								result_promise->set_exception(retry_error);
+								return;
+							}
+							if (record_for_replacement_policy) {
+								region_manager_.recordTraversal(retry_result.touched);
+								region_manager_.requestPromotion(retry_anchor_id, retry_result.touched, query_view.vector);
+							}
+							result_promise->set_value(commitSearch(retry_result, /*final_was_hybrid=*/true));
+						});
+			});
+
+	return result_future;
 }
 
-InsertResult Controller::insert(const Record& record) {
-	ARACHNE_TRACE_SCOPE("Controller", "insert");
+std::future<InsertResult> Controller::submitInsert(const Record& record) {
+	ARACHNE_TRACE_SCOPE("Controller", "submitInsert");
 	// Claim record.id before doing anything else -- see insert()'s doc
 	// comment (controller.hpp). The insert-and-check-.second pattern makes
 	// two concurrent insert() calls for the same id race safely: exactly one
@@ -107,71 +260,121 @@ InsertResult Controller::insert(const Record& record) {
 	{
 		std::lock_guard<std::mutex> lock(live_ids_mutex_);
 		if (!live_ids_.insert(record.id).second) {
-			ARACHNE_LOG_WARN("insert: id {} is already live, rejecting duplicate insert", record.id);
-			return InsertResult{false};
+			ARACHNE_LOG_WARN("submitInsert: id {} is already live, rejecting duplicate insert", record.id);
+			std::promise<InsertResult> rejected;
+			rejected.set_value(InsertResult{false});
+			return rejected.get_future();
 		}
 	}
 
-	try {
-		// Step 1 (Traversal): find where this new vector belongs -- candidate
-		// neighbors, a cluster to join, or whatever else the index's algorithm
-		// needs (TraverseResult::hint) -- using the same anchor-routing decision
-		// search() uses, so a repeatedly-inserted-near Anchor gets GpuOnly
-		// lookups the same way a repeatedly-queried one does.
-		Query lookup_query{record.vector, kInsertionLookupTopK};
-		RoutingDecision decision = route(lookup_query);
-		TraverseRequest lookup{lookup_query, decision.gpu_only ? ExecutionMode::GpuOnly : ExecutionMode::Hybrid,
-													 decision.predicted_scope};
-		lookup.anchor_id = decision.anchor_id;
-		// Same reasoning as search()'s own fix above: record.id is always what
-		// requestPromotion() below registers this locality under (unlike
-		// search(), insert() always has a real, non-synthetic id available), so
-		// fall back to it when routeInsert()/route() didn't already find an
-		// existing Anchor.
-		if (!lookup.anchor_id) lookup.anchor_id = record.id;
-		// Unlike search(), always registers record.id as a promotion candidate
-		// (it's always a brand-new Anchor here, never a redundant
-		// re-registration) regardless of whether the Modify call below even
-		// runs, let alone succeeds.
-		TraverseResult candidates = dispatch(lookup, record.id);
+	auto result_promise = std::make_shared<std::promise<InsertResult>>();
+	std::future<InsertResult> result_future = result_promise->get_future();
 
-		// Step 2 (Modification): apply the insert using what the traversal found.
-		InsertPlan plan = routeInsert(record, std::move(candidates));
-		ModifyResult result = dispatch(plan.request);
-		InsertResult final_result = commitInsert(result);
+	// Step 1 (Traversal): find where this new vector belongs -- candidate
+	// neighbors, a cluster to join, or whatever else the index's algorithm
+	// needs (TraverseResult::hint) -- using the same anchor-routing decision
+	// search() uses, so a repeatedly-inserted-near Anchor gets GpuOnly
+	// lookups the same way a repeatedly-queried one does.
+	Query lookup_query{record.vector, kInsertionLookupTopK};
+	RoutingDecision decision = route(lookup_query);
+	TraverseRequest lookup{lookup_query, decision.gpu_only ? ExecutionMode::GpuOnly : ExecutionMode::Hybrid,
+												 decision.predicted_scope};
+	lookup.anchor_id = decision.anchor_id;
+	// Mint a fresh Anchor id when routeInsert()/route() didn't already find
+	// an existing one nearby -- exactly like search()'s own fallback below,
+	// not record.id: an Anchor's id and lifecycle are Core's own bookkeeping,
+	// independent of whether *this specific* insert's vector is what
+	// originally caused it to exist (see MintAnchorId()'s own doc comment,
+	// and next_anchor_id_'s in controller.hpp, for why reusing record.id
+	// here used to conflate the two and what that broke: deleting this
+	// vector later must not be assumed to mean "this Anchor is done").
+	if (!lookup.anchor_id) lookup.anchor_id = MintAnchorId();
+	// Whatever this lookup ended up tagged with (an existing nearby Anchor,
+	// or the freshly-minted one above) -- *not* record_id below, now that
+	// the two are no longer the same thing. requestPromotion() must register
+	// this traversal's footprint under the same Anchor id the traversal
+	// itself ran under, or RegionManager/the ReplacementPolicy would track
+	// dependencies against an id nothing else ever refers to.
+	VectorId insert_anchor_id = *lookup.anchor_id;
 
-		if (!final_result.ok) {
-			// Never actually landed -- free the id back up rather than leaving
-			// it permanently unusable.
-			std::lock_guard<std::mutex> lock(live_ids_mutex_);
-			live_ids_.erase(record.id);
-		}
-		return final_result;
-	} catch (...) {
-		// dispatch() can throw (e.g. a GpuOnly request reaching an adapter's
-		// unimplemented traverseDevice()/modifyDevice(), see IAdapter's doc
-		// comment) -- record.id was never actually inserted either way, so it
-		// must not stay claimed.
-		ARACHNE_LOG_WARN("insert: id {} threw during dispatch, releasing claimed id", record.id);
-		std::lock_guard<std::mutex> lock(live_ids_mutex_);
-		live_ids_.erase(record.id);
-		throw;
-	}
+	// `record` itself isn't captured (non-owning VectorView, see
+	// submitSearch()'s doc comment on the same issue) -- record.id is a
+	// plain value, safe regardless.
+	VectorId record_id = record.id;
+	Record record_by_value = record;
+
+	// Always registers a promotion candidate for insert_anchor_id (regardless
+	// of whether the Modify call below even runs, let alone succeeds) --
+	// unlike search(), there's no "GpuOnly hit, nothing to promote" case
+	// here, insert()'s lookup traversal always runs Hybrid or GpuOnly-with-
+	// residency-hints, either way worth recording.
+	scheduler_.schedule(lookup,
+			[this, result_promise, insert_anchor_id, record_id, record_by_value](std::exception_ptr error,
+					const TraverseResult& candidates) {
+				if (error) {
+					// dispatch() throwing here used to leave record.id un-claimed
+					// (insert()'s catch block released it) -- do the same before
+					// propagating, so a failed lookup never permanently blocks
+					// this id from ever being inserted again.
+					std::lock_guard<std::mutex> lock(live_ids_mutex_);
+					live_ids_.erase(record_id);
+					result_promise->set_exception(error);
+					return;
+				}
+				region_manager_.recordTraversal(candidates.touched);
+				region_manager_.requestPromotion(insert_anchor_id, candidates.touched, record_by_value.vector);
+
+				// Step 2 (Modification): apply the insert using what the
+				// traversal found. `candidates` is copied (routeInsert() takes it
+				// by value and moves its `hint` out) since this callback only has
+				// a const&.
+				InsertPlan plan = routeInsert(record_by_value, candidates);
+				scheduler_.schedule(plan.request,
+						[this, result_promise, record_id](std::exception_ptr modify_error, const ModifyResult& result) {
+							if (modify_error) {
+								std::lock_guard<std::mutex> lock(live_ids_mutex_);
+								live_ids_.erase(record_id);
+								result_promise->set_exception(modify_error);
+								return;
+							}
+							InsertResult final_result = commitInsert(result);
+							if (!final_result.ok) {
+								// Never actually landed -- free the id back up rather than
+								// leaving it permanently unusable.
+								std::lock_guard<std::mutex> lock(live_ids_mutex_);
+								live_ids_.erase(record_id);
+							}
+							result_promise->set_value(final_result);
+						});
+			});
+
+	return result_future;
 }
 
-DeleteResult Controller::remove(VectorId id) {
-	ARACHNE_TRACE_SCOPE("Controller", "remove");
+std::future<DeleteResult> Controller::submitRemove(VectorId id) {
+	ARACHNE_TRACE_SCOPE("Controller", "submitRemove");
 	RemovePlan plan = routeRemove(id);
-	ModifyResult result = dispatch(plan.request);
-	DeleteResult final_result = commitRemove(plan, result);
 
-	if (final_result.ok) {
-		std::lock_guard<std::mutex> lock(live_ids_mutex_);
-		live_ids_.erase(id);
-	} else {
-		ARACHNE_LOG_WARN("remove: id {} failed at the adapter, id remains live", id);
-	}
-	return final_result;
+	auto result_promise = std::make_shared<std::promise<DeleteResult>>();
+	std::future<DeleteResult> result_future = result_promise->get_future();
+
+	scheduler_.schedule(plan.request,
+			[this, result_promise, plan, id](std::exception_ptr error, const ModifyResult& result) {
+				if (error) {
+					result_promise->set_exception(error);
+					return;
+				}
+				DeleteResult final_result = commitRemove(plan, result);
+				if (final_result.ok) {
+					std::lock_guard<std::mutex> lock(live_ids_mutex_);
+					live_ids_.erase(id);
+				} else {
+					ARACHNE_LOG_WARN("remove: id {} failed at the adapter, id remains live", id);
+				}
+				result_promise->set_value(final_result);
+			});
+
+	return result_future;
 }
 
 Controller::SearchPlan Controller::routeSearch(const Query& query) {
@@ -229,20 +432,30 @@ Controller::RemovePlan Controller::routeRemove(VectorId id) {
 	return plan;
 }
 
-TraverseResult Controller::dispatch(const TraverseRequest& request, VectorId promotion_anchor_id) {
+TraverseResult Controller::dispatch(const TraverseRequest& request, VectorId promotion_anchor_id,
+		bool record_traversal) {
 	ARACHNE_TRACE_SCOPE("Controller", "dispatchTraverse");
+	return dispatchAsync(request, promotion_anchor_id, record_traversal).get();
+}
+
+std::future<TraverseResult> Controller::dispatchAsync(
+		const TraverseRequest& request, VectorId promotion_anchor_id, bool record_traversal) {
+	ARACHNE_TRACE_SCOPE("Controller", "dispatchTraverseAsync");
 	// `vector` is captured now (copying just the VectorView struct, not its
 	// backing bytes) rather than read from inside the lambda below --
 	// OpScheduler's own copy of `request` only preserves the pointer, not its
 	// lifetime, so this must happen while `request` (a reference into the
-	// still-blocked caller's data) is still valid.
+	// still-live caller's data) is still valid -- true for dispatch()'s
+	// blocking callers, and for dispatchAsync()'s own callers as long as
+	// they honor the same lifetime contract submitSearch()/submitInsert()'s
+	// doc comments describe.
 	VectorView vector = request.query.vector;
-	std::future<TraverseResult> future =
-			scheduler_.schedule(request, [this, promotion_anchor_id, vector](const TraverseResult& result) {
+	return scheduler_.schedule(
+			request, [this, promotion_anchor_id, record_traversal, vector](std::exception_ptr error, const TraverseResult& result) {
+				if (error || !record_traversal) return;
 				region_manager_.recordTraversal(result.touched);
 				if (promotion_anchor_id != 0) region_manager_.requestPromotion(promotion_anchor_id, result.touched, vector);
 			});
-	return future.get();
 }
 
 ModifyResult Controller::dispatch(const ModifyRequest& request) {
@@ -262,15 +475,23 @@ InsertResult Controller::commitInsert(const ModifyResult& result) {
 	return InsertResult{result.ok};
 }
 
-DeleteResult Controller::commitRemove(const RemovePlan& plan, const ModifyResult& result) {
+DeleteResult Controller::commitRemove(const RemovePlan&, const ModifyResult& result) {
 	ARACHNE_TRACE_SCOPE("Controller", "commitRemove");
-	if (result.ok) {
-		// A deleted anchor's Region dependencies (if any -- releaseAnchor() is
-		// a no-op otherwise) no longer represent live data; releaseAnchor()
-		// also erases it from RoutingCache so a future query/insert near this
-		// id's old vector doesn't route to an anchor that no longer exists.
-		region_manager_.releaseAnchor(plan.request.target);
-	}
+	// Deliberately does *not* call region_manager_.releaseAnchor() here
+	// anymore -- plan.request.target is the deleted *data* element's own id,
+	// which is no longer assumed to double as some Anchor's id too (see
+	// MintAnchorId()'s and next_anchor_id_'s own doc comments for why that
+	// assumption was wrong in general, and the latency-tracing report entry,
+	// cpp/test/index/report/, for the measured cost of every delete taking
+	// CostAwareReplacementPolicy::mutex_ to chase a relationship that mostly
+	// didn't exist). An Anchor's own lifecycle -- whether it's still worth
+	// keeping GPU-resident -- is entirely the ReplacementPolicy's call now,
+	// driven by heat decay and capacity pressure like any other Anchor,
+	// independent of whatever data element happened to trigger its creation.
+	// Controller::verify() still calls releaseAnchor() directly, with a real
+	// Anchor id, for the one case that's still Core's call to make: a
+	// verification mismatch means that Anchor's current Region dependencies
+	// no longer represent its locality at all, regardless of heat.
 	return DeleteResult{result.ok};
 }
 
@@ -335,6 +556,12 @@ RegionAccess Controller::acquireRegion(RegionId region) {
 	return result;
 }
 
+void* Controller::workerScratch() const { return g_worker_scratch; }
+
+cudaStream_t Controller::workerStream() const {
+	return g_worker_stream != nullptr ? g_worker_stream : device_.managementStream();
+}
+
 ControllerStats Controller::stats() const {
 	RegionManager::Stats region_stats = region_manager_.stats();
 	ControllerStats result;
@@ -344,6 +571,9 @@ ControllerStats Controller::stats() const {
 	result.regions_written_back_total = region_stats.regions_written_back_total;
 	result.anchor_evictions_total = region_stats.anchor_evictions_total;
 	result.compactions_total = region_stats.compactions_total;
+	result.relocation_batches_total = region_stats.relocation_batches_total;
+	result.candidates_requeued_total = region_stats.candidates_requeued_total;
+	result.candidates_rejected_total = region_stats.candidates_rejected_total;
 	return result;
 }
 

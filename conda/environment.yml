@@ -29,4 +29,4 @@ dependencies:
   - librmm
   - gtest
   - spdlog                # Logging.
-  - highway               # CPU SIMD (AVX2/AVX512/NEON) dynamic dispatch for arachne/util vector math.
+  - libhwy               # CPU SIMD (AVX2/AVX512/NEON) dynamic dispatch for arachne/util vector math.

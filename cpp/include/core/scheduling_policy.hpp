@@ -20,11 +20,20 @@ struct TraverseTask {
 	std::chrono::steady_clock::time_point enqueued_at;
 	TraverseRequest request;
 	std::promise<TraverseResult> promise;
-	// Invoked on the execution worker thread, right before the promise is
-	// fulfilled -- see OpScheduler::schedule(TraverseRequest, ...)'s doc
-	// comment. OpScheduler never interprets this itself, same as start()'s
-	// on_worker_start callback.
-	std::function<void(const TraverseResult&)> on_complete;
+	// Invoked exactly once, on the execution worker thread, right before the
+	// promise is resolved -- see OpScheduler::schedule(TraverseRequest,
+	// ...)'s doc comment. Fires unconditionally, not just on success: `error`
+	// is null and `result` populated when the adapter call succeeded, or
+	// `error` is set (result default-constructed) if it threw for this
+	// task's whole batch. Firing either way (rather than only on success)
+	// lets a caller chain a dependent follow-up dispatch -- e.g.
+	// Controller::submitInsert()'s lookup-then-modify pipeline,
+	// submitSearch()'s GpuOnly-miss-then-Hybrid-retry -- without ever
+	// blocking a thread on this task's own future: the continuation is
+	// guaranteed to observe an outcome one way or the other, never left
+	// waiting on a promise nobody resolves. OpScheduler never interprets
+	// this itself, same as start()'s on_worker_start callback.
+	std::function<void(std::exception_ptr error, const TraverseResult& result)> on_complete;
 };
 
 struct ModifyTask {
@@ -32,6 +41,11 @@ struct ModifyTask {
 	std::chrono::steady_clock::time_point enqueued_at;
 	ModifyRequest request;
 	std::promise<ModifyResult> promise;
+	// Same contract as TraverseTask::on_complete above, for Modify. No
+	// built-in Controller call today uses this for bookkeeping (unlike
+	// Traverse's recordTraversal/requestPromotion), only for chaining a
+	// dependent follow-up dispatch.
+	std::function<void(std::exception_ptr error, const ModifyResult& result)> on_complete;
 };
 
 using ScheduledOperation = std::variant<TraverseTask, ModifyTask>;

@@ -181,6 +181,20 @@ class IAdapter {
 	/// scheduler.
 	virtual bool requiresTraverseModifyIsolation() const { return true; }
 
+	/// Bytes of persistent, worker-affine GPU scratch this adapter wants
+	/// reserved per OpScheduler execution worker (see gpu::DeviceContext::
+	/// reserveWorkerScratch()/workerScratch()). Queried exactly once, by
+	/// Controller's own constructor, before any worker thread starts. An
+	/// adapter that does device-native work needing short-lived per-call/
+	/// per-hop buffers (e.g. HnswlibIndexGpu's traverseDevice(), see
+	/// hnswlib_index_gpu.cpp for a worked example) can request scratch here
+	/// instead of its own repeated cudaMalloc/cudaFree in the hot path.
+	/// Default 0: adapters that don't do device-native work, or that manage
+	/// their own device memory, need nothing here -- Controller::
+	/// workerScratch() then always returns nullptr, and Controller skips
+	/// reserving anything (no cudaMalloc at all).
+	virtual std::size_t requiredScratchBytesPerWorker() const { return 0; }
+
 	/// Structural accessors, not primitives: let Core resolve footprints
 	/// returned above into IRegion callbacks for lease management.
 	virtual IRegion* resolveRegion(RegionId id) = 0;
