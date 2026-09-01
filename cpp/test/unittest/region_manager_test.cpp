@@ -67,7 +67,8 @@ class RecordingReplacementPolicy : public ReplacementPolicy {
 	bool onRelocationTrigger() override { return false; }
 	bool hasPendingCandidates() const override { return false; }
 	std::optional<PromotionCandidate> selectNextPromotionCandidate() override { return std::nullopt; }
-	std::optional<VectorId> selectEvictionCandidate(VectorId, std::size_t, const std::vector<EvictionCandidate>&) override {
+	std::optional<VectorId> selectEvictionCandidate(VectorId, std::size_t, const std::vector<EvictionCandidate>&,
+			const std::unordered_set<VectorId>& = {}) override {
 		return std::nullopt;
 	}
 

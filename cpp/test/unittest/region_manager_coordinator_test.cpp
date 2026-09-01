@@ -130,7 +130,8 @@ class IntakeObservingPolicy : public ReplacementPolicy {
 		pending_.pop_front();
 		return candidate;
 	}
-	std::optional<VectorId> selectEvictionCandidate(VectorId, std::size_t, const std::vector<EvictionCandidate>&) override {
+	std::optional<VectorId> selectEvictionCandidate(VectorId, std::size_t, const std::vector<EvictionCandidate>&,
+			const std::unordered_set<VectorId>& = {}) override {
 		return std::nullopt;
 	}
 	bool waitForIntake(std::chrono::milliseconds timeout) {
@@ -715,7 +716,8 @@ class RecordingAlwaysRejectPolicy : public ReplacementPolicy {
 		pending_.pop_front();
 		return candidate;
 	}
-	std::optional<VectorId> selectEvictionCandidate(VectorId, std::size_t, const std::vector<EvictionCandidate>&) override {
+	std::optional<VectorId> selectEvictionCandidate(VectorId, std::size_t, const std::vector<EvictionCandidate>&,
+			const std::unordered_set<VectorId>& = {}) override {
 		return std::nullopt;
 	}
 	BatchAdmissionDecision evaluateBatchAdmission(const PromotionCandidate&, const AdmissionContext& admission,
@@ -847,7 +849,8 @@ class GiveUpAfterAttemptsPolicy : public ReplacementPolicy {
 		pending_.pop_front();
 		return candidate;
 	}
-	std::optional<VectorId> selectEvictionCandidate(VectorId, std::size_t, const std::vector<EvictionCandidate>&) override {
+	std::optional<VectorId> selectEvictionCandidate(VectorId, std::size_t, const std::vector<EvictionCandidate>&,
+			const std::unordered_set<VectorId>& = {}) override {
 		return std::nullopt;
 	}
 

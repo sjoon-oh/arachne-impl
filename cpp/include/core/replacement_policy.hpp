@@ -307,20 +307,44 @@ class ReplacementPolicy {
 	virtual void onPromotionCommitted(VectorId, const AdmissionContext&) {}
 
 	/// Chooses the next Anchor to reclaim, excluding `excluded` (the Anchor
-	/// currently being promoted -- never select the thing being promoted).
-	/// Returns nullopt if nothing is eligible to evict. `required_bytes`/
-	/// `candidates` give byte- and group-aware policies (CostAwareReplacementPolicy)
-	/// what they need to score victims properly; a policy that scores purely
-	/// by its own tracked order/recency/frequency (every other built-in
-	/// policy) is free to ignore both and just walk its own internal
-	/// structure, the same as before this was the sole eviction-selection
-	/// entry point (this used to be two separate virtuals -- a "legacy"
-	/// `selectNextEvictionCandidate(excluded)` every policy had to implement,
-	/// and this one, with a default that just delegated to it; collapsed to
-	/// one once nothing outside this file ever called the legacy one
-	/// directly anymore -- see cpp/test/index/report/ for that investigation).
+	/// currently being promoted -- never select the thing being promoted) and
+	/// every anchor named in `excluded_anchors`. Returns nullopt if nothing is
+	/// eligible to evict. `required_bytes`/`candidates` give byte- and
+	/// group-aware policies (CostAwareReplacementPolicy) what they need to
+	/// score victims properly; a policy that scores purely by its own tracked
+	/// order/recency/frequency (every other built-in policy) is free to
+	/// ignore both and just walk its own internal structure, the same as
+	/// before this was the sole eviction-selection entry point (this used to
+	/// be two separate virtuals -- a "legacy" `selectNextEvictionCandidate(excluded)`
+	/// every policy had to implement, and this one, with a default that just
+	/// delegated to it; collapsed to one once nothing outside this file ever
+	/// called the legacy one directly anymore -- see cpp/test/index/report/
+	/// for that investigation).
+	///
+	/// `excluded_anchors` is `buildRelocationPlan()`'s victim-selection loop's
+	/// way of saying "these are already spoken for this pass" (anchors just
+	/// promoted this same pass, plus anchors already selected as a victim
+	/// earlier in this same while loop) *without* physically removing them
+	/// from `candidates` first. `candidates` itself is always the full,
+	/// shared, pass-lifetime eviction-candidate snapshot (the same one
+	/// AdmissionContext::eviction_candidates points at) -- every
+	/// implementation must independently check `!excluded_anchors.contains(id)`
+	/// for each id it considers, the same way it already checks
+	/// `id != excluded`, rather than assuming `candidates` has already had
+	/// excluded_anchors's members filtered out. Defaults to empty so existing
+	/// callers (tests, anything not routing through buildRelocationPlan()'s
+	/// own victim-selection loop) that have no exclusion beyond `excluded`
+	/// need not pass it. See cpp/test/index/report/ (the 10M-scale
+	/// Coordinator-throughput entry) for why this replaced a filtered-copy
+	/// approach: that copy -- of `candidates` itself, made once per
+	/// buildRelocationPlan() pass and mutated by erasing this same
+	/// information -- was the dominant Coordinator cost at 10M scale, because
+	/// pass count there is 44-250x what it is at 1M scale. `excluded_anchors`
+	/// stays small (bounded by promotions + victims selected in a single
+	/// pass) regardless of how large `candidates` itself grows.
 	virtual std::optional<VectorId> selectEvictionCandidate(
-			VectorId excluded, std::size_t required_bytes, const std::vector<EvictionCandidate>& candidates) = 0;
+			VectorId excluded, std::size_t required_bytes, const std::vector<EvictionCandidate>& candidates,
+			const std::unordered_set<VectorId>& excluded_anchors = {}) = 0;
 
  protected:
 	/// Opt-in aging/starvation check a concrete policy's own
@@ -365,8 +389,8 @@ class FifoReplacementPolicy final : public ReplacementPolicy {
 	bool hasPendingCandidates() const override;
 	std::optional<PromotionCandidate> selectNextPromotionCandidate() override;
 	std::optional<VectorId> selectEvictionCandidate(
-			VectorId excluded, std::size_t required_bytes,
-			const std::vector<EvictionCandidate>& candidates) override;
+			VectorId excluded, std::size_t required_bytes, const std::vector<EvictionCandidate>& candidates,
+			const std::unordered_set<VectorId>& excluded_anchors = {}) override;
 
  private:
 	mutable std::mutex mutex_;
@@ -415,8 +439,8 @@ class LruReplacementPolicy final : public ReplacementPolicy {
 	bool hasPendingCandidates() const override;
 	std::optional<PromotionCandidate> selectNextPromotionCandidate() override;
 	std::optional<VectorId> selectEvictionCandidate(
-			VectorId excluded, std::size_t required_bytes,
-			const std::vector<EvictionCandidate>& candidates) override;
+			VectorId excluded, std::size_t required_bytes, const std::vector<EvictionCandidate>& candidates,
+			const std::unordered_set<VectorId>& excluded_anchors = {}) override;
 
  private:
 	mutable std::mutex mutex_;
@@ -470,8 +494,8 @@ class LfuReplacementPolicy final : public ReplacementPolicy {
 	bool hasPendingCandidates() const override;
 	std::optional<PromotionCandidate> selectNextPromotionCandidate() override;
 	std::optional<VectorId> selectEvictionCandidate(
-			VectorId excluded, std::size_t required_bytes,
-			const std::vector<EvictionCandidate>& candidates) override;
+			VectorId excluded, std::size_t required_bytes, const std::vector<EvictionCandidate>& candidates,
+			const std::unordered_set<VectorId>& excluded_anchors = {}) override;
 
  private:
 	struct TrackedEntry {
@@ -527,8 +551,8 @@ class ClockReplacementPolicy final : public ReplacementPolicy {
 	bool hasPendingCandidates() const override;
 	std::optional<PromotionCandidate> selectNextPromotionCandidate() override;
 	std::optional<VectorId> selectEvictionCandidate(
-			VectorId excluded, std::size_t required_bytes,
-			const std::vector<EvictionCandidate>& candidates) override;
+			VectorId excluded, std::size_t required_bytes, const std::vector<EvictionCandidate>& candidates,
+			const std::unordered_set<VectorId>& excluded_anchors = {}) override;
 
  private:
 	struct ClockEntry {
@@ -601,8 +625,8 @@ class TwoQReplacementPolicy final : public ReplacementPolicy {
 	bool hasPendingCandidates() const override;
 	std::optional<PromotionCandidate> selectNextPromotionCandidate() override;
 	std::optional<VectorId> selectEvictionCandidate(
-			VectorId excluded, std::size_t required_bytes,
-			const std::vector<EvictionCandidate>& candidates) override;
+			VectorId excluded, std::size_t required_bytes, const std::vector<EvictionCandidate>& candidates,
+			const std::unordered_set<VectorId>& excluded_anchors = {}) override;
 
  private:
 	std::size_t ghost_capacity_;
@@ -669,8 +693,8 @@ class CostAwareReplacementPolicy final : public ReplacementPolicy {
 															 const AdmissionContext& context) override;
 	void onPromotionCommitted(VectorId anchor_id, const AdmissionContext& context) override;
 	std::optional<VectorId> selectEvictionCandidate(
-			VectorId excluded, std::size_t required_bytes,
-			const std::vector<EvictionCandidate>& candidates) override;
+			VectorId excluded, std::size_t required_bytes, const std::vector<EvictionCandidate>& candidates,
+			const std::unordered_set<VectorId>& excluded_anchors = {}) override;
 
  private:
 	using Clock = std::chrono::steady_clock;

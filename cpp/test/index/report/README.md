@@ -199,3 +199,84 @@ not a living doc).
     their search latency beats cost_aware's default by ~3-4x, at the cost of
     ~530x the promotion/eviction volume (no admission-side filtering at
     all) and 4-12x cost_aware's own wall time.
+11. [2026-08-31-10m-scale-coordinator-throughput.md](2026-08-31-10m-scale-coordinator-throughput.md)
+    -- before attempting the requested 10M-scale sweep, calibration runs
+    showed a severe, run-to-run-inconsistent gap (8-102 minutes) between a
+    config's own printed op-time sum and its real wall clock. Root-caused
+    via two new trace-only scopes (no logic touched): the streaming loop
+    itself is never the problem (325s, matches its own timers exactly) --
+    the entire gap is `RegionManager::shutdown()`'s forced final drain.
+    Ruled out `ARACHNE_LOG_INFO`'s unconditional `fmt::format()` cost by
+    direct measurement (0.72s total across 1M+ calls -- negligible).
+    Found the real cause: `buildRelocationPlan()`'s victim-selection phase
+    deep-copies `eviction_candidates_cache` on *every* pass needing
+    eviction (`std::vector<EvictionCandidate> candidates = *eviction_candidates_cache;`)
+    -- the same architectural pattern as entry 9's admission-side fix, at a
+    *different* call site entry 9 explicitly reasoned was safe to leave
+    alone ("called once per pass... never the cost the shared_ptr change
+    targets"). That held at 1M scale (16-97 passes ever measured); at 10M
+    scale this one run made **4,069** passes reaching the evict phase --
+    turning a ~46-second total cost into 2,130 seconds (35.5 minutes), the
+    dominant share of the observed gap. Confirmed not cost_aware-specific
+    (the copy is policy-agnostic; the pre-entry evidence -- `fifo`'s own
+    102-minute calibration run beating cost_aware's 75-minute one despite
+    zero admission-scan cost -- already pointed this direction). Why pass
+    count itself explodes 44-250x at 10M scale is flagged as a still-open
+    sub-question. Fix direction proposed, not implemented (root-cause scope
+    only). 365/366 suite passing (trace-only change, unaffected).
+12. [2026-09-01-eviction-cache-exclusion-set-fix.md](2026-09-01-eviction-cache-exclusion-set-fix.md)
+    -- implements and verifies entry 11's proposed (not attempted there) fix:
+    `ReplacementPolicy::selectEvictionCandidate()` gained an `excluded_anchors`
+    set parameter so `buildRelocationPlan()`'s victim-selection loop can share
+    `eviction_candidates_cache` directly instead of deep-copying it every
+    pass; all 6 policies updated to honor it. 9 new unit tests, 374/375
+    suite passing (same pre-existing unrelated failure); existing
+    multi-victim-per-pass integration tests (`StrictBatchEvictsEnough
+    VictimsBeforePromotingWholeFootprint` etc.) confirm the exclusion set
+    accumulates correctly across a pass's while-loop iterations. Re-ran
+    entry 11's exact 10M config: the 68-minute post-loop gap dropped to 7
+    seconds (~583x), `buildRelocationPlan_evict` itself dropped ~750x
+    (2,130.0s -> 2.8s), and total step-1-to-summary wall clock dropped 14.5x
+    (73.5min -> 5.1min). Recall unchanged (mean recall@k = 0.8619, matching
+    entry 11 exactly) -- confirms the fix changes *when* the copy happens,
+    not *which* victim gets picked. Unplanned second effect, reported as a
+    likely-but-not-independently-proven explanation: pass count itself also
+    dropped 12.9x (4,072 -> 316) and `evaluateAdmission`'s own per-call mean
+    dropped ~19x despite being untouched by this fix -- read as the slow
+    copy having created a backlog-retry feedback loop that inflated both,
+    substantially narrowing (not fully closing) entry 11's open
+    pass-count-explosion question.
+13. [2026-09-01-pass-count-root-cause.md](2026-09-01-pass-count-root-cause.md)
+    -- follow-up investigating entry 12's remaining open question directly.
+    **Finding 1**: pass count varies 15x (149-2,228) across three
+    back-to-back reruns of the identical post-fix binary/config -- entry
+    11's "44-250x explosion" framing (one 10M number against a 1M range)
+    doesn't hold up once the 10M side is itself shown to vary this much.
+    **Finding 2** (new per-pass `examined`/`admitted`/reason logging, added
+    tracing-only): during active streaming, the dominant pass-ending reason
+    is a *fixed* 256MB per-pass budget cap (~1,300-1,450 candidates
+    admitted per capped pass, replacing roughly the whole resident
+    population each time) -- since this cap doesn't scale with corpus size
+    but total candidate volume does, a 10x bigger corpus mechanically needs
+    proportionally more such passes. **Finding 3**: late in the run, most
+    passes examine thousands of backlog candidates but admit near-zero
+    (hysteresis rejecting a backlog that's gone stale relative to a
+    settled resident set) -- expensive-to-scan, cheap-to-resolve passes.
+    **Finding 4**: pass count is directly confirmed timing-sensitive, not
+    just inferred -- disabling `--quiet-logs` (I/O overhead only, zero
+    decision-logic change) alone shifted total passes 2,228 -> 149 in
+    back-to-back runs, explaining why entry 12's unrelated per-pass-cost
+    fix also moved pass count as a side effect. **Finding 5**: despite that
+    15x pass-count swing (149-2,228), total candidates *examined* across a
+    whole run stays stable (932K-1.15M, ~1.2x) -- pass count is a
+    Coordinator-service-timing chunking artifact, not a proxy for actual
+    work; the real cost driver (total examined x per-examination cost) is
+    what entry 12 actually fixed, and pass count itself was never a
+    reliable health signal. **Conclusion**: the structural drivers (fixed
+    budget vs. growing corpus, hysteresis needing to evaluate before it can
+    reject) are inherent to any bounded-capacity cache facing a streaming
+    workload bigger than it -- not an Arachne-specific defect -- and the
+    Coordinator-timing piece only changes chunking, not total work, so
+    neither rises to "framework problem"; pass count joins entry 3's own
+    5.8x-reproducibility-spread precedent as a noisy-but-harmless metric.
+    374/375 suite passing (tracing/logging-only, no regression).

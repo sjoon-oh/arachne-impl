@@ -697,6 +697,12 @@ void RegionManager::assignAnchorToGroup(VectorId anchor_id, const std::vector<Re
 
 AdmissionContext RegionManager::buildAdmissionContext(const PromotionCandidate& candidate,
 		std::shared_ptr<const std::vector<EvictionCandidate>>& eviction_candidates_cache) const {
+	// Diagnostic-only (ARACHNE_ENABLE_TRACING build) -- see the 10M-scale
+	// Coordinator-throughput investigation this was added for
+	// (cpp/test/index/report/): buildRelocationPlan_collect's own per-pass
+	// scope was already traced, but nothing isolated this specific callee's
+	// own cost from the rest of that loop body.
+	ARACHNE_TRACE_SCOPE("RegionManager", "buildAdmissionContext");
 	AdmissionContext context;
 	context.allocation_unit_bytes = device_region_pool_->allocationUnitBytes(gpu::MemoryKind::Data);
 	std::unordered_set<RegionId> unique_regions;
@@ -831,9 +837,25 @@ std::optional<RegionManager::RelocationPlan> RegionManager::buildRelocationPlan(
 	// report entry this was added for.
 	{
 	ARACHNE_TRACE_SCOPE("RegionManager", "buildRelocationPlan_collect");
+	// Diagnostic-only (ARACHNE_ENABLE_TRACING build) -- see the pass-count
+	// investigation this was added for (cpp/test/index/report/): a per-PASS
+	// (not per-candidate, so low volume -- one line per buildRelocationPlan_collect
+	// call, unlike the existing per-candidate log a few lines below) summary of
+	// how many candidates this pass's collect loop actually looked at and why
+	// it stopped, to distinguish "queue genuinely ran dry" from "broke out
+	// early because of the per-pass budget cap" as the reason a big backlog
+	// needs many separate passes to drain.
+	std::size_t examined_this_pass = 0;
 	while (true) {
 		std::optional<PromotionCandidate> candidate = replacement_policy_->selectNextPromotionCandidate();
-		if (!candidate.has_value()) break;
+		if (!candidate.has_value()) {
+			ARACHNE_LOG_INFO(
+					"buildRelocationPlan[{}]: collect loop ended -- reason=queue_drained examined={} admitted={} "
+					"retain_failed_candidates={}",
+					batch_sequence, examined_this_pass, plan.promotions.size(), retain_failed_candidates);
+			break;
+		}
+		++examined_this_pass;
 		{
 			std::lock_guard<RegionManagerMutex> lock(mutex_);
 			if (currentEpochLocked(candidate->anchor_id) != candidate->epoch) continue;
@@ -847,20 +869,34 @@ std::optional<RegionManager::RelocationPlan> RegionManager::buildRelocationPlan(
 				available, budget, coordinator_config_.max_promotion_bytes_per_pass};
 		BatchAdmissionDecision decision =
 				replacement_policy_->evaluateBatchAdmission(*candidate, admission, batch_context);
-		ARACHNE_LOG_INFO(
-				"buildRelocationPlan[{}]: admission for anchor {} (incremental_bytes={}) -> {} "
-				"(plan.promotions.size()={} selected_incremental={} retain_failed_candidates={})",
-				batch_sequence, candidate->anchor_id, admission.incremental_bytes,
-				decision == BatchAdmissionDecision::Admit ? "Admit"
-				: decision == BatchAdmissionDecision::Defer ? "Defer"
-																										 : "Reject",
-				plan.promotions.size(), selected_incremental, retain_failed_candidates);
+		{
+			// Diagnostic-only (ARACHNE_ENABLE_TRACING build) -- see the
+			// 10M-scale Coordinator-throughput investigation this was added
+			// for (cpp/test/index/report/): isolates ARACHNE_LOG_INFO's own
+			// cost (fmt::format() runs unconditionally as a macro argument,
+			// before the logger's own runtime level check ever sees it --
+			// see logging.hpp -- so --quiet-logs suppresses the *output*,
+			// not this formatting cost) from the rest of this loop body.
+			ARACHNE_TRACE_SCOPE("RegionManager", "buildRelocationPlan_collect_log");
+			ARACHNE_LOG_INFO(
+					"buildRelocationPlan[{}]: admission for anchor {} (incremental_bytes={}) -> {} "
+					"(plan.promotions.size()={} selected_incremental={} retain_failed_candidates={})",
+					batch_sequence, candidate->anchor_id, admission.incremental_bytes,
+					decision == BatchAdmissionDecision::Admit ? "Admit"
+					: decision == BatchAdmissionDecision::Defer ? "Defer"
+																											 : "Reject",
+					plan.promotions.size(), selected_incremental, retain_failed_candidates);
+		}
 		if (decision == BatchAdmissionDecision::Reject) {
 			stat_candidates_rejected_.fetch_add(1, std::memory_order_relaxed);
 			continue;
 		}
 		if (decision == BatchAdmissionDecision::Defer) {
 			if (retain_failed_candidates) deferred.push_back(std::move(*candidate));
+			ARACHNE_LOG_INFO(
+					"buildRelocationPlan[{}]: collect loop ended -- reason=defer examined={} admitted={} "
+					"retain_failed_candidates={}",
+					batch_sequence, examined_this_pass, plan.promotions.size(), retain_failed_candidates);
 			break;
 		}
 
@@ -877,6 +913,10 @@ std::optional<RegionManager::RelocationPlan> RegionManager::buildRelocationPlan(
 			// returned to the policy for a later pass") -- that was always the
 			// intent, not something conditional on how the pass was triggered.
 			deferred.push_back(std::move(*candidate));
+			ARACHNE_LOG_INFO(
+					"buildRelocationPlan[{}]: collect loop ended -- reason=max_promotion_bytes_per_pass examined={} "
+					"admitted={} retain_failed_candidates={}",
+					batch_sequence, examined_this_pass, plan.promotions.size(), retain_failed_candidates);
 			break;
 		}
 
@@ -911,6 +951,11 @@ std::optional<RegionManager::RelocationPlan> RegionManager::buildRelocationPlan(
 					batch_sequence, dropped_anchor, required, budget, plan.promotions.size(),
 					requeued ? "requeued for a later pass" : "DROPPED PERMANENTLY (infeasible alone, not requeued)");
 			if (requeued) deferred.push_back(std::move(over_budget));
+			ARACHNE_LOG_INFO(
+					"buildRelocationPlan[{}]: collect loop ended -- reason=over_budget examined={} admitted={} "
+					"required={} budget={} retain_failed_candidates={}",
+					batch_sequence, examined_this_pass, plan.promotions.size(), required, budget,
+					retain_failed_candidates);
 			break;
 		}
 		selected_incremental += plan.promotions.back().admission.incremental_bytes;
@@ -922,28 +967,38 @@ std::optional<RegionManager::RelocationPlan> RegionManager::buildRelocationPlan(
 	plan.required_incremental_bytes = promotionBytes(plan.promotions);
 	if (available >= plan.required_incremental_bytes) return plan;
 
-	std::unordered_set<VectorId> promoted_anchors;
-	for (const PlannedPromotion& promotion : plan.promotions) {
-		promoted_anchors.insert(promotion.candidate.anchor_id);
-	}
 	// Reuses eviction_candidates_cache if some candidate above already
 	// populated it -- same "static for the whole pass" reasoning as
-	// buildAdmissionContext()'s own use of it. Copied (not shared) into
-	// `candidates` below since this loop mutates its own working copy
-	// (erase-remove of already-promoted anchors) -- called once per pass,
-	// not once per candidate, so this copy was never the cost the shared_ptr
-	// change above targets.
+	// buildAdmissionContext()'s own use of it.
 	if (!eviction_candidates_cache) {
 		eviction_candidates_cache = std::make_shared<const std::vector<EvictionCandidate>>(buildEvictionCandidates());
 	}
-	std::vector<EvictionCandidate> candidates = *eviction_candidates_cache;
-	candidates.erase(std::remove_if(candidates.begin(), candidates.end(),
-			[&promoted_anchors](const EvictionCandidate& candidate) {
-				return promoted_anchors.contains(candidate.anchor_id);
-			}), candidates.end());
+	// excluded_anchors starts as "already promoted this pass" (never evict the
+	// thing just promoted) and grows below as each victim group is selected --
+	// deliberately NOT expressed as a filtered copy of *eviction_candidates_cache
+	// (that used to be this exact spot: `std::vector<EvictionCandidate>
+	// candidates = *eviction_candidates_cache;` then erase-remove). That copy
+	// was the dominant Coordinator cost at 10M scale -- eviction_candidates_cache
+	// can hold thousands of entries, each with its own heap-allocated
+	// group_members, and the old code deep-copied the *whole thing* once per
+	// pass just to physically remove a handful of already-decided anchors; at
+	// 10M scale, pass count itself is 44-250x what it is at 1M scale, so this
+	// added up to the majority of a 68-minute post-loop stall -- see
+	// cpp/test/index/report/2026-08-31-10m-scale-coordinator-throughput.md and
+	// its follow-up fix entry. eviction_candidates_cache itself is now shared
+	// (no copy) with every selectEvictionCandidate() call below; excluded_anchors
+	// is the small, mutable side-table that expresses "skip this one" instead --
+	// see ReplacementPolicy::selectEvictionCandidate()'s own doc comment for the
+	// exclusion contract every policy must honor against it.
+	std::unordered_set<VectorId> excluded_anchors;
+	for (const PlannedPromotion& promotion : plan.promotions) {
+		excluded_anchors.insert(promotion.candidate.anchor_id);
+	}
 	ARACHNE_LOG_INFO(
-			"buildRelocationPlan[{}]: required={} available={} eviction_candidates={} -- entering victim-selection loop",
-			batch_sequence, plan.required_incremental_bytes, available, candidates.size());
+			"buildRelocationPlan[{}]: required={} available={} eviction_candidates={} (excluded so far: {}) -- "
+			"entering victim-selection loop",
+			batch_sequence, plan.required_incremental_bytes, available, eviction_candidates_cache->size(),
+			excluded_anchors.size());
 
 	// Diagnostic-only (ARACHNE_ENABLE_TRACING build): see the
 	// buildRelocationPlan_collect scope above -- this one covers only the
@@ -953,18 +1008,18 @@ std::optional<RegionManager::RelocationPlan> RegionManager::buildRelocationPlan(
 	while (available + plan.immediately_reclaimable_bytes < plan.required_incremental_bytes) {
 		std::size_t remaining = plan.required_incremental_bytes -
 				(available + plan.immediately_reclaimable_bytes);
-		std::optional<VectorId> victim =
-				replacement_policy_->selectEvictionCandidate(/*excluded=*/0, remaining, candidates);
+		std::optional<VectorId> victim = replacement_policy_->selectEvictionCandidate(
+				/*excluded=*/0, remaining, *eviction_candidates_cache, excluded_anchors);
 		if (!victim.has_value()) {
 			ARACHNE_LOG_INFO(
-					"buildRelocationPlan[{}]: selectEvictionCandidate() returned no victim with remaining={} and {} "
-					"candidates left -- stopping victim selection short",
-					batch_sequence, remaining, candidates.size());
+					"buildRelocationPlan[{}]: selectEvictionCandidate() returned no victim with remaining={} ({} "
+					"eviction candidate(s) total, {} already excluded this pass) -- stopping victim selection short",
+					batch_sequence, remaining, eviction_candidates_cache->size(), excluded_anchors.size());
 			break;
 		}
-		auto found = std::find_if(candidates.begin(), candidates.end(),
+		auto found = std::find_if(eviction_candidates_cache->begin(), eviction_candidates_cache->end(),
 				[&victim](const EvictionCandidate& candidate) { return candidate.anchor_id == *victim; });
-		if (found == candidates.end()) {
+		if (found == eviction_candidates_cache->end()) {
 			ARACHNE_LOG_INFO(
 					"buildRelocationPlan[{}]: selectEvictionCandidate() returned anchor {} which isn't in the "
 					"candidate list -- stopping victim selection short",
@@ -999,13 +1054,10 @@ std::optional<RegionManager::RelocationPlan> RegionManager::buildRelocationPlan(
 		// Every group member has its own EvictionCandidate entry (see
 		// buildEvictionCandidates()'s doc comment) -- all of them just got
 		// committed to plan.evictions together, so none should be offered
-		// again as a separate, redundant selection.
-		candidates.erase(std::remove_if(candidates.begin(), candidates.end(),
-				[&group_to_evict](const EvictionCandidate& candidate) {
-					return std::find(group_to_evict.begin(), group_to_evict.end(), candidate.anchor_id) !=
-							group_to_evict.end();
-				}),
-				candidates.end());
+		// again as a separate, redundant selection. Grown into excluded_anchors
+		// (small, O(1) inserts) instead of erased out of eviction_candidates_cache
+		// (shared, large) -- see this loop's setup comment above.
+		excluded_anchors.insert(group_to_evict.begin(), group_to_evict.end());
 	}
 	}  // end buildRelocationPlan_evict trace scope
 
@@ -1032,6 +1084,23 @@ std::optional<RegionManager::RelocationPlan> RegionManager::buildRelocationPlan(
 
 void RegionManager::processRelocationBatch(bool retain_failed_candidates) {
 	ARACHNE_TRACE_SCOPE("RegionManager", "processRelocationBatch");
+	// Diagnostic-only (ARACHNE_ENABLE_TRACING build) -- see the pass-count
+	// investigation this was added for (cpp/test/index/report/): coordinatorLoop()
+	// passes retain_failed_candidates as exactly `!forced && !stop`, so this
+	// distinguishes an ordinary, trigger_interval-paced call from one that's
+	// part of a forced/stop drain's own back-to-back do-while loop (see
+	// coordinatorLoop()'s own comment on that loop). Deliberately a
+	// zero-duration marker, not a real timing scope -- these two scopes'
+	// duration_ns is meaningless (measures only the if/else dispatch); only
+	// each one's count and start_ns (still stamped at this call's true entry
+	// time) matter, to bucket every processRelocationBatch call's true
+	// duration (the *outer*, whole-function scope above) by which of the two
+	// it belongs to and when it happened.
+	if (retain_failed_candidates) {
+		ARACHNE_TRACE_SCOPE("RegionManager", "processRelocationBatch_normal");
+	} else {
+		ARACHNE_TRACE_SCOPE("RegionManager", "processRelocationBatch_forced");
+	}
 	std::optional<RelocationPlan> maybe_plan =
 			buildRelocationPlan(next_batch_sequence_++, retain_failed_candidates);
 	if (!maybe_plan.has_value()) return;

@@ -84,10 +84,12 @@ std::optional<PromotionCandidate> FifoReplacementPolicy::selectNextPromotionCand
 }
 
 std::optional<VectorId> FifoReplacementPolicy::selectEvictionCandidate(
-		VectorId excluded, std::size_t, const std::vector<EvictionCandidate>& candidates) {
+		VectorId excluded, std::size_t, const std::vector<EvictionCandidate>& candidates,
+		const std::unordered_set<VectorId>& excluded_anchors) {
 	std::lock_guard lock(mutex_);
 	for (VectorId candidate : promoted_order_) {
-		if (candidate != excluded && ContainsCandidate(candidates, candidate)) return candidate;
+		if (candidate != excluded && !excluded_anchors.contains(candidate) && ContainsCandidate(candidates, candidate))
+			return candidate;
 	}
 	return std::nullopt;
 }
@@ -154,10 +156,12 @@ std::optional<PromotionCandidate> LruReplacementPolicy::selectNextPromotionCandi
 }
 
 std::optional<VectorId> LruReplacementPolicy::selectEvictionCandidate(
-		VectorId excluded, std::size_t, const std::vector<EvictionCandidate>& candidates) {
+		VectorId excluded, std::size_t, const std::vector<EvictionCandidate>& candidates,
+		const std::unordered_set<VectorId>& excluded_anchors) {
 	std::lock_guard lock(mutex_);
 	for (VectorId candidate : lru_order_) {
-		if (candidate != excluded && ContainsCandidate(candidates, candidate)) return candidate;
+		if (candidate != excluded && !excluded_anchors.contains(candidate) && ContainsCandidate(candidates, candidate))
+			return candidate;
 	}
 	return std::nullopt;
 }
@@ -234,11 +238,14 @@ std::optional<PromotionCandidate> LfuReplacementPolicy::selectNextPromotionCandi
 }
 
 std::optional<VectorId> LfuReplacementPolicy::selectEvictionCandidate(
-		VectorId excluded, std::size_t, const std::vector<EvictionCandidate>& candidates) {
+		VectorId excluded, std::size_t, const std::vector<EvictionCandidate>& candidates,
+		const std::unordered_set<VectorId>& excluded_anchors) {
 	std::lock_guard lock(mutex_);
 	for (const auto& [freq, bucket] : freq_buckets_) {
 		for (VectorId candidate : bucket) {
-			if (candidate != excluded && ContainsCandidate(candidates, candidate)) return candidate;
+			if (candidate != excluded && !excluded_anchors.contains(candidate) &&
+					ContainsCandidate(candidates, candidate))
+				return candidate;
 		}
 	}
 	return std::nullopt;
@@ -314,7 +321,8 @@ std::optional<PromotionCandidate> ClockReplacementPolicy::selectNextPromotionCan
 }
 
 std::optional<VectorId> ClockReplacementPolicy::selectEvictionCandidate(
-		VectorId excluded, std::size_t, const std::vector<EvictionCandidate>& candidates) {
+		VectorId excluded, std::size_t, const std::vector<EvictionCandidate>& candidates,
+		const std::unordered_set<VectorId>& excluded_anchors) {
 	std::lock_guard lock(mutex_);
 	if (ring_.empty()) return std::nullopt;
 
@@ -322,7 +330,9 @@ std::optional<VectorId> ClockReplacementPolicy::selectEvictionCandidate(
 	for (std::size_t step = 0; step < max_steps; ++step) {
 		ClockEntry& entry = ring_[hand_];
 		hand_ = (hand_ + 1) % ring_.size();
-		if (entry.anchor_id == excluded || !ContainsCandidate(candidates, entry.anchor_id)) continue;
+		if (entry.anchor_id == excluded || excluded_anchors.contains(entry.anchor_id) ||
+				!ContainsCandidate(candidates, entry.anchor_id))
+			continue;
 		if (entry.referenced) {
 			entry.referenced = false;
 			continue;
@@ -438,13 +448,16 @@ std::optional<PromotionCandidate> TwoQReplacementPolicy::selectNextPromotionCand
 }
 
 std::optional<VectorId> TwoQReplacementPolicy::selectEvictionCandidate(
-		VectorId excluded, std::size_t, const std::vector<EvictionCandidate>& candidates) {
+		VectorId excluded, std::size_t, const std::vector<EvictionCandidate>& candidates,
+		const std::unordered_set<VectorId>& excluded_anchors) {
 	std::lock_guard lock(mutex_);
 	for (VectorId candidate : a1in_) {
-		if (candidate != excluded && ContainsCandidate(candidates, candidate)) return candidate;
+		if (candidate != excluded && !excluded_anchors.contains(candidate) && ContainsCandidate(candidates, candidate))
+			return candidate;
 	}
 	for (VectorId candidate : am_) {
-		if (candidate != excluded && ContainsCandidate(candidates, candidate)) return candidate;
+		if (candidate != excluded && !excluded_anchors.contains(candidate) && ContainsCandidate(candidates, candidate))
+			return candidate;
 	}
 	return std::nullopt;
 }
@@ -588,6 +601,14 @@ std::optional<double> CostAwareReplacementPolicy::groupRetentionDensity(
 
 AdmissionDecision CostAwareReplacementPolicy::evaluateAdmission(
 		const PromotionCandidate& candidate, const AdmissionContext& context) {
+	// Diagnostic-only (ARACHNE_ENABLE_TRACING build) -- see the 10M-scale
+	// Coordinator-throughput investigation this was added for
+	// (cpp/test/index/report/): covers the *whole* call, including the
+	// early-return fast paths below that evaluateAdmission_locked's own
+	// narrower scope (further down) deliberately excludes -- isolates
+	// whether cost is hiding in those fast paths rather than the locked
+	// eviction-candidates scan.
+	ARACHNE_TRACE_SCOPE("CostAwareReplacementPolicy", "evaluateAdmission_full");
 	if (candidate.observations < config_.minimum_observations) {
 		ARACHNE_LOG_INFO(
 				"CostAwareReplacementPolicy: reject anchor {} -- observations={} below minimum_observations={}",
@@ -667,7 +688,8 @@ void CostAwareReplacementPolicy::onPromotionCommitted(VectorId anchor_id, const 
 }
 
 std::optional<VectorId> CostAwareReplacementPolicy::selectEvictionCandidate(
-		VectorId excluded, std::size_t required_bytes, const std::vector<EvictionCandidate>& candidates) {
+		VectorId excluded, std::size_t required_bytes, const std::vector<EvictionCandidate>& candidates,
+		const std::unordered_set<VectorId>& excluded_anchors) {
 	// Diagnostic-only (ARACHNE_ENABLE_TRACING build) -- see the latency-
 	// tracing report entry this was added for; same reasoning as
 	// evaluateAdmission_locked above, for the victim-selection side of
@@ -679,7 +701,9 @@ std::optional<VectorId> CostAwareReplacementPolicy::selectEvictionCandidate(
 	double best_score = std::numeric_limits<double>::infinity();
 	std::optional<VectorId> best;
 	for (const EvictionCandidate& candidate : candidates) {
-		if (candidate.anchor_id == excluded || candidate.reclaimable_bytes == 0) continue;
+		if (candidate.anchor_id == excluded || excluded_anchors.contains(candidate.anchor_id) ||
+				candidate.reclaimable_bytes == 0)
+			continue;
 		std::optional<double> density = groupRetentionDensity(candidate, now);
 		if (!density.has_value()) continue;
 		double coverage_penalty = candidate.reclaimable_bytes >= required_bytes

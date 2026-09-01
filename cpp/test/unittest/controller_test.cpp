@@ -161,8 +161,9 @@ class EvictionCountingReplacementPolicy : public ReplacementPolicy {
 		return inner_.selectNextPromotionCandidate();
 	}
 	std::optional<VectorId> selectEvictionCandidate(VectorId excluded, std::size_t required_bytes,
-																									 const std::vector<EvictionCandidate>& candidates) override {
-		return inner_.selectEvictionCandidate(excluded, required_bytes, candidates);
+			const std::vector<EvictionCandidate>& candidates,
+			const std::unordered_set<VectorId>& excluded_anchors = {}) override {
+		return inner_.selectEvictionCandidate(excluded, required_bytes, candidates, excluded_anchors);
 	}
 
 	int eviction_calls = 0;

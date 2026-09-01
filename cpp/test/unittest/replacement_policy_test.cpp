@@ -213,6 +213,45 @@ TEST(FifoReplacementPolicyTest, SelectEvictionCandidateIsNulloptWhenOnlyExcluded
 	EXPECT_FALSE(policy.selectEvictionCandidate(/*excluded=*/1, /*required_bytes=*/0, Candidates({1})).has_value());
 }
 
+// ---------------------------------------------------------------------------
+// selectEvictionCandidate()'s 4th argument, excluded_anchors -- the small,
+// growable exclusion set buildRelocationPlan()'s victim-selection loop passes
+// instead of physically filtering `candidates` itself (see
+// ReplacementPolicy::selectEvictionCandidate()'s own doc comment and
+// cpp/test/index/report/2026-08-31-10m-scale-coordinator-throughput.md for
+// why). Every policy must honor it the same way it already honors the single
+// `excluded` id -- these mirror the SkipsExcluded/IsNulloptWhenOnlyExcluded
+// pairs above, with excluded_anchors doing the work instead.
+// ---------------------------------------------------------------------------
+
+TEST(FifoReplacementPolicyTest, SelectEvictionCandidateSkipsExcludedAnchors) {
+	FifoReplacementPolicy policy;
+	policy.enqueueCandidate(MakeCandidate(1));
+	policy.enqueueCandidate(MakeCandidate(2));
+	policy.enqueueCandidate(MakeCandidate(3));
+	policy.selectNextPromotionCandidate();
+	policy.selectNextPromotionCandidate();
+	policy.selectNextPromotionCandidate();
+
+	auto candidate = policy.selectEvictionCandidate(/*excluded=*/0, /*required_bytes=*/0, Candidates({1, 2, 3}),
+			/*excluded_anchors=*/{1, 2});
+	ASSERT_TRUE(candidate.has_value());
+	EXPECT_EQ(*candidate, 3u);
+}
+
+TEST(FifoReplacementPolicyTest, SelectEvictionCandidateIsNulloptWhenEverythingExcludedViaTheSet) {
+	FifoReplacementPolicy policy;
+	policy.enqueueCandidate(MakeCandidate(1));
+	policy.enqueueCandidate(MakeCandidate(2));
+	policy.selectNextPromotionCandidate();
+	policy.selectNextPromotionCandidate();
+
+	EXPECT_FALSE(policy
+			.selectEvictionCandidate(/*excluded=*/0, /*required_bytes=*/0, Candidates({1, 2}),
+					/*excluded_anchors=*/{1, 2})
+			.has_value());
+}
+
 TEST(FifoReplacementPolicyTest, ReSelectingTheSameAnchorDoesNotReorderEvictionOrder) {
 	// Mirrors the old RepeatedPromotionDoesNotReorder test: a second Region
 	// dependency for an already-selected Anchor shouldn't change its eviction
@@ -463,6 +502,29 @@ TEST(LruReplacementPolicyTest, SelectEvictionCandidateIsNulloptWhenOnlyExcludedI
 	EXPECT_FALSE(policy.selectEvictionCandidate(/*excluded=*/1, /*required_bytes=*/0, Candidates({1})).has_value());
 }
 
+TEST(LruReplacementPolicyTest, SelectEvictionCandidateSkipsExcludedAnchors) {
+	LruReplacementPolicy policy;
+	policy.enqueueCandidate(MakeCandidate(1));
+	policy.enqueueCandidate(MakeCandidate(2));
+	policy.selectNextPromotionCandidate();
+	policy.selectNextPromotionCandidate();
+
+	auto candidate = policy.selectEvictionCandidate(/*excluded=*/0, /*required_bytes=*/0, Candidates({1, 2}),
+			/*excluded_anchors=*/{1});
+	ASSERT_TRUE(candidate.has_value());
+	EXPECT_EQ(*candidate, 2u);
+}
+
+TEST(LruReplacementPolicyTest, SelectEvictionCandidateIsNulloptWhenOnlyExcludedIsSelectedViaTheSet) {
+	LruReplacementPolicy policy;
+	policy.enqueueCandidate(MakeCandidate(1));
+	policy.selectNextPromotionCandidate();
+
+	EXPECT_FALSE(policy
+			.selectEvictionCandidate(/*excluded=*/0, /*required_bytes=*/0, Candidates({1}), /*excluded_anchors=*/{1})
+			.has_value());
+}
+
 TEST(LruReplacementPolicyTest, ReSelectingTheSameAnchorDoesNotResetItsRecency) {
 	// A second Region dependency for an already-resident Anchor is not itself
 	// a "use" -- onAnchorTouched() is the intended signal for that.
@@ -641,6 +703,22 @@ TEST(LfuReplacementPolicyTest, SelectEvictionCandidateSkipsExcludedAcrossFrequen
 	EXPECT_EQ(*candidate, 2u);
 }
 
+TEST(LfuReplacementPolicyTest, SelectEvictionCandidateSkipsExcludedAnchorsAcrossFrequencyBuckets) {
+	// Same scenario as SkipsExcludedAcrossFrequencyBuckets above, but via
+	// excluded_anchors instead of the single excluded id.
+	LfuReplacementPolicy policy;
+	policy.enqueueCandidate(MakeCandidate(1));
+	policy.enqueueCandidate(MakeCandidate(2));
+	policy.selectNextPromotionCandidate();  // 1 at freq 1
+	policy.selectNextPromotionCandidate();  // 2 at freq 1
+	policy.onAnchorTouched(2);              // 2 -> freq 2; 1 alone at freq 1
+
+	auto candidate = policy.selectEvictionCandidate(/*excluded=*/0, /*required_bytes=*/0, Candidates({1, 2}),
+			/*excluded_anchors=*/{1});
+	ASSERT_TRUE(candidate.has_value());
+	EXPECT_EQ(*candidate, 2u);
+}
+
 TEST(LfuReplacementPolicyTest, OnAnchorEvictedRemovesAnAlreadySelectedAnchorFromEvictionOrder) {
 	LfuReplacementPolicy policy;
 	policy.enqueueCandidate(MakeCandidate(1));
@@ -807,6 +885,29 @@ TEST(ClockReplacementPolicyTest, SelectEvictionCandidateIsNulloptWhenOnlyExclude
 	policy.selectNextPromotionCandidate();
 
 	EXPECT_FALSE(policy.selectEvictionCandidate(/*excluded=*/1, /*required_bytes=*/0, Candidates({1})).has_value());
+}
+
+TEST(ClockReplacementPolicyTest, SelectEvictionCandidateSkipsExcludedAnchors) {
+	ClockReplacementPolicy policy;
+	policy.enqueueCandidate(MakeCandidate(1));
+	policy.enqueueCandidate(MakeCandidate(2));
+	policy.selectNextPromotionCandidate();
+	policy.selectNextPromotionCandidate();
+
+	auto candidate = policy.selectEvictionCandidate(/*excluded=*/0, /*required_bytes=*/0, Candidates({1, 2}),
+			/*excluded_anchors=*/{1});
+	ASSERT_TRUE(candidate.has_value());
+	EXPECT_EQ(*candidate, 2u);
+}
+
+TEST(ClockReplacementPolicyTest, SelectEvictionCandidateIsNulloptWhenOnlyExcludedIsSelectedViaTheSet) {
+	ClockReplacementPolicy policy;
+	policy.enqueueCandidate(MakeCandidate(1));
+	policy.selectNextPromotionCandidate();
+
+	EXPECT_FALSE(policy
+			.selectEvictionCandidate(/*excluded=*/0, /*required_bytes=*/0, Candidates({1}), /*excluded_anchors=*/{1})
+			.has_value());
 }
 
 TEST(ClockReplacementPolicyTest, OnAnchorEvictedRemovesAnAlreadySelectedAnchorFromEvictionOrder) {
@@ -1019,6 +1120,19 @@ TEST(TwoQReplacementPolicyTest, SelectEvictionCandidateSkipsExcludedAcrossQueues
 	EXPECT_FALSE(policy.selectEvictionCandidate(/*excluded=*/1, /*required_bytes=*/0, Candidates({1})).has_value());
 }
 
+TEST(TwoQReplacementPolicyTest, SelectEvictionCandidateSkipsExcludedAnchorsAcrossQueues) {
+	// Same scenario as SkipsExcludedAcrossQueues above, but via
+	// excluded_anchors instead of the single excluded id.
+	TwoQReplacementPolicy policy;
+	policy.enqueueCandidate(MakeCandidate(1));
+	policy.selectNextPromotionCandidate();  // 1 -> a1in_
+	policy.onAnchorTouched(1);              // 1 -> am_ (a1in_ now empty)
+
+	EXPECT_FALSE(policy
+			.selectEvictionCandidate(/*excluded=*/0, /*required_bytes=*/0, Candidates({1}), /*excluded_anchors=*/{1})
+			.has_value());
+}
+
 TEST(TwoQReplacementPolicyTest, OnAnchorEvictedRemovesAnUnselectedCandidateFromThePendingQueue) {
 	TwoQReplacementPolicy policy;
 	policy.enqueueCandidate(MakeCandidate(1));
@@ -1147,6 +1261,36 @@ TEST(CostAwareReplacementPolicyTest, TouchIsAppliedOnTheNextDrainNotImmediately)
 	// proving the drain didn't corrupt resident_ or throw.
 	ASSERT_TRUE(victim.has_value());
 	EXPECT_EQ(*victim, 1u);
+}
+
+TEST(CostAwareReplacementPolicyTest, SelectEvictionCandidateSkipsExcludedAnchors) {
+	// Same exclusion contract every other policy honors -- see
+	// ReplacementPolicy::selectEvictionCandidate()'s own doc comment and
+	// cpp/test/index/report/2026-08-31-10m-scale-coordinator-throughput.md.
+	// Anchors 1 and 2 are identically scored (same heat, same
+	// reclaimable_bytes) so this is a tie; without excluded_anchors the
+	// (deterministic, first-seen-wins) tie-break would return 1 -- excluding
+	// it must force 2 instead, not just re-break the tie by chance.
+	CostAwareReplacementPolicy policy;
+
+	AdmissionContext committed;
+	committed.total_footprint_bytes = 64;
+	policy.onPromotionCommitted(1, committed);
+	policy.onPromotionCommitted(2, committed);
+
+	EvictionCandidate candidate1;
+	candidate1.anchor_id = 1;
+	candidate1.reclaimable_bytes = 64;
+	candidate1.group_members = {1};
+	EvictionCandidate candidate2;
+	candidate2.anchor_id = 2;
+	candidate2.reclaimable_bytes = 64;
+	candidate2.group_members = {2};
+
+	std::optional<VectorId> victim = policy.selectEvictionCandidate(
+			/*excluded=*/0, /*required_bytes=*/1, {candidate1, candidate2}, /*excluded_anchors=*/{1});
+	ASSERT_TRUE(victim.has_value());
+	EXPECT_EQ(*victim, 2u);
 }
 
 }  // namespace
